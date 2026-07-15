@@ -1,0 +1,6 @@
+{
+  "autoClearCompleted": "on_task_complete",
+  "sortOrder": "status",
+  "sortDirection": "descending",
+  "maxVisible": 5
+}

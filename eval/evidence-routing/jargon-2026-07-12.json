@@ -1,0 +1,242 @@
+{
+  "artifactVersion": 1,
+  "effectiveProductionGuidance": {
+    "searchToolDescription": "Find historical evidence candidates from earlier context. Trigger a search when the request references a concrete but currently-invisible referent — a named file, symbol, error string, commit or PR, specific value, or a prior decision, agreement, or scope item — that is not present in the visible context, or uses back-references (\"earlier\", \"before\", \"originally\", \"we agreed\", \"that/those\") pointing to content that has rotated out; also search before asserting a specific earlier detail you cannot currently see. Use context_recall on a result id for exact original wording or source evidence. Use live tools—not the archive—for current mutable state. For mixed questions, recover archived intent first, then inspect live state and reconcile conflicts. Historical framing or an invitation to search history does not make archive evidence material for an exclusively current question. Naming a concept does not by itself mean it is archived: when a referent's location is ambiguous (it may be prior conversation or current repository state), probe both rather than assuming the archive. Avoid speculative broad searches; key each search on a concrete anchor (file name, symbol, error text, decision term). An empty result for a well-anchored query is itself routing evidence: treat the referent as live or external and probe repository, docs, or MCP next instead of retrying broader archive searches.",
+    "recallToolDescription": "Recover one exact archived source document by an id from context_window_search or an archive marker. Use for exact original wording or source evidence, not as proof of current mutable state; verify current state with live tools.",
+    "evidenceRoutingGuidelines": [
+      "Use context_window_search to find historical candidates for prior intent, rationale, decisions, rejected approaches, continuity, scope disputes, message history, or original-task evidence not fully visible in recent turns.",
+      "Use context_recall—not task records or assistant summaries—when exact original wording or source evidence is required; recall only ids returned by context_window_search or archive markers.",
+      "Do not use context_window_search or context_recall as proof of current files, runtime behavior, configuration, tests, or task status; use live tools, and note that historical framing or an invitation to search history does not make archive evidence material for an exclusively current question.",
+      "For mixed questions, use context_window_search and, when source precision matters, context_recall to recover archived intent first; then inspect live state and reconcile conflicts, treating live evidence as authoritative for mutable state.",
+      "Skip context_window_search and context_recall when evidence is already in recent context or neither historical nor live project evidence is needed; avoid speculative broad archive searches.",
+      "Before answering a history-flavored question, classify the needed evidence once: already in the visible context (answer directly), current mutable project state (use live tools), or an out-of-window referent such as prior wording, intent, decision, or rejected approach (use context_window_search); combine archive and live only when both an out-of-window referent and current state are required.",
+      "Naming or referencing a concept does not imply it is archived; when you cannot tell whether a named referent lives in rotated-out conversation or in current repository state, treat the location as ambiguous and use both a context_window_search and live inspection to locate it rather than defaulting to an archive-only search, keying the context_window_search on a concrete anchor.",
+      "If you are about to quote, cite, or assert a specific earlier detail (a number, name, exact phrasing, or committed decision) that is not visible in the current context, run context_window_search for its anchor before asserting rather than reconstructing it from memory.",
+      "Treat an empty context_window_search result for a well-anchored query as routing evidence, not a dead end: the referent is likely live or external, so probe repository, docs, or MCP next rather than retrying broader archive searches."
+    ],
+    "archivedEvidenceLabel": "Archived historical evidence — may be stale about current mutable state; verify live state separately."
+  },
+  "effectiveProductionGuidanceVersion": "6",
+  "provenance": {
+    "evaluationPrompt": "Rendered deterministically from the jargon suite and delivered verbatim as a single pi-subagent task message; no repository access (empty cwd, prompt forbids inspection).",
+    "rawResponses": "Exact response bytes as returned by the subagent tool call.",
+    "harnessRevision": "The pi-subagent package revision was not recorded at run time and is represented explicitly as `unavailable`.",
+    "exposure": "untouched: first evaluation of the jargon suite, recorded before any per-case inspection or tuning against results."
+  },
+  "records": [
+    {
+      "timestamp": "2026-07-13T06:16:11.124Z",
+      "modelIdentifier": "openai-codex/gpt-5.6-sol",
+      "suite": "jargon",
+      "exposure": "untouched",
+      "evaluationInstructions": "Jargon-disambiguation evidence-routing evaluation. Return exactly 20 lines `jargon-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: each case names an unrecognized term. Route both when older intent and current inspection are both required, or when the term's location is ambiguous between rotated-out conversation and the repository — probe both rather than assuming. A quoted context-index line is visible context listing terms from turns already rotated to the archive: a term listed there resolves its origin to archived conversation (archive), while a visible index that omits the term is evidence the referent is live or external (live). Questions exclusively about current repository or runtime state stay live regardless of index listings. Route neither when the needed evidence is already supplied in the prompt. Avoid speculative archive search.",
+      "orderedModelInputs": [
+        {
+          "id": "jargon-001",
+          "prompt": "The term flushGuard keeps coming up as if established, but nothing in view defines it; is it from our earlier discussion or the codebase, and what is it?"
+        },
+        {
+          "id": "jargon-002",
+          "prompt": "A visible context-index line reads - turn-77ab \"plan the migration\" — sentinel rebase, cutover window; what did we mean by sentinel rebase?"
+        },
+        {
+          "id": "jargon-003",
+          "prompt": "Does an export named epochGate exist anywhere in the code on disk right now?"
+        },
+        {
+          "id": "jargon-004",
+          "prompt": "Define soft eviction as dropping cache entries without invalidating readers; given only that definition, is deleting an entry and its readers a soft eviction?"
+        },
+        {
+          "id": "jargon-005",
+          "prompt": "Is the backfill contract we settled on earlier still what the implementation in the checkout actually does?"
+        },
+        {
+          "id": "jargon-006",
+          "prompt": "The visible context-index lines mention only rotation limits and cache topics, not quorum stitching; so what is quorum stitching in this project?"
+        },
+        {
+          "id": "jargon-007",
+          "prompt": "When I first introduced the term drip migration, long before it scrolled out of view, what did I say it meant?"
+        },
+        {
+          "id": "jargon-008",
+          "prompt": "shadow reindex is referenced like something we both know, yet I cannot tell whether it came from our conversation or from this repository; track down what it is."
+        },
+        {
+          "id": "jargon-009",
+          "prompt": "This message defines lease fencing as pinning a task to a single owner, and a context-index line lists an older mention too; using only what is on screen, restate what lease fencing means."
+        },
+        {
+          "id": "jargon-010",
+          "prompt": "A visible context-index line reads - turn-3f9c \"debounce the writer\" — flushGuard, writeQueue; what did we mean when we coined flushGuard?"
+        },
+        {
+          "id": "jargon-011",
+          "prompt": "Somewhere along the way sentinel rebase became shorthand, but I do not know if we invented it or the repo defines it; figure out which and explain it."
+        },
+        {
+          "id": "jargon-012",
+          "prompt": "None of the visible context-index lines list shadow reindex anywhere; given that, what is shadow reindex in this project?"
+        },
+        {
+          "id": "jargon-013",
+          "prompt": "A context-index line reads - turn-c04d \"scope the retry work\" — carry-forward set, retry ledger; remind me what our carry-forward set referred to."
+        },
+        {
+          "id": "jargon-014",
+          "prompt": "What is quorum stitching here? Nothing on screen explains it and I cannot tell whether it was discussion shorthand or a repo concept."
+        },
+        {
+          "id": "jargon-015",
+          "prompt": "Even though a context-index line lists soft eviction under turn-5c1e, take my definition here — dropping cache entries without invalidating readers — and say whether a full flush qualifies."
+        },
+        {
+          "id": "jargon-016",
+          "prompt": "People keep saying carry-forward set as if it were settled vocabulary; confirm where that phrase comes from and what it covers."
+        },
+        {
+          "id": "jargon-017",
+          "prompt": "A context-index line lists epochGate under turn-91d2, but my question is only this: does an export named epochGate exist in the code on disk right now?"
+        },
+        {
+          "id": "jargon-018",
+          "prompt": "The context index shows - turn-b7e1 \"sequence the rollout\" — drip migration, cohort gates; quote what I originally said drip migration meant."
+        },
+        {
+          "id": "jargon-019",
+          "prompt": "The context index lists backfill contract under turn-2a9f; is that agreed contract still what the implementation in the checkout actually does?"
+        },
+        {
+          "id": "jargon-020",
+          "prompt": "Right here I define lease fencing as pinning a task to a single owner; using only that sentence, does assigning two owners break lease fencing?"
+        }
+      ],
+      "evaluationPayloadHash": "sha256:a5ba558444b882a42320182ca0eebab8d1a712e6fdaa42d63e5d574ee4fdf897",
+      "renderedPrompt": "Jargon-disambiguation evidence-routing evaluation. Return exactly 20 lines `jargon-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: each case names an unrecognized term. Route both when older intent and current inspection are both required, or when the term's location is ambiguous between rotated-out conversation and the repository — probe both rather than assuming. A quoted context-index line is visible context listing terms from turns already rotated to the archive: a term listed there resolves its origin to archived conversation (archive), while a visible index that omits the term is evidence the referent is live or external (live). Questions exclusively about current repository or runtime state stay live regardless of index listings. Route neither when the needed evidence is already supplied in the prompt. Avoid speculative archive search.\n001 The term flushGuard keeps coming up as if established, but nothing in view defines it; is it from our earlier discussion or the codebase, and what is it?\n002 A visible context-index line reads - turn-77ab \"plan the migration\" — sentinel rebase, cutover window; what did we mean by sentinel rebase?\n003 Does an export named epochGate exist anywhere in the code on disk right now?\n004 Define soft eviction as dropping cache entries without invalidating readers; given only that definition, is deleting an entry and its readers a soft eviction?\n005 Is the backfill contract we settled on earlier still what the implementation in the checkout actually does?\n006 The visible context-index lines mention only rotation limits and cache topics, not quorum stitching; so what is quorum stitching in this project?\n007 When I first introduced the term drip migration, long before it scrolled out of view, what did I say it meant?\n008 shadow reindex is referenced like something we both know, yet I cannot tell whether it came from our conversation or from this repository; track down what it is.\n009 This message defines lease fencing as pinning a task to a single owner, and a context-index line lists an older mention too; using only what is on screen, restate what lease fencing means.\n010 A visible context-index line reads - turn-3f9c \"debounce the writer\" — flushGuard, writeQueue; what did we mean when we coined flushGuard?\n011 Somewhere along the way sentinel rebase became shorthand, but I do not know if we invented it or the repo defines it; figure out which and explain it.\n012 None of the visible context-index lines list shadow reindex anywhere; given that, what is shadow reindex in this project?\n013 A context-index line reads - turn-c04d \"scope the retry work\" — carry-forward set, retry ledger; remind me what our carry-forward set referred to.\n014 What is quorum stitching here? Nothing on screen explains it and I cannot tell whether it was discussion shorthand or a repo concept.\n015 Even though a context-index line lists soft eviction under turn-5c1e, take my definition here — dropping cache entries without invalidating readers — and say whether a full flush qualifies.\n016 People keep saying carry-forward set as if it were settled vocabulary; confirm where that phrase comes from and what it covers.\n017 A context-index line lists epochGate under turn-91d2, but my question is only this: does an export named epochGate exist in the code on disk right now?\n018 The context index shows - turn-b7e1 \"sequence the rollout\" — drip migration, cohort gates; quote what I originally said drip migration meant.\n019 The context index lists backfill contract under turn-2a9f; is that agreed contract still what the implementation in the checkout actually does?\n020 Right here I define lease fencing as pinning a task to a single owner; using only that sentence, does assigning two owners break lease fencing?",
+      "renderedPromptHash": "sha256:678fc56c1c0ef6bd6a0ed7b1dcb1d05c1076d4321dac564c92bece46c83fd2e2",
+      "rawResponseText": "jargon-001: both\njargon-002: archive\njargon-003: live\njargon-004: neither\njargon-005: both\njargon-006: live\njargon-007: archive\njargon-008: both\njargon-009: neither\njargon-010: archive\njargon-011: both\njargon-012: live\njargon-013: archive\njargon-014: both\njargon-015: neither\njargon-016: both\njargon-017: live\njargon-018: archive\njargon-019: both\njargon-020: neither",
+      "rawResponseProvenance": "byte-exact",
+      "parsedOrderedLabels": [
+        "both",
+        "archive",
+        "live",
+        "neither",
+        "both",
+        "live",
+        "archive",
+        "both",
+        "neither",
+        "archive",
+        "both",
+        "live",
+        "archive",
+        "both",
+        "neither",
+        "both",
+        "live",
+        "archive",
+        "both",
+        "neither"
+      ],
+      "harness": {
+        "identifier": "pi-subagent/advisor",
+        "revision": "unavailable",
+        "settings": {
+          "model": "openai-codex/gpt-5.6-sol",
+          "thinking": "high",
+          "cwd": "/tmp/jargon-eval-empty",
+          "delivery": "verbatim rendered prompt as single task message"
+        }
+      },
+      "effectiveProductionGuidanceVersion": "6",
+      "effectiveProductionGuidanceHash": "sha256:5d1d09bc4f2f61591ab767eb761a7198acdbfd7254cf1432e8b007d1acd927b5",
+      "score": {
+        "total": 20,
+        "correct": 20,
+        "incorrect": 0,
+        "accuracy": 1,
+        "missing": 0,
+        "invalid": 0,
+        "extra": 0,
+        "falseArchiveSearches": 0
+      },
+      "archiveRoutingScore": {
+        "archiveRequiredTotal": 12,
+        "archiveRequiredRouted": 12,
+        "archiveSearchRecall": 1,
+        "archiveSearchesTotal": 12,
+        "archiveSearchesMaterial": 12,
+        "archiveSearchPrecision": 1
+      },
+      "markerPairScore": {
+        "pairs": [
+          {
+            "pairId": "pair-flush-guard",
+            "term": "flushGuard",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-sentinel-rebase",
+            "term": "sentinel rebase",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-quorum-stitching",
+            "term": "quorum stitching",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-shadow-reindex",
+            "term": "shadow reindex",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-epoch-gate",
+            "term": "epochGate",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-backfill-contract",
+            "term": "backfill contract",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-soft-eviction",
+            "term": "soft eviction",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-carry-forward-set",
+            "term": "carry-forward set",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-drip-migration",
+            "term": "drip migration",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          },
+          {
+            "pairId": "pair-lease-fencing",
+            "term": "lease fencing",
+            "withoutMarkerCorrect": true,
+            "withMarkerCorrect": true
+          }
+        ],
+        "bothCorrect": 10,
+        "markerVariantOnlyCorrect": 0,
+        "baselineVariantOnlyCorrect": 0,
+        "bothWrong": 0
+      }
+    }
+  ]
+}

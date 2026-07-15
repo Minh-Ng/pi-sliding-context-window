@@ -1,0 +1,41 @@
+{
+  "name": "context-epoch-window",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cache-aware epoch context window with local SQLite FTS5/BM25 recall",
+  "license": "MIT",
+  "files": [
+    "bin",
+    "extensions",
+    "src",
+    "README.md",
+    "!eval/**",
+    "!test/**"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "context-window-mcp": "./bin/context-window-mcp.js"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --test"
+  },
+  "dependencies": {
+    "typebox": "1.1.38"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}

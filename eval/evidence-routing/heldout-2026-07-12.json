@@ -1,0 +1,305 @@
+{
+  "artifactVersion": 4,
+  "provenance": {
+    "evaluationPrompt": "The full rendered evaluation prompt is exact from the retained tool call and is deterministically reconstructed and hashed in each record.",
+    "presentationIds": "orderedModelInputs retain conceptual `<suite>-NNN` ids such as `heldout-NNN` and `reference-NNN`; rendered case lines map each to display id `NNN`, while requested and reconstructed response lines use the full `<suite>-NNN`.",
+    "rawResponses": "Exact response bytes were not captured. Each rawResponseText was reconstructed from the 20 ordered `<id>: <route>` output lines in order; parsed labels and scores are unchanged.",
+    "harnessRevision": "The harness revision was not recorded at run time and is represented explicitly as `unavailable` rather than inferred.",
+    "guidance": "Recorded against effective production routing guidance version 4 (sha256:00382f554d72acdad140503a56821728ee51fd8435306a1e2c9b05b5fd05280d).",
+    "exposure": "heldout re-run is regression (its cases were used and inspected during earlier tuning); reference is untouched (first evaluation of a fresh suite)."
+  },
+  "records": [
+    {
+      "timestamp": "2026-07-13T04:23:04.743Z",
+      "modelIdentifier": "openai-codex/gpt-5.6-sol",
+      "suite": "heldout",
+      "exposure": "regression",
+      "evaluationInstructions": "Held-out evidence-routing evaluation. Return exactly 20 lines `heldout-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: archive for older intent/rationale/wording/decisions; live for current mutable files/runtime/config/tests/tasks; historical framing alone does not make archive material for an exclusively current question; both when older intent and current inspection are both required; neither when evidence is already in this prompt/recent context or neither project source is needed. Avoid speculative archive search.",
+      "orderedModelInputs": [
+        {
+          "id": "heldout-001",
+          "prompt": "In this prompt, the release codename is Juniper. Return the codename without consulting project history or files."
+        },
+        {
+          "id": "heldout-002",
+          "prompt": "Which audit fields did I ask us to preserve early in the project, and which of them does the logger emit in the checkout now?"
+        },
+        {
+          "id": "heldout-003",
+          "prompt": "What exact version of the parser library is resolved by the lockfile in this checkout?"
+        },
+        {
+          "id": "heldout-004",
+          "prompt": "During the planning conversation, why did we postpone browser support rather than include it in the first release?"
+        },
+        {
+          "id": "heldout-005",
+          "prompt": "An old note calls the generated directory tracked. Is that directory ignored by the repository as it stands now?"
+        },
+        {
+          "id": "heldout-006",
+          "prompt": "For the array [4, 1, 4], how many distinct numbers are present?"
+        },
+        {
+          "id": "heldout-007",
+          "prompt": "What caveat did I attach when I authorized the data migration? Quote it rather than inferring it from the implementation."
+        },
+        {
+          "id": "heldout-008",
+          "prompt": "Did the migration retain the rollback guarantee agreed during review, and does its current implementation actually provide it?"
+        },
+        {
+          "id": "heldout-009",
+          "prompt": "A function receives the string `owl`, appends `!`, and returns it. What string does it return?"
+        },
+        {
+          "id": "heldout-010",
+          "prompt": "Which diagnostics does the compiler report for the source tree currently on disk?"
+        },
+        {
+          "id": "heldout-011",
+          "prompt": "We previously promised consumers a particular import style. Does the package's current export map still honor that promise?"
+        },
+        {
+          "id": "heldout-012",
+          "prompt": "Before implementation began, which naming option did the maintainer reject as likely to confuse users?"
+        },
+        {
+          "id": "heldout-013",
+          "prompt": "Compare the feature-flag default selected in the design review with the value active in the present deployment."
+        },
+        {
+          "id": "heldout-014",
+          "prompt": "Did my original delivery deadline include producing a migration script, or was that added afterward?"
+        },
+        {
+          "id": "heldout-015",
+          "prompt": "What value does NODE_ENV have in the shell running this evaluation?"
+        },
+        {
+          "id": "heldout-016",
+          "prompt": "Rewrite the sentence `Retries stop after three attempts` in the passive voice using only the text here."
+        },
+        {
+          "id": "heldout-017",
+          "prompt": "Which assumption about tenant identifiers did I correct before the conversation was summarized?"
+        },
+        {
+          "id": "heldout-018",
+          "prompt": "Is the latency ceiling approved in our earlier discussion satisfied by a benchmark run against the code now checked out?"
+        },
+        {
+          "id": "heldout-019",
+          "prompt": "Without checking this repository, explain whether a JavaScript Set keeps duplicate primitive values."
+        },
+        {
+          "id": "heldout-020",
+          "prompt": "What response does the service running from this checkout return for its health endpoint right now?"
+        }
+      ],
+      "evaluationPayloadHash": "sha256:c290f38461cf707250949425c6b429eb0baa98bc0218bf6cf2d67debb5cd2728",
+      "renderedPrompt": "Held-out evidence-routing evaluation. Return exactly 20 lines `heldout-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: archive for older intent/rationale/wording/decisions; live for current mutable files/runtime/config/tests/tasks; historical framing alone does not make archive material for an exclusively current question; both when older intent and current inspection are both required; neither when evidence is already in this prompt/recent context or neither project source is needed. Avoid speculative archive search.\n001 In this prompt, the release codename is Juniper. Return the codename without consulting project history or files.\n002 Which audit fields did I ask us to preserve early in the project, and which of them does the logger emit in the checkout now?\n003 What exact version of the parser library is resolved by the lockfile in this checkout?\n004 During the planning conversation, why did we postpone browser support rather than include it in the first release?\n005 An old note calls the generated directory tracked. Is that directory ignored by the repository as it stands now?\n006 For the array [4, 1, 4], how many distinct numbers are present?\n007 What caveat did I attach when I authorized the data migration? Quote it rather than inferring it from the implementation.\n008 Did the migration retain the rollback guarantee agreed during review, and does its current implementation actually provide it?\n009 A function receives the string `owl`, appends `!`, and returns it. What string does it return?\n010 Which diagnostics does the compiler report for the source tree currently on disk?\n011 We previously promised consumers a particular import style. Does the package's current export map still honor that promise?\n012 Before implementation began, which naming option did the maintainer reject as likely to confuse users?\n013 Compare the feature-flag default selected in the design review with the value active in the present deployment.\n014 Did my original delivery deadline include producing a migration script, or was that added afterward?\n015 What value does NODE_ENV have in the shell running this evaluation?\n016 Rewrite the sentence `Retries stop after three attempts` in the passive voice using only the text here.\n017 Which assumption about tenant identifiers did I correct before the conversation was summarized?\n018 Is the latency ceiling approved in our earlier discussion satisfied by a benchmark run against the code now checked out?\n019 Without checking this repository, explain whether a JavaScript Set keeps duplicate primitive values.\n020 What response does the service running from this checkout return for its health endpoint right now?",
+      "renderedPromptHash": "sha256:384af42300a98250bfa1cb20568de6e78c2bc2beede7d6360de4d36eb416c9e7",
+      "rawResponseText": "heldout-001: neither\nheldout-002: both\nheldout-003: live\nheldout-004: archive\nheldout-005: live\nheldout-006: neither\nheldout-007: archive\nheldout-008: both\nheldout-009: neither\nheldout-010: live\nheldout-011: both\nheldout-012: archive\nheldout-013: both\nheldout-014: archive\nheldout-015: live\nheldout-016: neither\nheldout-017: archive\nheldout-018: both\nheldout-019: neither\nheldout-020: live",
+      "rawResponseProvenance": "reconstructed-from-ordered-lines",
+      "parsedOrderedLabels": [
+        "neither",
+        "both",
+        "live",
+        "archive",
+        "live",
+        "neither",
+        "archive",
+        "both",
+        "neither",
+        "live",
+        "both",
+        "archive",
+        "both",
+        "archive",
+        "live",
+        "neither",
+        "archive",
+        "both",
+        "neither",
+        "live"
+      ],
+      "harness": {
+        "identifier": "pi-subagent/worker",
+        "revision": "unavailable",
+        "settings": {
+          "thinking": "high",
+          "retries": 0,
+          "repositoryAccess": false,
+          "expectedLabelsExposed": false
+        }
+      },
+      "effectiveProductionGuidanceVersion": "4",
+      "effectiveProductionGuidanceHash": "sha256:00382f554d72acdad140503a56821728ee51fd8435306a1e2c9b05b5fd05280d",
+      "score": {
+        "total": 20,
+        "correct": 20,
+        "incorrect": 0,
+        "accuracy": 1,
+        "missing": 0,
+        "invalid": 0,
+        "extra": 0,
+        "falseArchiveSearches": 0
+      }
+    },
+    {
+      "timestamp": "2026-07-13T04:23:04.743Z",
+      "modelIdentifier": "openai-codex/gpt-5.6-sol",
+      "suite": "reference",
+      "exposure": "untouched",
+      "evaluationInstructions": "Reference-detection evidence-routing evaluation. Return exactly 20 lines `reference-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: a request names a concept whose location may be unknown. Route archive when the referent is out-of-window prior wording/intent/decisions/rejected approaches; live when the question is whether a named concept currently exists or behaves in the checkout (files/symbols/config/runtime); both when the referent's location is genuinely ambiguous (could be prior conversation or the repository) or requires reconciling past intent with current state — probe both to locate rather than assuming; neither when the named concept is already visible in this prompt/recent context or is general knowledge. Naming a concept never by itself implies it is archived; do not assume archive for something that may be current repository state.",
+      "orderedModelInputs": [
+        {
+          "id": "reference-001",
+          "prompt": "You named a cache-miss fallback strategy earlier that has since scrolled out of view; what exactly did you call it?"
+        },
+        {
+          "id": "reference-002",
+          "prompt": "Whatever we may have said about it, what does the function parseRuntimeLimits actually do in the code right now?"
+        },
+        {
+          "id": "reference-003",
+          "prompt": "You referenced something called rollback policy, but I cannot tell whether that was only our discussion or something defined in the repo."
+        },
+        {
+          "id": "reference-004",
+          "prompt": "Two messages ago you used the phrase anchor-based triggering; restate what you meant using only what is already on screen."
+        },
+        {
+          "id": "reference-005",
+          "prompt": "Before we wrote any code, you and I agreed on a term for the batch-once-per-cycle behavior; what was that agreed name?"
+        },
+        {
+          "id": "reference-006",
+          "prompt": "The retry count we settled on earlier in the conversation, is it the same as the value the code uses today?"
+        },
+        {
+          "id": "reference-007",
+          "prompt": "Is a configuration key named maxBufferRatio defined anywhere in the repository as it currently stands?"
+        },
+        {
+          "id": "reference-008",
+          "prompt": "Right here I define a cold miss as a cache reset that reprocesses the prefix; given only that, is a warm read a cold miss?"
+        },
+        {
+          "id": "reference-009",
+          "prompt": "You named a warning threshold earlier, something like eighty percent; does the status-panel code actually use that number now?"
+        },
+        {
+          "id": "reference-010",
+          "prompt": "What reason did I give for rejecting the sliding-window approach during our discussion before it left the context?"
+        },
+        {
+          "id": "reference-011",
+          "prompt": "Using only the four routes you listed in this message, archive live both and neither, how many routes are there?"
+        },
+        {
+          "id": "reference-012",
+          "prompt": "We may have mentioned a validation matrix; does one actually exist in the checks directory in the checkout today?"
+        },
+        {
+          "id": "reference-013",
+          "prompt": "Restate the exact acceptance wording I used for the lookup feature earlier; it predates the current session summary."
+        },
+        {
+          "id": "reference-014",
+          "prompt": "I just named the branch feature/refresh-cache-state in this sentence; spell that branch name back to me."
+        },
+        {
+          "id": "reference-015",
+          "prompt": "We discussed a naming convention for test groups; does the new group follow it, or does it even exist in the repo yet?"
+        },
+        {
+          "id": "reference-016",
+          "prompt": "What value is retentionCount set to in the configuration on disk right now?"
+        },
+        {
+          "id": "reference-017",
+          "prompt": "In general software terms, not referring to anything in this project, what does idempotent mean?"
+        },
+        {
+          "id": "reference-018",
+          "prompt": "When we first scoped this project, which two edge cases did I say were out of scope? Those turns are gone from view."
+        },
+        {
+          "id": "reference-019",
+          "prompt": "Does the storage module currently export a function named lookup in the code on disk?"
+        },
+        {
+          "id": "reference-020",
+          "prompt": "You used the term buffer threshold; confirm both what we said it should be and what the config sets it to now."
+        }
+      ],
+      "evaluationPayloadHash": "sha256:f96b3d422d1c7e8d1f190a372328f0629757a0ecc7beaa9f5fd2991f53d82611",
+      "renderedPrompt": "Reference-detection evidence-routing evaluation. Return exactly 20 lines `reference-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: a request names a concept whose location may be unknown. Route archive when the referent is out-of-window prior wording/intent/decisions/rejected approaches; live when the question is whether a named concept currently exists or behaves in the checkout (files/symbols/config/runtime); both when the referent's location is genuinely ambiguous (could be prior conversation or the repository) or requires reconciling past intent with current state — probe both to locate rather than assuming; neither when the named concept is already visible in this prompt/recent context or is general knowledge. Naming a concept never by itself implies it is archived; do not assume archive for something that may be current repository state.\n001 You named a cache-miss fallback strategy earlier that has since scrolled out of view; what exactly did you call it?\n002 Whatever we may have said about it, what does the function parseRuntimeLimits actually do in the code right now?\n003 You referenced something called rollback policy, but I cannot tell whether that was only our discussion or something defined in the repo.\n004 Two messages ago you used the phrase anchor-based triggering; restate what you meant using only what is already on screen.\n005 Before we wrote any code, you and I agreed on a term for the batch-once-per-cycle behavior; what was that agreed name?\n006 The retry count we settled on earlier in the conversation, is it the same as the value the code uses today?\n007 Is a configuration key named maxBufferRatio defined anywhere in the repository as it currently stands?\n008 Right here I define a cold miss as a cache reset that reprocesses the prefix; given only that, is a warm read a cold miss?\n009 You named a warning threshold earlier, something like eighty percent; does the status-panel code actually use that number now?\n010 What reason did I give for rejecting the sliding-window approach during our discussion before it left the context?\n011 Using only the four routes you listed in this message, archive live both and neither, how many routes are there?\n012 We may have mentioned a validation matrix; does one actually exist in the checks directory in the checkout today?\n013 Restate the exact acceptance wording I used for the lookup feature earlier; it predates the current session summary.\n014 I just named the branch feature/refresh-cache-state in this sentence; spell that branch name back to me.\n015 We discussed a naming convention for test groups; does the new group follow it, or does it even exist in the repo yet?\n016 What value is retentionCount set to in the configuration on disk right now?\n017 In general software terms, not referring to anything in this project, what does idempotent mean?\n018 When we first scoped this project, which two edge cases did I say were out of scope? Those turns are gone from view.\n019 Does the storage module currently export a function named lookup in the code on disk?\n020 You used the term buffer threshold; confirm both what we said it should be and what the config sets it to now.",
+      "renderedPromptHash": "sha256:29ab70e8c6258668967c74174ed7f5befe6236204a3c92456cc17f5a1421be06",
+      "rawResponseText": "reference-001: archive\nreference-002: live\nreference-003: both\nreference-004: neither\nreference-005: archive\nreference-006: both\nreference-007: live\nreference-008: neither\nreference-009: both\nreference-010: archive\nreference-011: neither\nreference-012: live\nreference-013: archive\nreference-014: neither\nreference-015: both\nreference-016: live\nreference-017: neither\nreference-018: archive\nreference-019: live\nreference-020: both",
+      "rawResponseProvenance": "reconstructed-from-ordered-lines",
+      "parsedOrderedLabels": [
+        "archive",
+        "live",
+        "both",
+        "neither",
+        "archive",
+        "both",
+        "live",
+        "neither",
+        "both",
+        "archive",
+        "neither",
+        "live",
+        "archive",
+        "neither",
+        "both",
+        "live",
+        "neither",
+        "archive",
+        "live",
+        "both"
+      ],
+      "harness": {
+        "identifier": "pi-subagent/worker",
+        "revision": "unavailable",
+        "settings": {
+          "thinking": "high",
+          "retries": 0,
+          "repositoryAccess": false,
+          "expectedLabelsExposed": false
+        }
+      },
+      "effectiveProductionGuidanceVersion": "4",
+      "effectiveProductionGuidanceHash": "sha256:00382f554d72acdad140503a56821728ee51fd8435306a1e2c9b05b5fd05280d",
+      "score": {
+        "total": 20,
+        "correct": 20,
+        "incorrect": 0,
+        "accuracy": 1,
+        "missing": 0,
+        "invalid": 0,
+        "extra": 0,
+        "falseArchiveSearches": 0
+      }
+    }
+  ],
+  "effectiveProductionGuidanceVersion": "4",
+  "effectiveProductionGuidance": {
+    "searchToolDescription": "Find historical evidence candidates from earlier context. Trigger a search when the request references a concrete but currently-invisible referent — a named file, symbol, error string, commit or PR, specific value, or a prior decision, agreement, or scope item — that is not present in the visible context, or uses back-references (\"earlier\", \"before\", \"originally\", \"we agreed\", \"that/those\") pointing to content that has rotated out; also search before asserting a specific earlier detail you cannot currently see. Use context_window_recall on a result id for exact original wording or source evidence. Use live tools—not the archive—for current mutable state. For mixed questions, recover archived intent first, then inspect live state and reconcile conflicts. Historical framing or an invitation to search history does not make archive evidence material for an exclusively current question. Naming a concept does not by itself mean it is archived: when a referent's location is ambiguous (it may be prior conversation or current repository state), probe both rather than assuming the archive. Avoid speculative broad searches; key each search on a concrete anchor (file name, symbol, error text, decision term).",
+    "recallToolDescription": "Recover one exact archived source document by an id from context_window_search or an archive marker. Use for exact original wording or source evidence, not as proof of current mutable state; verify current state with live tools.",
+    "evidenceRoutingGuidelines": [
+      "Use context_window_search to find historical candidates for prior intent, rationale, decisions, rejected approaches, continuity, scope disputes, message history, or original-task evidence not fully visible in recent turns.",
+      "Use context_window_recall—not task records or assistant summaries—when exact original wording or source evidence is required; recall only ids returned by context_window_search or archive markers.",
+      "Do not use context_window_search or context_window_recall as proof of current files, runtime behavior, configuration, tests, or task status; use live tools, and note that historical framing or an invitation to search history does not make archive evidence material for an exclusively current question.",
+      "For mixed questions, use context_window_search and, when source precision matters, context_window_recall to recover archived intent first; then inspect live state and reconcile conflicts, treating live evidence as authoritative for mutable state.",
+      "Skip context_window_search and context_window_recall when evidence is already in recent context or neither historical nor live project evidence is needed; avoid speculative broad archive searches.",
+      "Before answering a history-flavored question, classify the needed evidence once: already in the visible context (answer directly), current mutable project state (use live tools), or an out-of-window referent such as prior wording, intent, decision, or rejected approach (use context_window_search); combine archive and live only when both an out-of-window referent and current state are required.",
+      "Naming or referencing a concept does not imply it is archived; when you cannot tell whether a named referent lives in rotated-out conversation or in current repository state, treat the location as ambiguous and use both a context_window_search and live inspection to locate it rather than defaulting to an archive-only search, keying the context_window_search on a concrete anchor.",
+      "If you are about to quote, cite, or assert a specific earlier detail (a number, name, exact phrasing, or committed decision) that is not visible in the current context, run context_window_search for its anchor before asserting rather than reconstructing it from memory."
+    ],
+    "archivedEvidenceLabel": "Archived historical evidence — may be stale about current mutable state; verify live state separately."
+  }
+}

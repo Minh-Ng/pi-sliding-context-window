@@ -1,0 +1,175 @@
+{
+  "artifactVersion": 1,
+  "effectiveProductionGuidance": {
+    "searchToolDescription": "Find historical evidence candidates from earlier context. Trigger a search when the request references a concrete but currently-invisible referent — a named file, symbol, error string, commit or PR, specific value, or a prior decision, agreement, or scope item — that is not present in the visible context, or uses back-references (\"earlier\", \"before\", \"originally\", \"we agreed\", \"that/those\") pointing to content that has rotated out; also search before asserting a specific earlier detail you cannot currently see. Use context_recall on a result id for exact original wording or source evidence. Use live tools—not the archive—for current mutable state. For mixed questions, recover archived intent first, then inspect live state and reconcile conflicts. Historical framing or an invitation to search history does not make archive evidence material for an exclusively current question. Naming a concept does not by itself mean it is archived: when a referent's location is ambiguous (it may be prior conversation or current repository state), probe both rather than assuming the archive. Avoid speculative broad searches; key each search on a concrete anchor (file name, symbol, error text, decision term). An empty result for a well-anchored query is itself routing evidence: treat the referent as live or external and probe repository, docs, or MCP next instead of retrying broader archive searches.",
+    "recallToolDescription": "Recover one exact archived source document by an id from context_window_search or an archive marker. Use for exact original wording or source evidence, not as proof of current mutable state; verify current state with live tools.",
+    "evidenceRoutingGuidelines": [
+      "Use context_window_search to find historical candidates for prior intent, rationale, decisions, rejected approaches, continuity, scope disputes, message history, or original-task evidence not fully visible in recent turns.",
+      "Use context_recall—not task records or assistant summaries—when exact original wording or source evidence is required; recall only ids returned by context_window_search or archive markers.",
+      "Do not use context_window_search or context_recall as proof of current files, runtime behavior, configuration, tests, or task status; use live tools, and note that historical framing or an invitation to search history does not make archive evidence material for an exclusively current question.",
+      "For mixed questions, use context_window_search and, when source precision matters, context_recall to recover archived intent first; then inspect live state and reconcile conflicts, treating live evidence as authoritative for mutable state.",
+      "Skip context_window_search and context_recall when evidence is already in recent context or neither historical nor live project evidence is needed; avoid speculative broad archive searches.",
+      "Before answering a history-flavored question, classify the needed evidence once: already in the visible context (answer directly), current mutable project state (use live tools), or an out-of-window referent such as prior wording, intent, decision, or rejected approach (use context_window_search); combine archive and live only when both an out-of-window referent and current state are required.",
+      "Naming or referencing a concept does not imply it is archived; when you cannot tell whether a named referent lives in rotated-out conversation or in current repository state, treat the location as ambiguous and use both a context_window_search and live inspection to locate it rather than defaulting to an archive-only search, keying the context_window_search on a concrete anchor.",
+      "If you are about to quote, cite, or assert a specific earlier detail (a number, name, exact phrasing, or committed decision) that is not visible in the current context, run context_window_search for its anchor before asserting rather than reconstructing it from memory.",
+      "Treat an empty context_window_search result for a well-anchored query as routing evidence, not a dead end: the referent is likely live or external, so probe repository, docs, or MCP next rather than retrying broader archive searches."
+    ],
+    "archivedEvidenceLabel": "Archived historical evidence — may be stale about current mutable state; verify live state separately."
+  },
+  "effectiveProductionGuidanceVersion": "6",
+  "provenance": {
+    "evaluationPrompt": "Rendered deterministically from the internalized suite and delivered verbatim as a single pi-subagent task message; no repository access (empty cwd, prompt forbids inspection).",
+    "rawResponses": "Exact response bytes as returned by the subagent tool call.",
+    "harnessRevision": "The pi-subagent package revision was not recorded at run time and is represented explicitly as `unavailable`.",
+    "exposure": "untouched: first evaluation of the internalized suite, recorded before any per-case inspection or tuning against results.",
+    "interpretation": "Policy-free instructions: this measures raw model routing priors, not pi production guidance, which was absent from the system context."
+  },
+  "records": [
+    {
+      "timestamp": "2026-07-13T06:22:40.399Z",
+      "modelIdentifier": "openai-codex/gpt-5.6-sol",
+      "suite": "internalized",
+      "exposure": "untouched",
+      "evaluationInstructions": "Internalized evidence-routing evaluation. Return exactly 20 lines `internalized-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain. No routing policy is provided: apply your own judgment about which evidence source each case requires.",
+      "orderedModelInputs": [
+        {
+          "id": "internalized-001",
+          "prompt": "You listed hydration ledger in the context index earlier, but what I need is the exact sentence I used when I first defined it."
+        },
+        {
+          "id": "internalized-002",
+          "prompt": "The context index lists writeAmp guard under turn-8c2e; given that, does the repository currently contain any code implementing a writeAmp guard?"
+        },
+        {
+          "id": "internalized-003",
+          "prompt": "The index lists twin-write window under turn-4d1a, and I want to know both what we agreed it means and whether the migration code honors it today."
+        },
+        {
+          "id": "internalized-004",
+          "prompt": "A teammate mentioned splice fencing, but they are not in this conversation and we never discussed it; what would splice fencing mean in distributed systems generally?"
+        },
+        {
+          "id": "internalized-005",
+          "prompt": "The visible context index omits amber path entirely and nothing on screen defines it; conclude where its definition must live and go get it."
+        },
+        {
+          "id": "internalized-006",
+          "prompt": "Given the index line - turn-5e7b \"tune the cache\" — warm set, eviction lag: which of those two terms did we spend more turns debating?"
+        },
+        {
+          "id": "internalized-007",
+          "prompt": "cursorLag shows up in test names in this repo, I think, but it may also have come from our chat; I need to know where it originated before renaming anything."
+        },
+        {
+          "id": "internalized-008",
+          "prompt": "The context index does not mention compaction debt anywhere, and nothing on screen defines it; where should I look to find what compaction debt is here?"
+        },
+        {
+          "id": "internalized-009",
+          "prompt": "In this sentence I stipulate that a ghost read means reading a deleted row; under that stipulation only, is reading a live row a ghost read?"
+        },
+        {
+          "id": "internalized-010",
+          "prompt": "Did we ever settle whether checkpoint stitching was in scope? I remember arguing about it before those turns rotated away."
+        },
+        {
+          "id": "internalized-011",
+          "prompt": "The file docs/soft-launch-checklist.md is open in my editor right now; per that file alone, what is the first unchecked item?"
+        },
+        {
+          "id": "internalized-012",
+          "prompt": "I vaguely recall we chose between fan-out replay and something else; which alternative did we reject, and does the winner exist in the code now?"
+        },
+        {
+          "id": "internalized-013",
+          "prompt": "Before rotation, I gave a numeric latency budget in milliseconds; state that number exactly as I wrote it."
+        },
+        {
+          "id": "internalized-014",
+          "prompt": "You defined quiesce fence two replies up in text that is still on screen; using only that visible definition, restate it."
+        },
+        {
+          "id": "internalized-015",
+          "prompt": "Ignore whatever we said before: right now, does the CI configuration on disk define a job named smoke-replay?"
+        },
+        {
+          "id": "internalized-016",
+          "prompt": "Earlier than anything visible here, I renamed one of the milestones; restate the new name I gave it."
+        },
+        {
+          "id": "internalized-017",
+          "prompt": "We floated two names for the recovery phase and I cannot see either anymore; which name won, and is it what the CLI prints from this checkout?"
+        },
+        {
+          "id": "internalized-018",
+          "prompt": "Quote the definition of retry horizon that appears verbatim in this sentence: a retry horizon is the deadline after which retries stop."
+        },
+        {
+          "id": "internalized-019",
+          "prompt": "Something called drainCredits is failing in the test run I just started; what is its current value at runtime?"
+        },
+        {
+          "id": "internalized-020",
+          "prompt": "The index lists backpressure valve under turn-99aa; I only need its meaning as we used it, nothing about the current code."
+        }
+      ],
+      "evaluationPayloadHash": "sha256:214ca792f24a93586755fdeabcc6f14098a8b46ac5a189d2414e2edfba10a1d8",
+      "renderedPrompt": "Internalized evidence-routing evaluation. Return exactly 20 lines `internalized-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain. No routing policy is provided: apply your own judgment about which evidence source each case requires.\n001 You listed hydration ledger in the context index earlier, but what I need is the exact sentence I used when I first defined it.\n002 The context index lists writeAmp guard under turn-8c2e; given that, does the repository currently contain any code implementing a writeAmp guard?\n003 The index lists twin-write window under turn-4d1a, and I want to know both what we agreed it means and whether the migration code honors it today.\n004 A teammate mentioned splice fencing, but they are not in this conversation and we never discussed it; what would splice fencing mean in distributed systems generally?\n005 The visible context index omits amber path entirely and nothing on screen defines it; conclude where its definition must live and go get it.\n006 Given the index line - turn-5e7b \"tune the cache\" — warm set, eviction lag: which of those two terms did we spend more turns debating?\n007 cursorLag shows up in test names in this repo, I think, but it may also have come from our chat; I need to know where it originated before renaming anything.\n008 The context index does not mention compaction debt anywhere, and nothing on screen defines it; where should I look to find what compaction debt is here?\n009 In this sentence I stipulate that a ghost read means reading a deleted row; under that stipulation only, is reading a live row a ghost read?\n010 Did we ever settle whether checkpoint stitching was in scope? I remember arguing about it before those turns rotated away.\n011 The file docs/soft-launch-checklist.md is open in my editor right now; per that file alone, what is the first unchecked item?\n012 I vaguely recall we chose between fan-out replay and something else; which alternative did we reject, and does the winner exist in the code now?\n013 Before rotation, I gave a numeric latency budget in milliseconds; state that number exactly as I wrote it.\n014 You defined quiesce fence two replies up in text that is still on screen; using only that visible definition, restate it.\n015 Ignore whatever we said before: right now, does the CI configuration on disk define a job named smoke-replay?\n016 Earlier than anything visible here, I renamed one of the milestones; restate the new name I gave it.\n017 We floated two names for the recovery phase and I cannot see either anymore; which name won, and is it what the CLI prints from this checkout?\n018 Quote the definition of retry horizon that appears verbatim in this sentence: a retry horizon is the deadline after which retries stop.\n019 Something called drainCredits is failing in the test run I just started; what is its current value at runtime?\n020 The index lists backpressure valve under turn-99aa; I only need its meaning as we used it, nothing about the current code.",
+      "renderedPromptHash": "sha256:c8d7828ac1aebcc19c88ffd764129411312c24259b19f62edce06a87e2de97f7",
+      "rawResponseText": "internalized-001: archive\ninternalized-002: live\ninternalized-003: both\ninternalized-004: neither\ninternalized-005: archive\ninternalized-006: archive\ninternalized-007: both\ninternalized-008: live\ninternalized-009: neither\ninternalized-010: archive\ninternalized-011: live\ninternalized-012: both\ninternalized-013: archive\ninternalized-014: neither\ninternalized-015: live\ninternalized-016: archive\ninternalized-017: both\ninternalized-018: neither\ninternalized-019: live\ninternalized-020: archive",
+      "rawResponseProvenance": "byte-exact",
+      "parsedOrderedLabels": [
+        "archive",
+        "live",
+        "both",
+        "neither",
+        "archive",
+        "archive",
+        "both",
+        "live",
+        "neither",
+        "archive",
+        "live",
+        "both",
+        "archive",
+        "neither",
+        "live",
+        "archive",
+        "both",
+        "neither",
+        "live",
+        "archive"
+      ],
+      "harness": {
+        "identifier": "pi-subagent/advisor",
+        "revision": "unavailable",
+        "settings": {
+          "model": "openai-codex/gpt-5.6-sol",
+          "thinking": "high",
+          "cwd": "/tmp/internalized-eval-empty",
+          "delivery": "verbatim rendered prompt as single task message; no production routing guidance in system context"
+        }
+      },
+      "effectiveProductionGuidanceVersion": "6",
+      "effectiveProductionGuidanceHash": "sha256:5d1d09bc4f2f61591ab767eb761a7198acdbfd7254cf1432e8b007d1acd927b5",
+      "score": {
+        "total": 20,
+        "correct": 19,
+        "incorrect": 1,
+        "accuracy": 0.95,
+        "missing": 0,
+        "invalid": 0,
+        "extra": 0,
+        "falseArchiveSearches": 1
+      },
+      "archiveRoutingScore": {
+        "archiveRequiredTotal": 10,
+        "archiveRequiredRouted": 10,
+        "archiveSearchRecall": 1,
+        "archiveSearchesTotal": 11,
+        "archiveSearchesMaterial": 10,
+        "archiveSearchPrecision": 0.9090909090909091
+      }
+    }
+  ]
+}

@@ -21,7 +21,7 @@ This keeps provider policy testable without Pi and gives alternate hosts or stor
 
 ## SQLite dependency
 
-The packaged Pi extension and MCP server use SQLite by default. `src/archive.js` imports Node's built-in [`node:sqlite`](https://nodejs.org/api/sqlite.html), and BM25 retrieval requires that Node's SQLite build includes FTS5. There is no native SQLite npm dependency to compile or install.
+The packaged Pi extension and MCP server use SQLite by default. `src/archive.js` loads Node's built-in [`node:sqlite`](https://nodejs.org/api/sqlite.html) for the MCP server and tests, then falls back to Pi's built-in `bun:sqlite` runtime. BM25 retrieval requires FTS5 in either runtime. There is no native SQLite npm dependency to compile or install.
 
 The package requires Node **22.13+**, the first Node 22 release where `node:sqlite` is available without `--experimental-sqlite`. The test environment uses Node 24 and verifies FTS5 by creating and querying the archive. Unusual custom Node builds can omit FTS5; archive startup then fails with a direct compatibility error.
 

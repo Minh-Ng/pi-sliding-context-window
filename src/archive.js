@@ -1,8 +1,26 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { archiveDocumentProvenance } from "./provenance.js";
+
+// Pi is distributed as a Bun executable, while the MCP server and tests run
+// under Node. Prefer Node's built-in API, then use Bun's compatible SQLite API
+// when this module is loaded by Pi.
+const { DatabaseSync } = await import("node:sqlite").catch(async (nodeError) => {
+  try {
+    const { Database } = await import("bun:sqlite");
+    return { DatabaseSync: Database };
+  } catch (bunError) {
+    throw new Error("Context Window requires SQLite from Node (node:sqlite) or Bun (bun:sqlite).", {
+      cause: bunError ?? nodeError,
+    });
+  }
+});
+
+function prepare(db, sql) {
+  // Bun calls this `query`; Node's DatabaseSync calls it `prepare`.
+  return typeof db.prepare === "function" ? db.prepare(sql) : db.query(sql);
+}
 
 function stableId(parts) {
   return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 20);
@@ -87,11 +105,11 @@ export class Archive {
     } catch (error) {
       this.db.close();
       if (/fts5|no such module/i.test(error instanceof Error ? error.message : String(error))) {
-        throw new Error("Context Window requires a Node.js SQLite build with FTS5 enabled.", { cause: error });
+        throw new Error("Context Window requires a SQLite build with FTS5 enabled.", { cause: error });
       }
       throw error;
     }
-    this.insertDocument = this.db.prepare(`
+    this.insertDocument = prepare(this.db, `
       INSERT INTO documents(id, session_id, project, kind, created_at, text, metadata_json)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -102,8 +120,8 @@ export class Archive {
         text=excluded.text,
         metadata_json=excluded.metadata_json
     `);
-    this.deleteFts = this.db.prepare("DELETE FROM documents_fts WHERE id = ?");
-    this.insertFts = this.db.prepare("INSERT INTO documents_fts(id, session_id, project, text) VALUES (?, ?, ?, ?)");
+    this.deleteFts = prepare(this.db, "DELETE FROM documents_fts WHERE id = ?");
+    this.insertFts = prepare(this.db, "INSERT INTO documents_fts(id, session_id, project, text) VALUES (?, ?, ?, ?)");
   }
 
   put({ id, sessionId, project, kind = "turn", text, metadata = {}, createdAt = Date.now() }) {
@@ -144,7 +162,7 @@ export class Archive {
     }
     params.push(limit);
 
-    const rows = this.db.prepare(`
+    const rows = prepare(this.db, `
       SELECT d.id, d.session_id, d.project, d.kind, d.created_at, d.text, d.metadata_json,
              bm25(documents_fts, 0.0, 0.0, 0.0, 1.0) AS rank,
              snippet(documents_fts, 3, '[', ']', ' … ', 28) AS snippet
@@ -167,7 +185,7 @@ export class Archive {
   }
 
   get(id) {
-    const row = this.db.prepare("SELECT * FROM documents WHERE id = ?").get(id);
+    const row = prepare(this.db, "SELECT * FROM documents WHERE id = ?").get(id);
     if (!row) return undefined;
     const document = documentFromRow(row);
     return { ...document, provenance: archiveDocumentProvenance(document) };
@@ -181,14 +199,14 @@ export class Archive {
       const placeholders = scopedSessionIds.map(() => "?").join(", ");
       const projectClause = project ? " AND project = ?" : "";
       const params = project ? [...scopedSessionIds, project] : scopedSessionIds;
-      return Number(this.db.prepare(
+      return Number(prepare(this.db,
         `SELECT count(*) AS n FROM documents WHERE session_id IN (${placeholders})${projectClause}`,
       ).get(...params).n);
     }
     if (scope !== "all" && project) {
-      return Number(this.db.prepare("SELECT count(*) AS n FROM documents WHERE project = ?").get(project).n);
+      return Number(prepare(this.db, "SELECT count(*) AS n FROM documents WHERE project = ?").get(project).n);
     }
-    return Number(this.db.prepare("SELECT count(*) AS n FROM documents").get().n);
+    return Number(prepare(this.db, "SELECT count(*) AS n FROM documents").get().n);
   }
 
   close() {

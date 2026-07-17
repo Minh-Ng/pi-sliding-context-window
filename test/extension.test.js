@@ -11,8 +11,44 @@ import {
 } from "../src/evidence-routing.js";
 import { Archive } from "../src/archive.js";
 import { loadConfig } from "../src/config.js";
+import { defaultSocketPath } from "../src/daemon/paths.js";
 import { EpochWindowSession, ROTATION_STATE_ENTRY } from "../src/epoch-window.js";
+import { StoreClient } from "../src/store-client.js";
 import { messageKey } from "../src/window.js";
+
+function processExists(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function stopProcess(processId) {
+  if (!processId || !processExists(processId)) return;
+  process.kill(processId, "SIGTERM");
+  const deadline = Date.now() + 1_000;
+  while (processExists(processId) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (processExists(processId)) {
+    process.kill(processId, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function stopDaemonAt(socketPath, project) {
+  const client = new StoreClient({ socketPath, project, requestTimeoutMs: 5_000 });
+  let processId;
+  try {
+    processId = (await client.request("daemon.status", {})).processId;
+  } catch {} finally {
+    client.close();
+  }
+  await stopProcess(processId);
+  rmSync(socketPath, { force: true });
+}
 
 test("archive tools advertise evidence-source routing", async () => {
   const tools = new Map();
@@ -55,7 +91,10 @@ test("archive tools advertise evidence-source routing", async () => {
 
 test("custom archive factories can replace the SQLite backend", async () => {
   const handlers = new Map();
+  const commands = new Map();
+  const notifications = [];
   let openedPath;
+  let openedOptions;
   let closed = false;
   const tools = new Map();
   const sourceKeys = Array.from({ length: 200 }, (_, index) =>
@@ -95,21 +134,26 @@ test("custom archive factories can replace the SQLite backend", async () => {
       maxToolResultTokens: 4_000,
       searchResults: 3,
       searchResultTokens: 1_500,
+      maxArchiveBytes: 10_000,
+      targetArchiveBytes: 7_500,
+      recentDocumentProtectionDays: 3,
+      minimumTurnsPerSession: 4,
       preventAutoCompaction: true,
       statusLabelAccent: false,
       dbPath: "/virtual/archive",
       models: {},
       environmentOverrides: {},
     }),
-    archiveFactory: (path) => {
+    archiveFactory: (path, options) => {
       openedPath = path;
+      openedOptions = options;
       return archive;
     },
   });
   await extension({
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
-    registerCommand() {},
+    registerCommand(name, command) { commands.set(name, command); },
     appendEntry() {},
   });
   const ctx = {
@@ -118,11 +162,22 @@ test("custom archive factories can replace the SQLite backend", async () => {
     model: { contextWindow: 100_000 },
     isProjectTrusted: () => false,
     sessionManager: { getSessionId: () => "custom", getBranch: () => [] },
-    ui: { setStatus() {} },
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
   };
 
   handlers.get("session_start")({}, ctx);
   assert.equal(openedPath, "/virtual/archive");
+  assert.deepEqual(openedOptions, {
+    retention: {
+      maxBytes: 10_000,
+      targetBytes: 7_500,
+      recentProtectionMs: 3 * 24 * 60 * 60 * 1_000,
+      minimumTurnsPerSession: 4,
+    },
+  });
 
   const recalled = await tools.get("context_recall").execute("call", { id: "recall-id" });
   assert.equal(recalled.details.found, true);
@@ -139,8 +194,207 @@ test("custom archive factories can replace the SQLite backend", async () => {
   const missing = await tools.get("context_recall").execute("call", { id: "missing" });
   assert.deepEqual(missing.details, { found: false, provenance: null });
 
+  const structural = await tools.get("context_window_search").execute("call", {
+    relation: "latest-question",
+  });
+  assert.equal(structural.details.mode, "structural");
+  assert.equal(structural.details.status, "not-found");
+  assert.equal(structural.details.relation, "latest-question");
+  assert.match(structural.content[0].text, /Structural retrieval: latest-question — not-found/);
+  await assert.rejects(
+    tools.get("context_window_search").execute("call", {}),
+    /requires query or relation/,
+  );
+
+  await commands.get("window").handler("archive status", ctx);
+  await commands.get("window").handler("archive prune", ctx);
+  await commands.get("window").handler("archive reclaim", ctx);
+  assert.match(notifications[0].message, /metrics are unavailable/);
+  assert.deepEqual(notifications.slice(1), [
+    { message: "Archive cleanup is unavailable for this backend.", level: "warning" },
+    { message: "Archive reclamation is unavailable for this backend.", level: "warning" },
+  ]);
+
   handlers.get("session_shutdown")({}, ctx);
   assert.equal(closed, true);
+});
+
+test("Pi defaults to project-bound RocksDB search, locator recall, and protection leases", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-extension-rocks-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const handlers = new Map();
+  const tools = new Map();
+  let daemonProcessId;
+  let started = false;
+  const extension = createContextEpochWindow({
+    configLoader: () => loadConfig({
+      cwd: directory,
+      home: directory,
+      projectTrusted: false,
+      env: {
+        CONTEXT_WINDOW_ROCKSDB: storePath,
+        CONTEXT_WINDOW_SOCKET: socketPath,
+        CONTEXT_WINDOW_ROTATION_TOKENS: "100000",
+        CONTEXT_WINDOW_ROTATION_TURNS: "3",
+        CONTEXT_WINDOW_HARD_LIMIT_TOKENS: "120000",
+        CONTEXT_WINDOW_RETAIN_TURNS: "1",
+        CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL: "false",
+        CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS: "0",
+        CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION: "0",
+      },
+    }),
+  });
+  await extension({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool(tool) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: directory,
+    hasUI: false,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "rocks-extension-session",
+      getBranch: () => [],
+    },
+    ui: { setStatus() {} },
+  };
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "PI_ROCKS_LOCATOR_TOKEN exact first question" }], timestamp: 1 },
+    { role: "assistant", content: [{ type: "text", text: "Exact first archived answer" }], timestamp: 2 },
+    { role: "user", content: [{ type: "text", text: "Second question" }], timestamp: 3 },
+    { role: "assistant", content: [{ type: "text", text: "Second answer" }], timestamp: 4 },
+    { role: "user", content: [{ type: "text", text: "Continue" }], timestamp: 5 },
+    { role: "assistant", content: [{ type: "text", text: "Current answer" }], timestamp: 6 },
+  ];
+
+  try {
+    handlers.get("session_start")({}, ctx);
+    started = true;
+    handlers.get("context")({ messages }, ctx);
+
+    const search = await tools.get("context_window_search").execute("call", {
+      query: "PI_ROCKS_LOCATOR_TOKEN",
+      scope: "session",
+      limit: 3,
+    });
+    assert.equal(search.details.count, 1);
+    assert.match(search.details.ids[0], /^cw1\./u);
+    assert.match(search.content[0].text, /PI_ROCKS_LOCATOR_TOKEN/u);
+
+    const recall = await tools.get("context_recall").execute("call", {
+      id: search.details.ids[0],
+    });
+    assert.equal(recall.details.found, true);
+    assert.match(recall.content[0].text, /PI_ROCKS_LOCATOR_TOKEN exact first question/u);
+    assert.match(recall.content[0].text, /ARCHIVED HISTORICAL EVIDENCE/u);
+    const recallLines = recall.content[0].text.split("\n");
+    assert.equal(recallLines.length, 2);
+    const recallEnvelope = JSON.parse(recallLines[1]);
+    assert.equal(recallEnvelope.trust, "untrusted-archived-data");
+    assert.match(JSON.parse(recallEnvelope.bodyJson), /PI_ROCKS_LOCATOR_TOKEN/u);
+
+    // The normal post-run hook refreshes the active-context protection lease.
+    handlers.get("agent_settled")({}, ctx);
+    const rightProject = new StoreClient({ socketPath, project: directory, requestTimeoutMs: 5_000 });
+    const wrongProject = new StoreClient({
+      socketPath,
+      project: join(directory, "other-project"),
+      requestTimeoutMs: 5_000,
+    });
+    try {
+      assert.ok((await rightProject.request("store.count", { scope: "project" })).count >= 1);
+      assert.equal((await wrongProject.request("store.count", { scope: "project" })).count, 0);
+      const status = await rightProject.request("daemon.status", {});
+      assert.ok(status.retention.leases >= 1);
+      daemonProcessId = status.processId;
+    } finally {
+      rightProject.close();
+      wrongProject.close();
+    }
+  } finally {
+    if (!daemonProcessId) {
+      const client = new StoreClient({ socketPath, project: directory, requestTimeoutMs: 2_000 });
+      try { daemonProcessId = (await client.request("daemon.status", {})).processId; } catch {}
+      finally { client.close(); }
+    }
+    if (started) handlers.get("session_shutdown")({}, ctx);
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("relation search recovers the latest archived question from a rotated Pi session", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-structural-extension-"));
+  const handlers = new Map();
+  const tools = new Map();
+  const config = {
+    rotationTokens: 100_000,
+    rotationTokensExplicit: true,
+    rotationTurns: 3,
+    hardLimitTokens: 120_000,
+    hardLimitTokensExplicit: true,
+    retainTurns: 1,
+    maxToolResultTokens: 4_000,
+    searchResults: 3,
+    searchResultTokens: 1_500,
+    maxArchiveBytes: 10_000_000,
+    targetArchiveBytes: 7_500_000,
+    recentDocumentProtectionDays: 0,
+    minimumTurnsPerSession: 0,
+    preventAutoCompaction: true,
+    statusLabelAccent: false,
+    archiveBackend: "sqlite",
+    dbPath: join(directory, "archive.db"),
+    models: {},
+    environmentOverrides: {},
+  };
+  const extension = createContextEpochWindow({ configLoader: () => config });
+  await extension({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool(tool) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: directory,
+    hasUI: false,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "structural-extension-session",
+      getBranch: () => [],
+    },
+    ui: { setStatus() {} },
+  };
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "Why did the worker restart?" }], timestamp: 1 },
+    { role: "assistant", content: [{ type: "text", text: "First answer" }], timestamp: 2 },
+    { role: "user", content: [{ type: "text", text: "Were liveserving workloads scaled up?" }], timestamp: 3 },
+    { role: "assistant", content: [{ type: "text", text: "Second answer" }], timestamp: 4 },
+    { role: "user", content: [{ type: "text", text: "Continue" }], timestamp: 5 },
+    { role: "assistant", content: [{ type: "text", text: "Current answer" }], timestamp: 6 },
+  ];
+
+  try {
+    handlers.get("session_start")({}, ctx);
+    handlers.get("context")({ messages }, ctx);
+    const result = await tools.get("context_window_search").execute("call", {
+      relation: "latest-question",
+    });
+    assert.equal(result.details.mode, "structural");
+    assert.equal(result.details.status, "resolved");
+    assert.equal(result.details.relation, "latest-question");
+    assert.match(result.content[0].text, /Were liveserving workloads scaled up\?/);
+    assert.equal(result.details.candidates[0].relationConfidence, 100);
+  } finally {
+    handlers.get("session_shutdown")({}, ctx);
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("a pre-rotation fork searches externalized tool results across header lineage only", async () => {
@@ -159,6 +413,7 @@ test("a pre-rotation fork searches externalized tool results across header linea
     searchResultTokens: 1_500,
     preventAutoCompaction: true,
     statusLabelAccent: false,
+    archiveBackend: "sqlite",
     dbPath,
   };
 
@@ -256,16 +511,8 @@ test("a pre-rotation fork searches externalized tool results across header linea
   }
 });
 
-test("threshold compaction trusts provider-aware usage over an optimistic epoch estimate", async () => {
-  const handlers = new Map();
-  const archive = {
-    put() {},
-    search() { return []; },
-    get() { return undefined; },
-    count() { return 0; },
-    close() {},
-  };
-  const config = {
+function compactionConfig(overrides = {}) {
+  return {
     rotationContextRatio: 0.65,
     hardLimitContextRatio: 0.8,
     rotationTokens: 96_000,
@@ -275,86 +522,503 @@ test("threshold compaction trusts provider-aware usage over an optimistic epoch 
     hardLimitTokensExplicit: false,
     retainTurns: 5,
     maxToolResultTokens: 4_000,
+    maxInlineUserTokens: 16_000,
+    automaticRetrieval: false,
     searchResults: 3,
     searchResultTokens: 1_500,
+    maxArchiveBytes: 10_000_000,
+    targetArchiveBytes: 7_500_000,
+    recentDocumentProtectionDays: 3,
+    minimumTurnsPerSession: 4,
     preventAutoCompaction: true,
     statusLabelAccent: false,
+    archiveBackend: "sqlite",
     dbPath: "/virtual/archive",
     models: {},
     environmentOverrides: {},
+    ...overrides,
   };
-  const extension = createContextEpochWindow({
-    configLoader: () => config,
+}
+
+function memoryCheckpointArchive() {
+  const documents = new Map();
+  const puts = [];
+  return {
+    documents,
+    puts,
+    put(document) {
+      puts.push(document);
+      documents.set(document.id, document);
+      return document.id;
+    },
+    search() { return []; },
+    get(id) { return documents.get(id); },
+    count() { return documents.size; },
+    setProtectedContext() {},
+    prune() {},
+    close() {},
+  };
+}
+
+function compactionPreparation({
+  firstKeptEntryId = "kept-entry",
+  messagesToSummarize = [{
+    role: "user",
+    content: [{ type: "text", text: "exact source for compaction" }],
+    timestamp: 10,
+  }],
+  turnPrefixMessages = [],
+  isSplitTurn = false,
+  tokensBefore = 70_000,
+  previousSummary,
+} = {}) {
+  return {
+    firstKeptEntryId,
+    messagesToSummarize,
+    turnPrefixMessages,
+    isSplitTurn,
+    tokensBefore,
+    ...(previousSummary === undefined ? {} : { previousSummary }),
+    fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+    settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+  };
+}
+
+function compactionEvent(reason, preparation, branchEntries = []) {
+  return {
+    type: "session_before_compact",
+    preparation,
+    branchEntries,
+    reason,
+    willRetry: reason === "overflow",
+    signal: new AbortController().signal,
+  };
+}
+
+test("startup archive failure closes its backend and fails closed for oversized context", async () => {
+  const handlers = new Map();
+  const notifications = [];
+  const startupSecret = "STARTUP_ARCHIVE_SECRET_MUST_NOT_ESCAPE";
+  let closeCalls = 0;
+  const archive = {
+    setProtectedContext() { throw new Error(startupSecret); },
+    close() { closeCalls += 1; },
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ maxInlineUserTokens: 1_000 }),
     archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
   });
-  await extension({
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() { abortCalls += 1; },
+    sessionManager: { getSessionId: () => "startup-failure", getBranch: () => [] },
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
+  };
+
+  assert.throws(
+    () => handlers.get("session_start")({ reason: "new" }, ctx),
+    new RegExp(startupSecret),
+  );
+  assert.equal(closeCalls, 1);
+
+  const middleSentinel = "STARTUP_OVERSIZED_MIDDLE_MUST_NOT_ESCAPE";
+  const original = [{
+    role: "user",
+    content: `${"head ".repeat(2_000)}${middleSentinel}${" tail".repeat(2_000)}`,
+    timestamp: 1,
+  }];
+  const snapshot = structuredClone(original);
+  const result = handlers.get("context")({ messages: original }, ctx);
+
+  assert.deepEqual(result, { messages: [] });
+  assert.deepEqual(original, snapshot);
+  assert.equal(abortCalls, 1);
+  assert.deepEqual(notifications, [{
+    message: "Context preparation failed. The turn was aborted before provider submission.",
+    level: "error",
+  }]);
+  assert.equal(JSON.stringify({ result, notifications }).includes(middleSentinel), false);
+  assert.equal(JSON.stringify({ result, notifications }).includes(startupSecret), false);
+});
+
+test("shutdown closes the session even when clearing its UI status fails", async () => {
+  const handlers = new Map();
+  let closeCalls = 0;
+  const archive = {
+    setProtectedContext() {},
+    close() { closeCalls += 1; },
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    sessionManager: { getSessionId: () => "shutdown-ui-failure", getBranch: () => [] },
+    ui: { setStatus() {} },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+
+  assert.throws(
+    () => handlers.get("session_shutdown")({}, {
+      ...ctx,
+      hasUI: true,
+      ui: {
+        setStatus() { throw new Error("injected shutdown UI failure"); },
+      },
+    }),
+    /injected shutdown UI failure/,
+  );
+  assert.equal(closeCalls, 1);
+
+  handlers.get("session_shutdown")({}, ctx);
+  assert.equal(closeCalls, 1);
+});
+
+test("a post-construction transition failure closes the new session and stays fail closed", async () => {
+  const handlers = new Map();
+  let archiveCalls = 0;
+  let replacementCloseCalls = 0;
+  const previousArchive = {
+    setProtectedContext() {},
+    close() { throw new Error("injected previous-session close failure"); },
+  };
+  const replacementArchive = {
+    setProtectedContext() {},
+    close() { replacementCloseCalls += 1; },
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => (archiveCalls++ === 0 ? previousArchive : replacementArchive),
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() { abortCalls += 1; },
+    sessionManager: { getSessionId: () => "transition-failure", getBranch: () => [] },
+    ui: { setStatus() {}, notify() {} },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  assert.throws(
+    () => handlers.get("session_start")({ reason: "switch" }, ctx),
+    /injected previous-session close failure/u,
+  );
+  assert.equal(replacementCloseCalls, 1);
+  assert.deepEqual(
+    handlers.get("context")({ messages: [{ role: "user", content: "raw" }] }, ctx),
+    { messages: [] },
+  );
+  assert.equal(abortCalls, 1);
+});
+
+test("a timer cleanup failure clears the previous ready session and stays fail closed", async () => {
+  const handlers = new Map();
+  let closeCalls = 0;
+  const archive = {
+    setProtectedContext() {},
+    close() { closeCalls += 1; },
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() { abortCalls += 1; },
+    sessionManager: { getSessionId: () => "timer-cleanup-failure", getBranch: () => [] },
+    ui: { setStatus() {}, notify() {} },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.clearInterval = () => { throw new Error("injected startup timer cleanup failure"); };
+  try {
+    assert.throws(
+      () => handlers.get("session_start")({ reason: "reload" }, ctx),
+      /injected startup timer cleanup failure/u,
+    );
+  } finally {
+    globalThis.clearInterval = originalClearInterval;
+  }
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(
+    handlers.get("context")({ messages: [{ role: "user", content: "raw" }] }, ctx),
+    { messages: [] },
+  );
+  assert.equal(abortCalls, 1);
+});
+
+test("oversized archival failure aborts and cannot fail open to raw provider context", async () => {
+  const handlers = new Map();
+  const notifications = [];
+  const backendSecret = "BACKEND_SECRET_MUST_NOT_ESCAPE";
+  const middleSentinel = "OVERSIZED_MIDDLE_SENTINEL_MUST_NOT_ESCAPE";
+  const archive = {
+    put() { throw new Error(backendSecret); },
+    search() { return []; },
+    get() {},
+    count() { return 0; },
+    setProtectedContext() {},
+    close() {},
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ maxInlineUserTokens: 1_000 }),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { provider: "openai-codex", id: "gpt-test", contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() {
+      abortCalls += 1;
+      throw new Error("abort transport is already closed");
+    },
+    sessionManager: { getSessionId: () => "oversized-failure", getBranch: () => [] },
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  const original = [{
+    role: "user",
+    content: [{
+      type: "text",
+      text: `${"visible head ".repeat(1_000)}${middleSentinel}${" visible tail".repeat(1_000)}`,
+    }],
+    timestamp: 1,
+  }];
+  const snapshot = structuredClone(original);
+  const result = handlers.get("context")({ messages: original }, ctx);
+
+  assert.deepEqual(result, { messages: [] });
+  assert.deepEqual(original, snapshot);
+  assert.equal(abortCalls, 1);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "error");
+  assert.ok(notifications[0].message.length <= 120);
+  assert.equal(JSON.stringify({ result, notifications }).includes(middleSentinel), false);
+  assert.equal(JSON.stringify({ result, notifications }).includes(backendSecret), false);
+  handlers.get("session_shutdown")({}, ctx);
+});
+
+test("a status failure cannot restore raw input after oversized archival succeeds", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ maxInlineUserTokens: 1_000 }),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  let statusShouldThrow = true;
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: true,
+    model: { provider: "openai-codex", id: "gpt-test", contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() { abortCalls += 1; },
+    sessionManager: { getSessionId: () => "oversized-status", getBranch: () => [] },
+    ui: {
+      setStatus() {
+        if (statusShouldThrow) throw new Error("STATUS_SECRET_MUST_NOT_ESCAPE");
+      },
+      notify() {},
+    },
+  };
+  assert.doesNotThrow(() => handlers.get("session_start")({ reason: "new" }, ctx));
+  const middleSentinel = "STATUS_PATH_MIDDLE_SENTINEL_MUST_NOT_ESCAPE";
+  const original = [{
+    role: "user",
+    content: [{
+      type: "text",
+      text: `${"bounded head ".repeat(1_000)}${middleSentinel}${" bounded tail".repeat(1_000)}`,
+    }],
+    timestamp: 1,
+  }];
+  const snapshot = structuredClone(original);
+  const result = handlers.get("context")({ messages: original }, ctx);
+
+  assert.equal(result.messages.length, 1);
+  assert.equal(JSON.stringify(result).includes(middleSentinel), false);
+  assert.equal(JSON.stringify([...archive.documents.values()]).includes(middleSentinel), true);
+  assert.deepEqual(original, snapshot);
+  assert.equal(abortCalls, 0);
+  handlers.get("session_shutdown")({}, { ...ctx, hasUI: false });
+});
+
+test("a post-archive processing failure also aborts oversized provider input", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  let protectionShouldThrow = false;
+  archive.setProtectedContext = () => {
+    if (protectionShouldThrow) throw new Error("PROTECTION_SECRET_MUST_NOT_ESCAPE");
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ maxInlineUserTokens: 1_000 }),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const notifications = [];
+  let abortCalls = 0;
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    abort() { abortCalls += 1; },
+    sessionManager: { getSessionId: () => "post-archive-failure", getBranch: () => [] },
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  protectionShouldThrow = true;
+  const middleSentinel = "POST_ARCHIVE_MIDDLE_SENTINEL_MUST_NOT_ESCAPE";
+  const result = handlers.get("context")({
+    messages: [{
+      role: "user",
+      content: `${"head ".repeat(2_000)}${middleSentinel}${" tail".repeat(2_000)}`,
+      timestamp: 1,
+    }],
+  }, ctx);
+
+  assert.deepEqual(result, { messages: [] });
+  assert.equal(abortCalls, 1);
+  assert.equal(JSON.stringify({ result, notifications }).includes(middleSentinel), false);
+  assert.equal(JSON.stringify({ result, notifications }).includes("PROTECTION_SECRET"), false);
+  protectionShouldThrow = false;
+  handlers.get("session_shutdown")({}, ctx);
+});
+
+test("safe threshold cancellation requires finite provider usage and precedes every archive write", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+  })({
     on(name, handler) { handlers.set(name, handler); },
     registerTool() {},
     registerCommand() {},
     appendEntry() {},
   });
 
-  let providerTokens = 70_000;
+  let providerTokens = 240_000;
   const ctx = {
     cwd: "/project",
     hasUI: false,
-    model: { provider: "openai-codex", id: "gpt-test", contextWindow: 100_000 },
+    model: { provider: "openai-codex", id: "gpt-test", contextWindow: 372_000 },
     isProjectTrusted: () => false,
-    getContextUsage: () => ({ tokens: providerTokens, contextWindow: 100_000, percent: providerTokens / 1_000 }),
+    getContextUsage: () => ({ tokens: providerTokens, contextWindow: 372_000, percent: providerTokens / 3_720 }),
     sessionManager: { getSessionId: () => "compaction-test", getBranch: () => [] },
     ui: { setStatus() {} },
   };
-  handlers.get("session_start")({}, ctx);
+  handlers.get("session_start")({ reason: "new" }, ctx);
   handlers.get("context")({
     messages: [{ role: "user", content: [{ type: "text", text: "small visible epoch" }], timestamp: 1 }],
   }, ctx);
 
-  const event = (tokensBefore) => ({
-    reason: "threshold",
-    preparation: { tokensBefore },
-  });
-  assert.deepEqual(handlers.get("session_before_compact")(event(70_000), ctx), { cancel: true });
+  const preparation = compactionPreparation({ tokensBefore: 240_000 });
+  assert.deepEqual(
+    handlers.get("session_before_compact")(
+      compactionEvent("threshold", preparation),
+      ctx,
+    ),
+    { cancel: true },
+  );
+  assert.equal(archive.puts.length, 0);
 
-  // Reproduces the failure mode: the extension's chars/4 estimate is tiny,
-  // while Pi reports a provider payload beyond the 80K hard limit.
-  providerTokens = 95_000;
-  assert.equal(handlers.get("session_before_compact")(event(70_000), ctx), undefined);
+  for (const getContextUsage of [
+    () => ({ tokens: null, contextWindow: 372_000, percent: null }),
+    () => undefined,
+    () => { throw new Error("provider usage unavailable"); },
+  ]) {
+    const missingProviderUsage = handlers.get("session_before_compact")(
+      compactionEvent("threshold", preparation),
+      { ...ctx, getContextUsage },
+    );
+    assert.ok(missingProviderUsage.compaction);
+  }
+  assert.ok(archive.puts.length > 0);
 
-  providerTokens = 70_000;
-  assert.equal(handlers.get("session_before_compact")(event(95_000), ctx), undefined);
-  assert.equal(handlers.get("session_before_compact")({
-    reason: "threshold",
-    preparation: { tokensBefore: undefined },
-  }, { ...ctx, getContextUsage: () => ({ tokens: null, contextWindow: 100_000, percent: null }) }), undefined);
+  // This provider measurement is above the effective rotation threshold even
+  // though the epoch estimate remains tiny, so checkpointing is mandatory.
+  providerTokens = 295_345;
+  const unsafe = handlers.get("session_before_compact")(
+    compactionEvent("threshold", preparation),
+    ctx,
+  );
+  assert.ok(unsafe.compaction);
+  assert.ok(archive.puts.length > 0);
   handlers.get("session_shutdown")({}, ctx);
 });
 
-test("unsafe epoch fallback allows native compaction and persists a post-compaction reset", async () => {
+test("unsafe threshold, overflow, and manual compaction return the same bounded archive catalog", async () => {
   const handlers = new Map();
   const appended = [];
-  const archive = {
-    put() {}, search() { return []; }, get() {}, count() { return 0; }, close() {},
-  };
-  const config = {
-    rotationContextRatio: 0.65,
-    hardLimitContextRatio: 0.8,
-    rotationTokens: 65_000,
-    rotationTokensExplicit: true,
-    rotationTurns: 20,
-    hardLimitTokens: 80_000,
-    hardLimitTokensExplicit: true,
-    retainTurns: 10,
-    maxToolResultTokens: 4_000,
-    searchResults: 3,
-    searchResultTokens: 1_500,
-    preventAutoCompaction: true,
-    statusLabelAccent: false,
-    dbPath: "/virtual/archive",
-    models: {},
-    environmentOverrides: {},
-  };
+  const archive = memoryCheckpointArchive();
   await createContextEpochWindow({
-    configLoader: () => config,
+    configLoader: () => compactionConfig({
+      rotationTokens: 65_000,
+      rotationTokensExplicit: true,
+      hardLimitTokens: 80_000,
+      hardLimitTokensExplicit: true,
+      retainTurns: 10,
+    }),
     archiveFactory: () => archive,
   })({
     on(name, handler) { handlers.set(name, handler); },
@@ -371,22 +1035,51 @@ test("unsafe epoch fallback allows native compaction and persists a post-compact
     sessionManager: { getSessionId: () => "fallback-test", getBranch: () => [] },
     ui: { setStatus() {} },
   };
-  handlers.get("session_start")({}, ctx);
+  handlers.get("session_start")({ reason: "new" }, ctx);
   handlers.get("context")({
-    messages: [
-      { role: "user", content: [{ type: "text", text: "old" }], timestamp: 1 },
-      { role: "assistant", content: [{ type: "text", text: "old" }], timestamp: 2 },
-      { role: "user", content: [{ type: "text", text: "current" }], timestamp: 3 },
-      { role: "assistant", content: [{ type: "text", text: "x".repeat(300_000) }], timestamp: 4 },
-    ],
+    messages: [{ role: "user", content: [{ type: "text", text: "small live turn" }], timestamp: 1 }],
   }, ctx);
 
-  const event = { reason: "threshold", preparation: { tokensBefore: 70_000 } };
-  assert.equal(handlers.get("session_before_compact")(event, ctx), undefined);
-  assert.equal(handlers.get("session_before_compact")({ ...event, reason: "overflow" }, ctx), undefined);
-  assert.equal(handlers.get("session_before_compact")({ ...event, reason: "manual" }, ctx), undefined);
+  const middleSentinel = "COMPACTION_MIDDLE_SENTINEL_MUST_NOT_ESCAPE";
+  const preparation = compactionPreparation({
+    messagesToSummarize: [{
+      role: "user",
+      content: [{
+        type: "text",
+        text: `${"checkpoint head ".repeat(8_000)}${middleSentinel}${" checkpoint tail".repeat(8_000)}`,
+      }],
+      timestamp: 2,
+    }],
+  });
+  const results = ["threshold", "overflow", "manual"].map((reason) =>
+    handlers.get("session_before_compact")(
+      compactionEvent(reason, preparation),
+      ctx,
+    ));
 
-  handlers.get("session_compact")({}, ctx);
+  for (const result of results) {
+    assert.deepEqual(Object.keys(result), ["compaction"]);
+    assert.deepEqual(
+      Object.keys(result.compaction).sort(),
+      ["details", "firstKeptEntryId", "summary", "tokensBefore"],
+    );
+    assert.deepEqual(Object.keys(result.compaction.details), ["contextWindowArchive"]);
+    assert.deepEqual(
+      Object.keys(result.compaction.details.contextWindowArchive).sort(),
+      ["entries", "version"],
+    );
+    assert.equal(result.compaction.details.contextWindowArchive.version, 1);
+    assert.equal(result.compaction.firstKeptEntryId, preparation.firstKeptEntryId);
+    assert.equal(result.compaction.tokensBefore, preparation.tokensBefore);
+    assert.ok(result.compaction.summary.length <= 4_000);
+    assert.equal(JSON.stringify(result).includes(middleSentinel), false);
+  }
+  assert.deepEqual(results[1], results[0]);
+  assert.deepEqual(results[2], results[0]);
+  assert.equal(JSON.stringify([...archive.documents.values()]).includes(middleSentinel), true);
+  assert.equal(appended.length, 0);
+
+  handlers.get("session_compact")({ fromExtension: true }, ctx);
   assert.equal(appended.length, 1);
   assert.equal(appended[0][0], ROTATION_STATE_ENTRY);
   assert.equal(appended[0][1].boundaryKey, undefined);
@@ -394,8 +1087,198 @@ test("unsafe epoch fallback allows native compaction and persists a post-compact
   handlers.get("session_shutdown")({}, ctx);
 });
 
+test("compaction admission fails closed for missing, malformed, undefined, and thrown checkpoints", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    getContextUsage: () => ({ tokens: 90_000, contextWindow: 100_000, percent: 90 }),
+    sessionManager: { getSessionId: () => "fail-closed", getBranch: () => [] },
+    ui: { setStatus() {} },
+  };
+  const validPreparation = compactionPreparation({ tokensBefore: 90_000 });
+  const validEvent = compactionEvent("manual", validPreparation);
+  assert.deepEqual(handlers.get("session_before_compact")(validEvent, ctx), { cancel: true });
+
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  assert.deepEqual(handlers.get("session_before_compact")(undefined, ctx), { cancel: true });
+  assert.deepEqual(handlers.get("session_before_compact")({
+    ...validEvent,
+    preparation: { ...validPreparation, fileOps: undefined },
+  }, ctx), { cancel: true });
+  assert.equal(archive.puts.length, 0);
+
+  const emptyPreparation = compactionPreparation({
+    messagesToSummarize: [],
+    turnPrefixMessages: [],
+  });
+  assert.deepEqual(
+    handlers.get("session_before_compact")(
+      compactionEvent("manual", emptyPreparation),
+      ctx,
+    ),
+    { cancel: true },
+  );
+
+  const originalCheckpoint = EpochWindowSession.prototype.checkpointCompaction;
+  try {
+    EpochWindowSession.prototype.checkpointCompaction = function checkpointThrows() {
+      throw new Error("THROWN_CHECKPOINT_SECRET");
+    };
+    assert.deepEqual(
+      handlers.get("session_before_compact")(validEvent, ctx),
+      { cancel: true },
+    );
+
+    const details = { contextWindowArchive: { version: 1, entries: [{}] } };
+    EpochWindowSession.prototype.checkpointCompaction = function checkpointAddsFields() {
+      return {
+        summary: "bounded catalog",
+        firstKeptEntryId: "kept-entry",
+        tokensBefore: 90_000,
+        estimatedTokensAfter: 12,
+        rawPayload: "RAW_PAYLOAD_MUST_BE_DROPPED",
+        details,
+      };
+    };
+    assert.deepEqual(
+      handlers.get("session_before_compact")(validEvent, ctx),
+      { cancel: true },
+    );
+
+    const exactResult = {
+      summary: "bounded catalog",
+      firstKeptEntryId: "kept-entry",
+      tokensBefore: 90_000,
+      details,
+    };
+    EpochWindowSession.prototype.checkpointCompaction = function checkpointIsExact() {
+      return exactResult;
+    };
+    const projected = handlers.get("session_before_compact")(validEvent, ctx);
+    assert.deepEqual(Object.keys(projected.compaction).sort(), [
+      "details",
+      "firstKeptEntryId",
+      "summary",
+      "tokensBefore",
+    ]);
+    assert.equal(projected.compaction, exactResult);
+    assert.equal(projected.compaction.details, details);
+
+    EpochWindowSession.prototype.checkpointCompaction = function malformedDetails() {
+      return {
+        summary: "untrusted catalog",
+        firstKeptEntryId: "kept-entry",
+        tokensBefore: 90_000,
+        details: { contextWindowArchive: { version: 2, entries: [{}] } },
+      };
+    };
+    assert.deepEqual(
+      handlers.get("session_before_compact")(validEvent, ctx),
+      { cancel: true },
+    );
+  } finally {
+    EpochWindowSession.prototype.checkpointCompaction = originalCheckpoint;
+  }
+  handlers.get("session_shutdown")({}, ctx);
+});
+
+test("only a valid versioned prior catalog is carried into the next compaction", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    getContextUsage: () => ({ tokens: 90_000, contextWindow: 100_000, percent: 90 }),
+    sessionManager: { getSessionId: () => "prior-catalog", getBranch: () => [] },
+    ui: { setStatus() {} },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+
+  const baseline = handlers.get("session_before_compact")(
+    compactionEvent("manual", compactionPreparation({
+      messagesToSummarize: [{ role: "user", content: "first exact span", timestamp: 1 }],
+    })),
+    ctx,
+  ).compaction;
+  const baselineEntry = baseline.details.contextWindowArchive.entries[0];
+  const priorBranchEntry = {
+    type: "compaction",
+    id: "prior-compaction",
+    fromHook: true,
+    summary: baseline.summary,
+    firstKeptEntryId: baseline.firstKeptEntryId,
+    tokensBefore: baseline.tokensBefore,
+    details: baseline.details,
+  };
+  const nextPreparation = compactionPreparation({
+    previousSummary: baseline.summary,
+    messagesToSummarize: [{ role: "user", content: "second exact span", timestamp: 2 }],
+  });
+  const carried = handlers.get("session_before_compact")(
+    compactionEvent("manual", nextPreparation, [priorBranchEntry]),
+    ctx,
+  ).compaction;
+  assert.equal(
+    carried.details.contextWindowArchive.entries.some((entry) => entry.rootId === baselineEntry.rootId),
+    true,
+  );
+  assert.equal(
+    carried.details.contextWindowArchive.entries.some((entry) => entry.kind === "archive-previous-summary"),
+    false,
+  );
+
+  const malformedPrior = {
+    ...priorBranchEntry,
+    details: {
+      contextWindowArchive: {
+        ...priorBranchEntry.details.contextWindowArchive,
+        version: 2,
+      },
+    },
+  };
+  const recovered = handlers.get("session_before_compact")(
+    compactionEvent("manual", nextPreparation, [malformedPrior]),
+    ctx,
+  ).compaction;
+  assert.equal(
+    recovered.details.contextWindowArchive.entries.some((entry) => entry.rootId === baselineEntry.rootId),
+    false,
+  );
+  assert.equal(
+    recovered.details.contextWindowArchive.entries.some((entry) => entry.kind === "archive-previous-summary"),
+    true,
+  );
+  handlers.get("session_shutdown")({}, ctx);
+});
+
 test("reload excludes an empty failed retry attempt from provider context", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-retry-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
   try {
     const handlers = new Map();
     let windowCommand;
@@ -426,7 +1309,12 @@ test("reload excludes an empty failed retry attempt from provider context", asyn
       configLoader: () => loadConfig({
         cwd: directory,
         projectTrusted: false,
-        env: { CONTEXT_WINDOW_DB: join(directory, "archive.db") },
+        env: {
+          CONTEXT_WINDOW_BACKEND: "sqlite",
+          CONTEXT_WINDOW_DB: join(directory, "archive.db"),
+          CONTEXT_WINDOW_ROCKSDB: storePath,
+          CONTEXT_WINDOW_SOCKET: socketPath,
+        },
         home: directory,
       }),
     });
@@ -454,14 +1342,28 @@ test("reload excludes an empty failed retry attempt from provider context", asyn
     assert.match(statuses.at(-1), /~\d+\/65K tokens$/);
     handlers.get("session_shutdown")({}, ctx);
   } finally {
+    await stopDaemonAt(socketPath, directory);
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
 test("tree navigation restores the destination branch epoch boundary", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-tree-"));
-  const previousDb = process.env.CONTEXT_WINDOW_DB;
-  process.env.CONTEXT_WINDOW_DB = join(directory, "archive.db");
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const envKeys = [
+    "CONTEXT_WINDOW_BACKEND",
+    "CONTEXT_WINDOW_DB",
+    "CONTEXT_WINDOW_ROCKSDB",
+    "CONTEXT_WINDOW_SOCKET",
+  ];
+  const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, {
+    CONTEXT_WINDOW_BACKEND: "sqlite",
+    CONTEXT_WINDOW_DB: join(directory, "archive.db"),
+    CONTEXT_WINDOW_ROCKSDB: storePath,
+    CONTEXT_WINDOW_SOCKET: socketPath,
+  });
   try {
     const handlers = new Map();
     const messages = [
@@ -500,16 +1402,24 @@ test("tree navigation restores the destination branch epoch boundary", async () 
     assert.deepEqual(handlers.get("context")({ messages }, ctx).messages, [messages[2]]);
     handlers.get("session_shutdown")({}, ctx);
   } finally {
-    if (previousDb === undefined) delete process.env.CONTEXT_WINDOW_DB;
-    else process.env.CONTEXT_WINDOW_DB = previousDb;
+    for (const key of envKeys) {
+      if (previousEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = previousEnv[key];
+    }
+    await stopDaemonAt(socketPath, directory);
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
 test("footer surfaces an over-limit retention floor", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-target-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
   const envKeys = [
+    "CONTEXT_WINDOW_BACKEND",
     "CONTEXT_WINDOW_DB",
+    "CONTEXT_WINDOW_ROCKSDB",
+    "CONTEXT_WINDOW_SOCKET",
     "CONTEXT_WINDOW_HARD_LIMIT_TOKENS",
     "CONTEXT_WINDOW_RETAIN_TURNS",
     "CONTEXT_WINDOW_ROTATION_TOKENS",
@@ -517,7 +1427,10 @@ test("footer surfaces an over-limit retention floor", async () => {
   ];
   const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   Object.assign(process.env, {
+    CONTEXT_WINDOW_BACKEND: "sqlite",
     CONTEXT_WINDOW_DB: join(directory, "archive.db"),
+    CONTEXT_WINDOW_ROCKSDB: storePath,
+    CONTEXT_WINDOW_SOCKET: socketPath,
     CONTEXT_WINDOW_HARD_LIMIT_TOKENS: "200",
     CONTEXT_WINDOW_RETAIN_TURNS: "10",
     CONTEXT_WINDOW_ROTATION_TOKENS: "100",
@@ -554,8 +1467,26 @@ test("footer surfaces an over-limit retention floor", async () => {
     const result = handlers.get("context")({ messages }, ctx);
 
     assert.deepEqual(result.messages, messages);
-    assert.equal(appendedEntries.length, 0);
-    assert.match(statuses.at(-1), /^Epoch · 10\/20 turns · ~\d+\/100 tokens · at limit · native compaction needed$/);
+    assert.equal(appendedEntries.length, 1);
+    assert.equal(appendedEntries[0][0], ROTATION_STATE_ENTRY);
+    const { archivedAt, ...persistedHintDecision } = appendedEntries[0][1];
+    assert.ok(Number.isSafeInteger(archivedAt) && archivedAt > 0);
+    assert.deepEqual(persistedHintDecision, {
+      sessionId: "target-test",
+      sessionIds: ["target-test"],
+      boundaryKey: undefined,
+      rotations: 0,
+      reason: undefined,
+      mode: undefined,
+      configuredRetainTurns: 10,
+      effectiveRetainTurns: undefined,
+      toc: [],
+      hintState: {
+        version: 1,
+        reconstructOnlyMessageKeys: messages.map(messageKey),
+      },
+    });
+    assert.match(statuses.at(-1), /^Epoch · 10\/20 turns · ~\d+\/100 tokens · at limit · history checkpoint needed$/);
     const [, active, limit] = statuses.at(-1).match(/~(\d+)\/(\d+) tokens/);
     assert.ok(Number(active) > Number(limit));
     handlers.get("session_shutdown")({}, ctx);
@@ -564,6 +1495,7 @@ test("footer surfaces an over-limit retention floor", async () => {
       if (previousEnv[key] === undefined) delete process.env[key];
       else process.env[key] = previousEnv[key];
     }
+    await stopDaemonAt(socketPath, directory);
     rmSync(directory, { recursive: true, force: true });
   }
 });

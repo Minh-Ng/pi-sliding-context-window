@@ -1,6 +1,6 @@
 # Context Epoch Window
 
-A cache-aware context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns in local SQLite FTS5, and exposes BM25 search/recall tools.
+A cache-aware context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, structural, and bounded recall tools.
 
 The Pi adapter provides the complete implementation because Pi exposes a pre-request `context` hook. The included MCP server makes the archive portable to Claude Code, Codex, OpenCode, and other MCP clients, but those clients cannot transparently remove old transcript messages unless their plugin API exposes a message-transform hook.
 
@@ -10,28 +10,30 @@ The implementation separates portable policy from host wiring:
 
 - `src/epoch-window.js` — the host-independent session state machine. Storage and rotation persistence are injected through `archive` and `onRotation`.
 - `src/window.js` — pure message grouping, filtering, token estimation, and epoch-boundary functions.
-- `src/archive.js` — the default SQLite FTS5 archive; an adapter can supply another implementation with the same small `put/search/get/count/close` interface.
+- `src/daemon/**`, `src/rocksdb/**`, and `src/retrieval/**` — the single-owner RocksDB service, immutable canonical records, indexes, locators, leases, recall, retention, and automatic hint preflight.
+- `src/archive.js` — the SQLite compatibility backend and pre-authority rollback source; custom adapters can still provide the small archive interface.
 - `src/presentation.js` — shared output truncation and status/search formatting.
 - `src/evidence-routing.js` — production archive-vs-live policy, tool descriptions, agent guidelines, and stale-evidence label. Benchmark fixtures and helpers are isolated under `eval/evidence-routing/` and are not imported by production modules.
 - `src/session-id.js` — stable session identity and bounded, failure-tolerant Pi session-header lineage discovery.
 - `extensions/pi.ts` — a thin Pi lifecycle, tool, command, and UI adapter. `createContextEpochWindow()` accepts custom `configLoader` and `archiveFactory` dependencies.
-- `bin/context-window-mcp.js` — the portable MCP adapter over the same archive and presentation modules.
+- `bin/context-windowd.js` — the sole RocksDB owner and versioned local RPC endpoint.
+- `bin/context-window-mcp.js` — the portable MCP adapter over the same daemon-backed archive and presentation modules.
 
 This keeps provider policy testable without Pi and gives alternate hosts or storage backends explicit extension points.
 
-## SQLite dependency
+## Storage and Node requirement
 
-The packaged Pi extension and MCP server use SQLite by default. `src/archive.js` loads Node's built-in [`node:sqlite`](https://nodejs.org/api/sqlite.html) for the MCP server and tests, then falls back to Pi's built-in `bun:sqlite` runtime. BM25 retrieval requires FTS5 in either runtime. There is no native SQLite npm dependency to compile or install.
+The packaged Pi extension and MCP server use `@harperfast/rocksdb-js` through `context-windowd`. Adapters never open RocksDB directly. The first client starts the daemon on demand; later clients share its Unix socket and closing one client does not close the store. Context Window currently supports macOS and Linux; Windows is unsupported because this release does not implement a named-pipe transport.
 
-The package requires Node **22.13+**, the first Node 22 release where `node:sqlite` is available without `--experimental-sqlite`. The test environment uses Node 24 and verifies FTS5 by creating and querying the archive. Unusual custom Node builds can omit FTS5; archive startup then fails with a direct compatibility error.
+The package requires Node **22.19–22.x or 24+** and is tested on Node 24. Node 23 is not supported. Fresh installations default to RocksDB. If an existing SQLite archive is detected and no backend was explicitly configured, SQLite remains authoritative until the offline migration procedure completes.
 
-Programmatic Pi integrations can avoid SQLite by calling `createContextEpochWindow({ archiveFactory })`. The factory must provide `put`, `search`, `get`, `count`, and `close`; when supplied, the Pi adapter does not load `src/archive.js`. The included MCP executable currently always uses the SQLite archive.
+Programmatic Pi integrations can replace storage by calling `createContextEpochWindow({ archiveFactory })`. The factory must provide `put`, `search`, `get`, `count`, and `close`; automatic preflight is enabled when it also provides `preflight`.
 
 ## Pi compatibility
 
 No local or unreleased Pi patch is required. The adapter uses documented public extension APIs only: the `context`, `session_start`, `session_tree`, `session_before_compact`, `session_compact`, `agent_settled`, `model_select`, and `session_shutdown` events; `appendEntry`; `registerTool`; `registerCommand`; and `ctx.ui.setStatus`.
 
-The package declares `@earendil-works/pi-coding-agent >=0.80.6`, the released version this integration is tested against. Transparent rotation specifically requires the host's pre-provider `context` message-transform hook, and threshold-compaction suppression requires cancellable `session_before_compact`; hosts without equivalents can use the MCP archive but not the full window policy.
+The package declares `@earendil-works/pi-coding-agent >=0.80.6` as its compatibility floor. The integration is tested against Pi 0.80.7. Transparent rotation specifically requires the host's pre-provider `context` message-transform hook, and threshold-compaction suppression requires cancellable `session_before_compact`; hosts without equivalents can use the MCP archive but not the full window policy.
 
 ## Behavior
 
@@ -39,15 +41,18 @@ Default policy:
 
 - Keep appending until the active epoch reaches approximately **65% of the selected model's context window or 20 user-role messages**.
 - Rotate once at a user-message boundary, normally retaining the configured number of latest interaction groups (each user-role message plus its following assistant/tool traffic). If that suffix does not fit the rotation target, retain progressively fewer complete groups, down to one. The footer reports `emergency retention N/M` when this safety policy goes below the configured target.
-- Archive removed interaction groups in `~/.pi/context-window/archive.db`.
+- Archive removed interaction groups in `~/.pi/context-window/archive.rocks` through the shared daemon.
 - Record each archived turn/preamble's ordered stable source message keys, explicit first/last keys, source count, session, project, archive kind, and creation time. Keys hash the complete deterministic message serialization. Exact recall shows this provenance in Pi and MCP; Pi also returns it as structured tool-result details for host/UI consumers.
 - Externalize individual tool results above **4K estimated tokens before the provider sees them**, recording the one original source message key while keeping the resulting document distinct from an archived turn.
 - Session-scoped search in a fork includes that session's verified parent archive lineage immediately, even if no ancestor has rotated. Ancestor identities come only from structurally valid Pi JSONL session headers; persisted rotation entries retain lineage only as informational state and cannot grant search access. Stable path identity is reserved for the current session when Pi does not provide its ID.
 - Keep exact source session entries unchanged. Archived text is deterministic source-derived message serialization, not stored raw message objects. Pi's `bashExecution`, `compactionSummary`, and `branchSummary` roles are serialized from their native payload fields so token estimates, stable keys, and archived preambles include their actual command/output or summary text.
-- BM25 retrieval is tool-driven, avoiding dynamic automatic injections that would damage prefix-cache reuse.
-- Cancel threshold-based Pi compaction only while both the filtered epoch estimate and Pi's provider-aware pre-compaction measurement are below the model-relative hard limit (80% by default). If those measurements disagree, the larger provider-aware value wins; threshold and overflow compaction remain available as safety mechanisms.
+- Before accounting or provider dispatch, archive user input above the default 16K-token inline limit exactly. Only the provider-facing text receives a bounded head/tail preview; non-text blocks remain present, automatic retrieval skips that still-visible source, and the Pi transcript stays unchanged. Admission failure aborts the turn without exposing the raw oversized text.
+- Run a cheap exact-first retrieval preflight for each current user message. Explicit historical intent may reveal one strong, unambiguous, date-labeled JSON excerpt. An implicit recurring concept can reveal only a continuity marker made from exact phrases in the current message; archived candidate wording and cold jargon do not enter that marker. Weak, stale, repeated, current-only, general-knowledge, and failed preflights add zero prompt bytes. Selected bytes are frozen by user-message key so an unchanged active prefix never changes after reindexing.
+- Apply semantic expiry by evidence class and age. There is no routine maximum archive size. Pins, active-context protections, and retrieval leases win deletion races; disk-low emergency mode remains a separate host-safety mechanism.
+- Let RocksDB compact obsolete LSM records in the background. Large deletion waves trigger a flush and continue through RocksDB's background workers; an explicit operator may request a full manual compaction. Compaction never decides which logical evidence is live.
+- Skip threshold-based compaction only when both required measurements are finite, the filtered epoch estimate remains below the hard limit, and the larger provider-aware measurement remains below the earlier rotation limit. Missing usage, manual/overflow requests, unsafe measurements, or an unrotatable turn require an exact archive checkpoint and bounded custom compaction result. If checkpoint publication cannot be confirmed, the adapter cancels compaction rather than pass raw source to a summarizer.
 
-Token estimates use `characters / 4` and exclude fixed request overhead such as the system prompt, tool schemas, and provider framing. Provider usage remains authoritative for compaction safety.
+Epoch sizing uses `characters / 4` and excludes fixed request overhead such as the system prompt, tool schemas, and provider framing. Model-visible hints and recall use the stricter deterministic estimator described below. Provider usage remains authoritative for compaction safety.
 
 ## Install in Pi
 
@@ -63,18 +68,32 @@ Restart Pi, then inspect it:
 /window
 /window search refresh token
 /window rotate
+/window archive status
+/window archive prune
+/window archive reclaim
 ```
 
 Agent tools:
 
-- `context_window_search` — BM25 search over archived turns and tool output
+- `context_window_search` — BM25 search over archived turns and tool output, or structural lookup of the latest archived question, request, correction, or answer
 - `context_recall` — recover an archived document by ID
 
-`context_recall` replaces the former `context_window_recall` name. No compatibility alias is registered, so clients should refresh tool discovery after upgrading.
+`context_recall` keeps direct document-ID compatibility. Search internally returns authenticated, version-bound locators and exact recall uses them without substituting newer versions.
 
 Use archive tools for prior intent, rationale, exact wording, decisions, rejected approaches, continuity, and scope disputes. Use live inspection for current files, runtime, configuration, tests, and task status. Mentioning old discussion or inviting history lookup does not make archive evidence material when the answer is exclusively current mutable state. For mixed questions, recover archived intent first, inspect live state second, and reconcile conflicts; archived evidence is never proof of current mutable state. Avoid speculative broad archive searches.
 
 For a conceptually phrased historical question without an exact identifier, the agent expands the lexical query with 3–8 concise likely synonyms or domain terms. Exact file names, symbols, errors, commits, PRs, and specific values are searched verbatim and are never broadened. A missed conceptual archive search permits at most one reformulation; a missed well-anchored search routes the agent to live or external evidence instead.
+
+When an existing context-recovery trigger has no lexical anchor, `context_window_search` accepts a structural `relation` instead of a query:
+
+```json
+{"relation":"latest-question","scope":"session"}
+{"relation":"latest-request","query":"LiveServing","scope":"session"}
+```
+
+Supported relations are `latest-question`, `latest-request`, `latest-correction`, and `latest-answer`. The archive scores original user and assistant messages with deterministic cues at rotation time; no model or embedding call is involved. A relation result keeps the containing turn's archive ID, so `context_recall` continues to recover the exact full turn. Results explicitly report `resolved`, `ambiguous`, `not-found`, or `legacy-fallback`. Ancestor-only, low-confidence, cross-session, and newer unindexed legacy evidence is not silently presented as a certain resolution.
+
+Query-only calls retain the existing document-level BM25 behavior and ordering. A relation plus query applies BM25 to individual user or assistant messages, preventing unrelated sibling tool or assistant text from satisfying the anchor.
 
 ### Routing benchmark and model evals
 
@@ -95,7 +114,11 @@ Eval fixtures, artifacts, and tests are repository-only development material and
 
 The footer maps each current value directly to its limit: `Epoch · 15/20 turns · ~92K/96K tokens`. Before the first provider request it says `waiting to measure`; at 80% it adds `near limit`; at or above a limit it adds `at limit`; and `/window rotate` immediately shows `rotation queued`. Semantic states use the active Pi theme rather than hard-coded colors. `Epoch` uses the theme accent by default; set `statusLabelAccent` to `false` for normal footer text.
 
-`retainTurns` is the normal retention target rather than an unconditional safety floor. Under token pressure, the extension chooses the largest complete-turn suffix that fits the rotation target and may retain fewer groups. If even the newest complete turn cannot fit, the footer reports `native compaction needed` and Pi's threshold/overflow compaction remains enabled. Pi's native percentage/window footer remains authoritative for provider context usage.
+`retainTurns` is the normal retention target rather than an unconditional safety floor. Under token pressure, the extension chooses the largest complete-turn suffix that fits the rotation target and may retain fewer groups. If even the newest complete turn cannot fit, the footer reports `history checkpoint needed`; the adapter archives the exact compaction inputs before returning a bounded custom result. Pi's percentage/window footer remains authoritative for provider context usage.
+
+The concise operator model for prompt use, automatic recall, project/session boundaries, retention, and reset procedures is documented in [state-operations.md](./docs/state-operations.md).
+The behavior-to-verifier map for retrieval and retention is maintained in [retrieval.md](./docs/rocksdb-archive/retrieval.md), [retention.md](./docs/rocksdb-archive/retention.md), and [evaluation.md](./docs/rocksdb-archive/evaluation.md).
+Oversized admission, fail-closed Pi handling, and real RocksDB restart reconstruction are verified by `test/epoch-window.test.js`, `test/extension.test.js`, and `test/oversized-compaction.test.js`.
 
 ## Configuration
 
@@ -122,11 +145,29 @@ Use the `context-window` namespace in Pi's shared settings files:
     },
     "retainTurns": 5,
     "maxToolResultTokens": 4000,
+    "maxInlineUserTokens": 16000,
     "searchResults": 3,
     "searchResultTokens": 1500,
+    "automaticRetrieval": true,
+    "hintBudgetTokens": 160,
+    "activeHintBudgetTokens": 640,
+    "epochHintBudgetTokens": 640,
+    "hintSourceCooldownHours": 24,
+    "ephemeralAutoRetrievalDays": 7,
+    "conversationAutoRetrievalDays": 30,
+    "derivedAutoRetrievalDays": 30,
+    "ephemeralRetentionDays": 14,
+    "conversationRetentionDays": 90,
+    "derivedRetentionDays": 30,
+    "archiveBackend": "rocksdb",
+    "rocksdbPath": "~/.pi/context-window/archive.rocks",
+    "dbPath": "~/.pi/context-window/archive.db",
+    "maxArchiveBytes": 1073741824,
+    "targetArchiveBytes": 805306368,
+    "recentDocumentProtectionDays": 7,
+    "minimumTurnsPerSession": 20,
     "preventAutoCompaction": true,
-    "statusLabelAccent": true,
-    "dbPath": "~/.pi/context-window/archive.db"
+    "statusLabelAccent": true
   }
 }
 ```
@@ -137,7 +178,11 @@ Precedence, from lowest to highest, is: defaults, global legacy, global namespac
 
 Model keys match `provider/model-id`, are case-insensitive, and support `*`. Case-variant redeclarations are the same profile: their fields merge, the later spelling is displayed, and the redeclared profile moves to that later source-order position. An object redeclaration with no valid fields still reorders an existing profile and inherits its valid fields; without an existing profile, it is ignored. The most specific matching pattern wins; equally specific patterns use the later declaration. Profiles can override `rotationContextRatio`, `hardLimitContextRatio`, and `rotationTurns`. The active profile is shown by `/window`.
 
+`activeHintBudgetTokens` is the preferred name for the 640-token active-context allowance. `epochHintBudgetTokens` remains a compatibility alias; when both are present at the same precedence, the preferred name wins.
+
 Legacy `rotationTokens` and `hardLimitTokens` remain supported as explicit safety caps on ratio-derived limits. When Pi does not provide a valid model context window, they fall back to 96K and 128K respectively.
+
+`archiveBackend` defaults to `rocksdb` only when no SQLite archive exists. An existing `dbPath` selects SQLite unless `archiveBackend` or `CONTEXT_WINDOW_BACKEND` explicitly selects RocksDB after offline verification. Every packaged adapter consults the singleton authority record through the configured RocksDB daemon before serving archive operations. SQLite startup persists a source-bound claim before opening SQLite. Fresh RocksDB startup persists permanent authority immediately, while a verified cutover remains rollback-eligible until its first canonical write atomically seals authority. SQLite startup therefore creates or contacts `rocksdbPath` even when remaining on SQLite; RocksDB startup always checks the configured `dbPath`. Concurrent or stale backend selections fail closed instead of opening divergent writable histories. Packaged adapters reject a fresh, incomplete, blocked, wrong-source, or post-authority rollback configuration. `maxArchiveBytes`, `targetArchiveBytes`, and SQLite reclamation settings apply only to SQLite. RocksDB uses `rocksdbPath`, derives a short Unix socket path automatically when `socketPath` is omitted, and has no routine archive-size cap. Raw tool payloads expire after 14 days by default, conversation sources after 90 days, and source-linked derived evidence after 30 days. Automatic prompt insertion is stricter: tool, conversation, and derived candidates become ineligible after 7, 30, and 30 days respectively. Manual or durable archives are never inserted automatically and do not expire automatically. Set a retention day value to `0` to disable automatic expiry for that storage class.
 
 Environment variables use the same values:
 
@@ -149,12 +194,38 @@ CONTEXT_WINDOW_ROTATION_TURNS
 CONTEXT_WINDOW_HARD_LIMIT_TOKENS
 CONTEXT_WINDOW_RETAIN_TURNS
 CONTEXT_WINDOW_MAX_TOOL_RESULT_TOKENS
+CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS
 CONTEXT_WINDOW_SEARCH_RESULTS
 CONTEXT_WINDOW_SEARCH_RESULT_TOKENS
+CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL
+CONTEXT_WINDOW_HINT_BUDGET_TOKENS
+CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS
+CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS
+CONTEXT_WINDOW_HINT_SOURCE_COOLDOWN_HOURS
+CONTEXT_WINDOW_EPHEMERAL_AUTO_RETRIEVAL_DAYS
+CONTEXT_WINDOW_CONVERSATION_AUTO_RETRIEVAL_DAYS
+CONTEXT_WINDOW_DERIVED_AUTO_RETRIEVAL_DAYS
+CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS
+CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS
+CONTEXT_WINDOW_DERIVED_RETENTION_DAYS
+CONTEXT_WINDOW_BACKEND
+CONTEXT_WINDOW_ROCKSDB
+CONTEXT_WINDOW_SOCKET
+CONTEXT_WINDOW_NODE
+CONTEXT_WINDOW_MAX_ARCHIVE_BYTES
+CONTEXT_WINDOW_TARGET_ARCHIVE_BYTES
+CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS
+CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION
 CONTEXT_WINDOW_PREVENT_AUTO_COMPACTION
 CONTEXT_WINDOW_STATUS_LABEL_ACCENT
 CONTEXT_WINDOW_DB
 ```
+
+The daemon is always launched with Node, even when the adapter host uses another runtime. `CONTEXT_WINDOW_NODE` can select an explicit Node 22.19–22.x or 24+ executable; otherwise a Node host reuses its current executable and a non-Node host resolves `node` from `PATH`.
+
+The default Unix socket is placed in a per-user `0700` directory under the operating-system temporary directory. A custom socket must likewise have a real, current-user-owned parent directory with no group or other access, and its ancestor chain cannot be controlled by another user; paths directly under a shared `/tmp` are rejected before any client connects or store opens. The RocksDB directory is created or tightened to `0700` before storage opens so archive contents remain inside a current-user-only trust boundary.
+
+The daemon runs bounded maintenance once per minute. Operators can tune its host-wide policy with `CONTEXT_WINDOW_MAINTENANCE_INTERVAL_MS`, `CONTEXT_WINDOW_RETENTION_BATCH_SIZE`, `CONTEXT_WINDOW_RETENTION_WAVES`, `CONTEXT_WINDOW_COMPACTION_DELETED_KEYS`, `CONTEXT_WINDOW_COMPACTION_RECLAIMABLE_BYTES`, `CONTEXT_WINDOW_CRITICAL_FREE_BYTES`, and `CONTEXT_WINDOW_ADMISSION_RESERVE_BYTES`. The default critical free-space threshold is 2 GiB; set it to `0` to disable the admission guard.
 
 ## Portable MCP archive
 
@@ -176,10 +247,26 @@ Optional environment:
 ```text
 CONTEXT_WINDOW_PROJECT=/absolute/project/path
 CONTEXT_WINDOW_SESSION=session-id
-CONTEXT_WINDOW_DB=~/.pi/context-window/archive.db
+CONTEXT_WINDOW_ROCKSDB=~/.pi/context-window/archive.rocks
+CONTEXT_WINDOW_SOCKET=/optional/custom/context-windowd.sock
 ```
 
 Point any MCP-capable client at that command. This provides shared archival and retrieval, not transparent transcript rotation on hosts without a pre-request message-transform API.
+
+## Daemon and migration operations
+
+The Pi and MCP adapters start `context-windowd` on demand. It can also be managed explicitly:
+
+```bash
+context-windowd --store ~/.pi/context-window/archive.rocks --socket ~/.cache/context-window/run/context-windowd-migration.sock --allow-shutdown
+context-window-migrate start --socket ~/.cache/context-window/run/context-windowd-migration.sock --source ~/.pi/context-window/archive.db --offline
+context-window-migrate verify --socket ~/.cache/context-window/run/context-windowd-migration.sock --source ~/.pi/context-window/archive.db --artifact ./migration-verification.json
+context-window-migrate status --socket ~/.cache/context-window/run/context-windowd-migration.sock
+```
+
+This is an offline migration. Stop every SQLite writer before passing `--offline`, and keep writers stopped until verification reports `passed` and status reports `offline-ready`. The flag asserts that quiescence; the CLI cannot stop other processes. Migration reads a coherent private SQLite DB/WAL snapshot, checkpoints idempotent batches, revalidates the completed prefix, and never modifies the source. RocksDB admissions are blocked during copy and verification.
+
+After `offline-ready`, explicitly select RocksDB and restart the adapter. At startup the adapter checks the destination's migration status and exact source path before it can accept a write. A fresh or otherwise unverified destination fails closed while the configured SQLite source exists. Selecting SQLite before the first new RocksDB write persists a rollback claim; returning to RocksDB then requires rerunning offline migration start and verification, which is the only path that clears that claim. The first new RocksDB canonical write atomically changes status to `rocksdb-authority`, persists permanent global RocksDB authority, and makes every later SQLite startup fail before SQLite opens. Logical retention is paused throughout copy, verification, blocked, and verified pre-authority states, then resumes after authority. There is no supported automated rollback after that boundary. Imported records receive a fresh, checkpointed retention horizon at migration start: 14 days for raw tool payloads, 90 days for conversation sources, and 30 days for derived evidence by default. Migration provenance follows canonical document retention, resolved failures are removed after a successful retry, and RocksDB comparison detail is kept in a bounded audit window. See `docs/rocksdb-archive/migration-operations.md` for the complete procedure.
 
 ## Cache rationale
 
@@ -189,13 +276,16 @@ Resuming a Pi session preserves its session ID and deterministically rebuilds th
 
 ## Safety and limitations
 
-- Interaction groups are cut only at user-message boundaries, keeping assistant tool calls and results together. The epoch layer never splits a turn; a single oversized current turn delegates to Pi's native split-turn compaction.
+- Interaction groups are cut only at user-message boundaries, keeping assistant tool calls and results together. The epoch layer never splits a turn; a single oversized current turn is archived exactly and represented by a bounded preview before archive-first custom compaction.
 - The legacy configuration keys use `Turns`; they count user-role messages and remain named that way for backward compatibility.
-- A single enormous current turn may still reach native threshold or overflow handling because no safe complete-turn epoch boundary exists. Missing provider usage and measurements at or above the hard limit fail closed by allowing native compaction. After compaction, the extension persists a reset entry so reload cannot resurrect a stale epoch boundary or TOC.
+- A single enormous current turn may still reach threshold or overflow handling because no safe complete-turn epoch boundary exists. Missing provider usage and measurements at or above the rotation limit require an exact checkpoint and bounded custom catalog; checkpoint failure cancels the operation. After successful compaction, the extension persists a reset entry so reload cannot resurrect a stale epoch boundary or table of archived turns.
 - Fork lineage follows `parentSession` paths from the current Pi session file (including resumed sessions), with the fork event's previous file as a startup fallback. Missing, malformed, oversized, non-session, unsupported-version, or ID-less parent headers contribute no path-derived identity and stop traversal; path cycles and chains beyond 64 ancestors also stop without failing session start. Session-scoped archive queries additionally require the active project when one is available.
 - Images and non-text tool-result blocks are retained when text is externalized. Deterministic archive serialization records bounded image metadata (MIME type, decoded byte length, and a short SHA-256 digest) rather than base64 payloads, and token estimation uses Pi's provider-neutral 4,800-character proxy per image. Actual provider usage remains authoritative. Pre-multimodal persisted boundary keys remain restorable. New tool-result archives report their tool call ID/name and the stable key of their one original source message, but remain tool-result documents rather than archived turns.
-- Existing databases require no migration. Recall marks genuinely absent older source-key fields as `legacy-unavailable`, while partial, inconsistent, malformed, or non-object metadata receives a distinct provenance status. Archived text remains readable and searchable even when legacy metadata cannot be parsed. Search and recall limits are strict whole-output caps of `max(1, token limit) * 4` characters, including the archived-evidence label, headings, provenance, and truncation marker. Recall renders a concise archive/source summary before deterministic archived text, then adds ordered source keys and extra metadata only from the remaining budget; unusually long provenance therefore truncates before recalled evidence. Pi's structured recall details retain complete provenance regardless of the text cap.
-- SQLite and the MCP process are local. No archive content is sent to another service except when retrieved into an agent request.
+- Existing SQLite databases require an explicit offline, non-destructive migration before RocksDB can contain their history. Online dual writes and post-authority rollback are not supported. Legacy documents with no real source keys retain documented absence; synthetic migration identities are never reported as original message provenance.
+- RocksDB, SQLite rollback data, and the daemon socket are local. No archive content is sent to another service except when retrieved into an agent request.
+- Recall applies lexical and byte limits while selecting canonical source. The final model-visible JSON record uses conservative deterministic token accounting for punctuation, JSON escapes, CJK, and opaque identifiers, so embedded text cannot escape either the evidence boundary or the configured presentation budget.
+- Archive size is governed by retention rather than a fixed byte cap. One canonical document is limited to 8 MiB of UTF-8 source text and 1 MiB of metadata; split larger payloads into multiple documents. Source-message references are capped at 256 and 1 MiB of identifier text. Structural annotations are capped at 4,096 entries, 1 MiB of identifiers, and 1 MiB of message text. Derived indexing has independent bounded-work limits and records a durable `partial` or `skipped` status when a document exceeds them; the canonical document remains directly recallable.
+- Structural relation scores are intentionally small English-oriented heuristics. Low-confidence role fallback and uncertain lineage/legacy ordering are labeled ambiguous rather than treated as verified semantic classification.
 - BM25 is lexical. Search exact file names, symbols, errors, and decision terms.
 - The preserved initial routing eval did not capture response bytes directly; its line-oriented raw responses are explicitly marked as reconstructions. Model eval scores are evidence for those prompts, models, settings, and exposure state—not a guarantee of production behavior.
 

@@ -1,41 +1,129 @@
 import { ARCHIVED_EVIDENCE_LABEL } from "./evidence-routing.js";
+import {
+  estimateModelVisibleTokens,
+  modelVisiblePrefix,
+} from "./model-token-budget.js";
 import { archiveDocumentProvenance } from "./provenance.js";
+import { oneLineJson } from "./retrieval/render.js";
 
 const TRUNCATION_MARKER = "[… retrieval truncated …]";
 
-function characterLimit(tokens) {
+function tokenBudget(tokens) {
   const numeric = Number(tokens);
-  return Math.max(1, Number.isFinite(numeric) ? numeric : 1) * 4;
+  return Math.max(1, Math.floor(Number.isFinite(numeric) ? numeric : 1));
 }
 
 function capCharacters(text, max, marker = TRUNCATION_MARKER) {
-  if (text.length <= max) return text;
+  if (estimateModelVisibleTokens(text) <= max) return text;
   const available = Math.max(0, Math.floor(max));
   if (available === 0) return "";
 
   const suffix = `\n${marker}`;
-  if (suffix.length < available) {
-    return `${text.slice(0, available - suffix.length)}${suffix}`;
+  if (estimateModelVisibleTokens(suffix) < available) {
+    const prefix = modelVisiblePrefix(text, available, suffix);
+    if (prefix.length > 0) return `${prefix}${suffix}`;
   }
 
-  // A clipped prose marker is less useful than the retrieved prefix. Fall back to
-  // one unambiguous character so tiny limits still preserve as much evidence as possible.
-  if (available === 1) return "…";
-  return `${text.slice(0, available - 1)}…`;
+  // A clipped prose marker is less useful than an evidence prefix.
+  if (estimateModelVisibleTokens("…") <= available) {
+    return `${modelVisiblePrefix(text, available, "…")}…`;
+  }
+  return modelVisiblePrefix(".".repeat(available), available);
 }
 
 export function capText(text, tokens, marker = TRUNCATION_MARKER) {
-  return capCharacters(text, characterLimit(tokens), marker);
+  return capCharacters(text, tokenBudget(tokens), marker);
 }
 
-export function formatSearchResults(results, tokenLimit) {
+export function formatSearchResults(results, tokenLimit, searchDetails) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
-  const body = results.length
-    ? results.map((result, index) =>
-      `## ${index + 1}. ${result.id} (${result.kind})\n${result.snippet || result.text}`,
-    ).join("\n\n")
-    : "No matching archived context.";
-  return capText(`${heading}\n\n${body}`, tokenLimit);
+  const structural = searchDetails?.mode === "structural";
+  const status = structural
+    ? `Structural retrieval: ${searchDetails.relation} — ${searchDetails.status}. Results are archived candidates, not currently visible conversation.`
+    : undefined;
+  const maxTokens = tokenBudget(tokenLimit);
+  let output = [heading, status].filter(Boolean).join("\n\n");
+  if (estimateModelVisibleTokens(output) >= maxTokens) {
+    return modelVisiblePrefix(output, maxTokens);
+  }
+  if (results.length === 0) {
+    return capText(`${output}\n\nNo matching archived context.`, tokenLimit);
+  }
+
+  const recordValue = (result, index, snippet, truncated) => ({
+    format: "context-window.archived-search-result.v1",
+    trust: "untrusted-archived-data",
+    rank: index + 1,
+    recallId: result.id,
+    kind: result.kind,
+    snippet,
+    ...(structural && result.structural ? { structural: result.structural } : {}),
+    ...(truncated ? { truncated: true, notice: "retrieval truncated" } : {}),
+  });
+  const minimalTruncation = oneLineJson({
+    format: "context-window.archived-search-result.v1",
+    trust: "untrusted-archived-data",
+    truncated: true,
+    notice: "retrieval truncated",
+  });
+  const fitRecord = (result, index, available) => {
+    const snippet = String(result.snippet || result.text || "");
+    const full = oneLineJson(recordValue(result, index, snippet, false));
+    if (estimateModelVisibleTokens(full) <= available) return { text: full, truncated: false };
+    const empty = oneLineJson(recordValue(result, index, "", true));
+    if (estimateModelVisibleTokens(empty) > available) {
+      const identifiedTruncation = oneLineJson({
+        trust: "untrusted-archived-data",
+        recallId: result.id,
+        notice: "retrieval truncated",
+      });
+      if (estimateModelVisibleTokens(identifiedTruncation) <= available) {
+        return { text: identifiedTruncation, truncated: true };
+      }
+      return estimateModelVisibleTokens(minimalTruncation) <= available
+        ? { text: minimalTruncation, truncated: true }
+        : undefined;
+    }
+    const codePoints = Array.from(snippet);
+    let low = 0;
+    let high = codePoints.length;
+    let best = empty;
+    while (low <= high) {
+      const midpoint = Math.floor((low + high) / 2);
+      const candidate = oneLineJson(recordValue(
+        result,
+        index,
+        codePoints.slice(0, midpoint).join(""),
+        true,
+      ));
+      if (estimateModelVisibleTokens(candidate) <= available) {
+        best = candidate;
+        low = midpoint + 1;
+      } else {
+        high = midpoint - 1;
+      }
+    }
+    return { text: best, truncated: true };
+  };
+
+  for (let index = 0; index < results.length; index += 1) {
+    const separator = "\n\n";
+    const available = maxTokens
+      - estimateModelVisibleTokens(output)
+      - estimateModelVisibleTokens(separator);
+    if (available <= 0) break;
+    const fitted = fitRecord(results[index], index, available);
+    if (!fitted) break;
+    output += `${separator}${fitted.text}`;
+    if (fitted.truncated) break;
+    if (index < results.length - 1) {
+      const remaining = maxTokens
+        - estimateModelVisibleTokens(output)
+        - estimateModelVisibleTokens("\n\n");
+      if (remaining < estimateModelVisibleTokens(minimalTruncation)) break;
+    }
+  }
+  return output;
 }
 
 function conciseProvenance(provenance, includeSourceBounds = true) {
@@ -94,31 +182,36 @@ export function formatRecalledDocument(document, tokenLimit, requestedId) {
     const suffix = requestedId ? ` with id ${requestedId}` : "";
     return capText(`${heading}\n\nNo archived document${suffix}.`, tokenLimit);
   }
+  if (document.modelVisibleFramed === true) {
+    // Daemon recall already applied the total conservative token budget and encoded source
+    // plus metadata as one untrusted JSON record. Any second truncation here
+    // could cut the JSON string open and destroy that trust boundary.
+    if (estimateModelVisibleTokens(document.text) <= tokenBudget(tokenLimit)) return document.text;
+    return capText(`[${ARCHIVED_EVIDENCE_LABEL}]\n\nArchived recall exceeded its presentation budget.`, tokenLimit);
+  }
 
   const provenance = document.provenance ?? archiveDocumentProvenance(document);
-  const max = characterLimit(tokenLimit);
+  const max = tokenBudget(tokenLimit);
   const evidencePrefix = `${heading}\n\n# ${document.id} (${document.kind})\n\n## Deterministic archived serialization\n`;
-  if (evidencePrefix.length >= max) return capCharacters(evidencePrefix, max);
+  const evidencePrefixTokens = estimateModelVisibleTokens(evidencePrefix);
+  if (evidencePrefixTokens >= max) return capCharacters(evidencePrefix, max);
 
-  const evidenceBudget = max - evidencePrefix.length;
-  if (document.text.length > evidenceBudget) {
-    // With exactly one character left, preserve actual evidence rather than
-    // spending that final character on a truncation marker.
-    const evidence = evidenceBudget === 1
-      ? document.text.slice(0, 1)
-      : capCharacters(document.text, evidenceBudget);
+  const evidenceBudget = max - evidencePrefixTokens;
+  if (estimateModelVisibleTokens(document.text) > evidenceBudget) {
+    const evidence = capCharacters(document.text, evidenceBudget);
     return `${evidencePrefix}${evidence}`;
   }
 
   let output = `${evidencePrefix}${document.text}`;
   const separator = "\n\n";
+  const separatorTokens = estimateModelVisibleTokens(separator);
   for (const section of [conciseProvenance(provenance), additionalProvenance(provenance)]) {
     if (!section) continue;
-    const remaining = max - output.length;
-    if (remaining <= separator.length) break;
-    const sectionBudget = remaining - separator.length;
+    const remaining = max - estimateModelVisibleTokens(output);
+    if (remaining <= separatorTokens) break;
+    const sectionBudget = remaining - separatorTokens;
     output += `${separator}${capCharacters(section, sectionBudget)}`;
-    if (section.length > sectionBudget) break;
+    if (estimateModelVisibleTokens(section) > sectionBudget) break;
   }
   return output;
 }
@@ -126,6 +219,52 @@ export function formatRecalledDocument(document, tokenLimit, requestedId) {
 export function compactTokenCount(tokens) {
   if (tokens == null) return "-";
   return tokens >= 1000 ? `${Math.round(tokens / 1000)}K` : String(tokens);
+}
+
+export function formatByteSize(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1_024) return `${value} B`;
+  if (value < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
+  if (value < 1_073_741_824) return `${(value / 1_048_576).toFixed(1)} MiB`;
+  return `${(value / 1_073_741_824).toFixed(2)} GiB`;
+}
+
+export function formatArchiveStorage(storage) {
+  if (!storage) return "Archive storage metrics are unavailable for this backend.";
+  if (storage.backend === "rocksdb" || storage.rocksdb) {
+    const counts = storage.counts ?? {};
+    const retention = storage.retention ?? {};
+    const rocksdb = storage.rocksdb ?? {};
+    const approximate = counts.approximate === true || retention.approximate === true;
+    const lowerBound = approximate ? "at least " : "";
+    const approximationLabel = approximate ? " (bounded lower-bound status)" : "";
+    const sections = [
+      `RocksDB archive: ${lowerBound}${Number(counts.documents ?? 0).toLocaleString()} document(s); ${lowerBound}${formatByteSize(counts.logicalBytes ?? 0)} logical source bytes${approximationLabel}`,
+      `Physical data: ${formatByteSize(rocksdb.totalSstBytes ?? 0)} SST; ${formatByteSize(rocksdb.liveDataBytes ?? 0)} estimated live data; ${formatByteSize(rocksdb.pendingCompactionBytes ?? 0)} pending compaction`,
+      `Retention: ${lowerBound}${Number(retention.pins ?? 0)} pin(s), ${lowerBound}${Number(retention.leases ?? 0)} active lease(s), ${lowerBound}${Number(retention.cleanupBacklog ?? 0)} cleanup item(s)${approximationLabel}`,
+      "Capacity policy: no routine archive-size cap; semantic expiry and compaction reclaim obsolete data.",
+    ];
+    if (storage.filesystem?.emergencyMode || retention.emergencyMode) {
+      sections.push("Emergency disk-low mode is active.");
+    }
+    return sections.join("\n");
+  }
+  const sections = [
+    `Archive logical usage: ${formatByteSize(storage.logicalBytes)} / ${formatByteSize(storage.maxBytes)}; cleanup target: ${formatByteSize(storage.targetBytes)}`,
+    `SQLite files: ${formatByteSize(storage.databaseBytes)} database + ${formatByteSize(storage.walBytes)} WAL; reclaimable pages: ${formatByteSize(storage.reclaimableBytes)}`,
+    `Physical reclamation: ${storage.autoVacuum === "incremental"
+      ? "incremental vacuum available"
+      : storage.autoVacuum === "full"
+        ? "automatic full auto-vacuum enabled"
+        : "offline vacuum upgrade required"}`,
+  ];
+  if (storage.lastPrune?.deletedDocuments > 0) {
+    sections.push(
+      `Last cleanup: removed ${storage.lastPrune.deletedDocuments} document(s), ${formatByteSize(storage.lastPrune.deletedBytes)}`,
+    );
+  }
+  if (storage.overLimit) sections.push("Archive remains above its logical limit.");
+  return sections.join("\n");
 }
 
 function identity(text) {
@@ -173,7 +312,7 @@ export function formatStatusLine(status, style = {}) {
   if (status.lastRotationMode === "emergency-retention" && status.effectiveRetainTurns != null) {
     sections.push(warning(`emergency retention ${status.effectiveRetainTurns}/${status.retainTurns}`));
   }
-  if (status.compactionFallbackReason) sections.push(warning("native compaction needed"));
+  if (status.compactionFallbackReason) sections.push(warning("history checkpoint needed"));
   return sections.join(separator);
 }
 
@@ -189,11 +328,15 @@ export function formatStatusDetails(status) {
     sections.push(`Last rotation: emergency ${status.lastRotationReason}; retained ${status.effectiveRetainTurns}/${status.retainTurns} user-role messages`);
   }
   if (status.compactionFallbackReason) {
-    sections.push(`Native compaction fallback: ${status.compactionFallbackReason}`);
+    const reason = status.compactionFallbackReason === "oversized-latest-turn"
+      ? "the latest retained turn is too large to rotate safely"
+      : "the active history could not rotate safely";
+    sections.push(`Compaction safety: archive checkpoint required; ${reason}.`);
   }
   sections.push(
     `Rotations: ${status.rotations}; archived documents: ${status.archivedDocuments}`,
     `Database: ${status.dbPath}`,
   );
+  if (status.archiveStorage) sections.push(formatArchiveStorage(status.archiveStorage));
   return sections.join("\n");
 }

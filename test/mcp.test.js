@@ -3,22 +3,134 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { Archive } from "../src/archive.js";
+import { defaultSocketPath } from "../src/daemon/paths.js";
 import {
   ARCHIVED_EVIDENCE_LABEL,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
+import { StoreClient } from "../src/store-client.js";
+import {
+  MAX_DOCUMENT_TEXT_BYTES,
+  MAX_STORE_IDENTIFIER_LENGTH,
+} from "../src/store-contract.js";
 
-function startServer(databasePath) {
-  return spawn(process.execPath, ["bin/context-window-mcp.js"], {
+function startServer(databasePath, extraEnvironment = {}) {
+  const directory = dirname(databasePath);
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const project = directory;
+  const child = spawn(process.execPath, ["bin/context-window-mcp.js"], {
     cwd: new URL("..", import.meta.url),
-    env: { ...process.env, CONTEXT_WINDOW_DB: databasePath },
+    env: {
+      ...process.env,
+      HOME: directory,
+      CONTEXT_WINDOW_BACKEND: "sqlite",
+      CONTEXT_WINDOW_DB: databasePath,
+      CONTEXT_WINDOW_ROCKSDB: storePath,
+      CONTEXT_WINDOW_SOCKET: socketPath,
+      CONTEXT_WINDOW_PROJECT: project,
+      ...extraEnvironment,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  child.authority = { socketPath, project };
+  return child;
+}
+
+function startRocksServer({ directory, storePath, socketPath, project }) {
+  const env = {
+    ...process.env,
+    HOME: directory,
+    CONTEXT_WINDOW_PROJECT: project,
+    CONTEXT_WINDOW_SESSION: "mcp-rocks-session",
+    CONTEXT_WINDOW_ROCKSDB: storePath,
+    CONTEXT_WINDOW_SOCKET: socketPath,
+  };
+  // The absence of this switch is the behavior under test: RocksDB is the
+  // default adapter, even when the invoking process happens to override it.
+  delete env.CONTEXT_WINDOW_BACKEND;
+  delete env.CONTEXT_WINDOW_DB;
+  return spawn(process.execPath, ["bin/context-window-mcp.js"], {
+    cwd: new URL("..", import.meta.url),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+function rpcClient(child) {
+  const input = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const pending = new Map();
+  let sequence = 0;
+  input.on("line", (line) => {
+    const response = JSON.parse(line);
+    const waiter = pending.get(response.id);
+    if (!waiter) return;
+    pending.delete(response.id);
+    waiter.resolve(response);
+  });
+  input.on("error", (error) => {
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+  });
+  return {
+    request(method, params) {
+      const id = ++sequence;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (error) => {
+          if (!error) return;
+          pending.delete(id);
+          reject(error);
+        });
+      });
+    },
+    close() { input.close(); },
+  };
+}
+
+function processExists(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function stopProcess(processId) {
+  if (!processId || !processExists(processId)) return;
+  process.kill(processId, "SIGTERM");
+  const deadline = Date.now() + 1_000;
+  while (processExists(processId) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (processExists(processId)) {
+    process.kill(processId, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function daemonStatus(socketPath, project) {
+  const client = new StoreClient({ socketPath, project, requestTimeoutMs: 5_000 });
+  try {
+    return await client.request("daemon.status", {});
+  } finally {
+    client.close();
+  }
+}
+
+async function stopServerAuthority(child) {
+  const authority = child.authority;
+  if (!authority) return;
+  let processId;
+  try { processId = (await daemonStatus(authority.socketPath, authority.project)).processId; } catch {}
+  await stopProcess(processId);
+  rmSync(authority.socketPath, { force: true });
 }
 
 function collectLines(stream, count) {
@@ -39,7 +151,7 @@ function collectLines(stream, count) {
 test("MCP exposes routing guidance and labels recall output as archived evidence", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-routing-"));
   const child = startServer(join(directory, "archive.db"));
-  const responses = collectLines(child.stdout, 2);
+  const responses = collectLines(child.stdout, 4);
 
   try {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
@@ -49,13 +161,29 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
       method: "tools/call",
       params: { name: "context_recall", arguments: { id: "missing" } },
     })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "context_window_status", arguments: {} },
+    })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "context_window_search", arguments: { relation: "latest-question" } },
+    })}\n`);
 
-    const [listed, recalled] = await responses;
+    const [listed, recalled, status, structural] = await responses;
     const search = listed.result.tools.find(({ name }) => name === "context_window_search");
     const recall = listed.result.tools.find(({ name }) => name === "context_recall");
+    const archiveTool = listed.result.tools.find(({ name }) => name === "context_window_archive");
     assert.equal(listed.result.tools.some(({ name }) => name === "context_window_recall"), false);
     assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);
     assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);
+    assert.equal(search.inputSchema.properties.query.maxLength, 65_536);
+    assert.equal(recall.inputSchema.properties.id.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
+    assert.equal(archiveTool.inputSchema.properties.text.maxLength, MAX_DOCUMENT_TEXT_BYTES);
     assert.match(search.description, /historical evidence candidates/);
     assert.match(search.description, /context_recall.*exact original wording or source evidence/);
     assert.match(search.description, /live tools—not the archive—for current mutable state/);
@@ -64,6 +192,9 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
     assert.match(recall.description, /exact archived source document/);
     assert.match(recall.description, /exact original wording or source evidence/);
     assert.match(recall.description, /not as proof of current mutable state.*live tools/);
+    assert.match(status.result.content[0].text, /Archive logical usage/);
+    assert.match(status.result.content[0].text, /SQLite files/);
+    assert.match(structural.result.content[0].text, /Structural retrieval: latest-question — not-found/);
     assert.equal(recalled.result.isError, true);
     assert.equal(
       recalled.result.content[0].text.startsWith(`[${ARCHIVED_EVIDENCE_LABEL}]\n\n`),
@@ -75,6 +206,128 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
     assert.equal(exitCode, 0);
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
+    await stopServerAuthority(child);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP bounds oversized and unterminated stdin before JSON parsing", async () => {
+  const cases = [
+    {
+      name: "oversized",
+      bytes: Buffer.alloc(1_025, 0x20),
+      expected: /exceeds 1024 bytes/u,
+    },
+    {
+      name: "unterminated",
+      bytes: Buffer.from('{"jsonrpc":"2.0"', "utf8"),
+      expected: /Incomplete input frame/u,
+    },
+  ];
+  for (const candidate of cases) {
+    const directory = mkdtempSync(join(tmpdir(), `context-window-mcp-${candidate.name}-`));
+    const child = startServer(join(directory, "archive.db"), {
+      CONTEXT_WINDOW_MCP_TEST_MAX_FRAME_BYTES: "1024",
+    });
+    const responses = collectLines(child.stdout, 1);
+    try {
+      child.stdin.end(candidate.bytes);
+      const [response] = await responses;
+      assert.equal(response.id, null);
+      assert.equal(response.error.code, -32700);
+      assert.match(response.error.message, candidate.expected);
+      const [exitCode] = await once(child, "exit");
+      assert.equal(exitCode, 1);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      await stopServerAuthority(child);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("MCP defaults to project-bound RocksDB search and locator recall", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-rocks-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const project = join(directory, "project");
+  const child = startRocksServer({ directory, storePath, socketPath, project });
+  const rpc = rpcClient(child);
+  let daemonProcessId;
+
+  try {
+    const archived = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "manual",
+        text: "MCP_ROCKS_LOCATOR_TOKEN exact archived version one",
+      },
+    });
+    assert.equal(archived.error, undefined);
+    assert.match(archived.result.content[0].text, /^Archived as /u);
+
+    const searched = await rpc.request("tools/call", {
+      name: "context_window_search",
+      arguments: { query: "MCP_ROCKS_LOCATOR_TOKEN", scope: "project", limit: 3 },
+    });
+    assert.equal(searched.error, undefined);
+    const locator = searched.result.content[0].text.match(
+      /\b(cw1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/u,
+    )?.[1];
+    assert.ok(locator, "search must expose an opaque exact-version locator");
+
+    const recalled = await rpc.request("tools/call", {
+      name: "context_recall",
+      arguments: { id: locator },
+    });
+    assert.equal(recalled.error, undefined);
+    assert.equal(recalled.result.isError, false);
+    assert.match(recalled.result.content[0].text, /MCP_ROCKS_LOCATOR_TOKEN exact archived version one/u);
+    assert.match(recalled.result.content[0].text, /ARCHIVED HISTORICAL EVIDENCE/u);
+    const recallLines = recalled.result.content[0].text.split("\n");
+    assert.equal(recallLines.length, 2);
+    const recallEnvelope = JSON.parse(recallLines[1]);
+    assert.equal(recallEnvelope.trust, "untrusted-archived-data");
+    assert.match(JSON.parse(recallEnvelope.bodyJson), /MCP_ROCKS_LOCATOR_TOKEN/u);
+
+    const status = await rpc.request("tools/call", {
+      name: "context_window_status",
+      arguments: {},
+    });
+    assert.equal(status.error, undefined);
+    assert.match(status.result.content[0].text, /RocksDB archive: 1 document/u);
+    assert.match(status.result.content[0].text, new RegExp(storePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
+    assert.doesNotMatch(status.result.content[0].text, /SQLite files/u);
+
+    const rightProject = new StoreClient({ socketPath, project, requestTimeoutMs: 5_000 });
+    const wrongProject = new StoreClient({
+      socketPath,
+      project: join(directory, "other-project"),
+      requestTimeoutMs: 5_000,
+    });
+    try {
+      assert.equal((await rightProject.request("store.count", { scope: "project" })).count, 1);
+      assert.equal((await wrongProject.request("store.count", { scope: "project" })).count, 0);
+      daemonProcessId = (await rightProject.request("daemon.status", {})).processId;
+    } finally {
+      rightProject.close();
+      wrongProject.close();
+    }
+
+    child.stdin.end();
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 0);
+  } finally {
+    rpc.close();
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    if (!daemonProcessId) {
+      try { daemonProcessId = (await daemonStatus(socketPath, project)).processId; } catch {}
+    }
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -143,6 +396,7 @@ test("MCP recall renders archive, source-message, and tool-result provenance", a
     assert.equal(exitCode, 0);
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
+    await stopServerAuthority(child);
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -175,6 +429,7 @@ test("MCP negotiates its supported version and reports malformed JSON", async ()
     assert.equal(stderr, "");
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
+    await stopServerAuthority(child);
     rmSync(directory, { recursive: true, force: true });
   }
 });

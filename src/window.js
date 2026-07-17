@@ -337,6 +337,7 @@ export function externalizeLargeToolResults(messages, {
   const maxChars = Math.max(1, maxTokens) * 4;
   const previewChars = Math.max(1, previewTokens) * 4;
   let changed = false;
+  const archiveIds = [];
   const output = messages.map((message) => {
     const isToolResult = message?.role === "toolResult" || message?.role === "tool";
     if (!isToolResult) return message;
@@ -344,13 +345,15 @@ export function externalizeLargeToolResults(messages, {
     if (text.length <= maxChars) return message;
 
     const id = store(message, text);
+    if (!id) return message;
+    archiveIds.push(id);
     const head = text.slice(0, Math.floor(previewChars * 0.7));
     const tail = text.slice(-Math.floor(previewChars * 0.3));
     const replacement = `${head}\n\n[… ${text.length - head.length - tail.length} characters archived as ${id}; use context_recall …]\n\n${tail}`;
     changed = true;
     return { ...message, content: replaceTextContent(message.content, replacement) };
   });
-  return { messages: changed ? output : messages, changed };
+  return { messages: changed ? output : messages, changed, archiveIds };
 }
 
 export const TOC_TERMS_PER_ENTRY = 8;

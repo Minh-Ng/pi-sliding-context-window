@@ -1,0 +1,6 @@
+# Local evaluation and benchmark output can contain machine metadata or
+# content-shaped fixture fields. Formal release captures belong outside the repo.
+artifacts/
+
+# The standalone daemon's checkout-relative default is local runtime state.
+.context-window/

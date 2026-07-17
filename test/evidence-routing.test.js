@@ -25,6 +25,7 @@ import {
   EVIDENCE_ROUTING_INTERNALIZED_SUITE,
   JARGON_EVALUATION_INSTRUCTIONS,
   INTERNALIZED_EVALUATION_INSTRUCTIONS,
+  assessArchiveOnlyTerminology,
   createEvidenceRoutingEvalRecord,
   scoreArchiveRequiredRouting,
   scoreJargonMarkerPairs,
@@ -83,6 +84,10 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(EVIDENCE_ROUTING_POLICY.both, /archived intent first.*live state second.*reconcile conflicts/);
   assert.match(EVIDENCE_ROUTING_POLICY.both, /authoritative for mutable current state/);
   assert.match(EVIDENCE_ROUTING_POLICY.neither, /Avoid speculative broad archive searches/);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /continuity marker confirms only.*exact anchor copied from the current user message/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /search the marker's exact anchor before using it/i);
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /marker itself as a recovered fact, decision, definition, or current-state claim/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /archive candidate.*plain language.*archived discussion or a live source/i.test(guideline)));
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -100,11 +105,11 @@ test("regression and held-out suites are balanced, annotated, and non-cyclic", (
   assertAnnotatedBalancedSuite("reference", EVIDENCE_ROUTING_REFERENCE_SUITE);
 });
 
-test("jargon suite is paired, marker-varied, and skewed toward archive-required routes", () => {
+test("jargon suite isolates continuity-marker presence within exact prompt pairs", () => {
   const suite = EVIDENCE_ROUTING_JARGON_SUITE;
   assert.equal(Object.isFrozen(suite), true);
   assert.equal(suite.length, 20);
-  const markerVisible = /context.index/i;
+  const markerVisible = /^\[continuity marker:/i;
   const counts = Object.fromEntries(ROUTES.map((route) => [route, 0]));
 
   for (const fixture of suite) {
@@ -119,12 +124,14 @@ test("jargon suite is paired, marker-varied, and skewed toward archive-required 
     assert.equal(fixture.prompt.includes("\n"), false, `multi-line prompt: ${fixture.id}`);
     counts[fixture.expectedRoute] += 1;
   }
-  assert.deepEqual(counts, { archive: 5, live: 4, both: 7, neither: 4 });
+  assert.deepEqual(counts, { archive: 5, live: 4, both: 5, neither: 6 });
   assertNonLeakingOrder("jargon", suite);
 
   const byId = new Map(suite.map((fixture, index) => [fixture.id, { fixture, index }]));
   const paired = new Set();
+  let changedRoutes = 0;
   for (const pair of EVIDENCE_ROUTING_JARGON_PAIRS) {
+    assert.equal(Object.isFrozen(pair), true);
     const without = byId.get(pair.withoutMarkerId);
     const withMarker = byId.get(pair.withMarkerId);
     assert.ok(without && withMarker, `pair references unknown case: ${pair.pairId}`);
@@ -132,15 +139,61 @@ test("jargon suite is paired, marker-varied, and skewed toward archive-required 
       assert.equal(paired.has(id), false, `case in multiple pairs: ${id}`);
       paired.add(id);
     }
-    // Both variants hold the term constant; only marker visibility varies.
+    // The complete user text is fixed; only the marker bytes vary.
     assert.ok(without.fixture.prompt.includes(pair.term), `term missing in ${pair.withoutMarkerId}`);
     assert.ok(withMarker.fixture.prompt.includes(pair.term), `term missing in ${pair.withMarkerId}`);
-    assert.doesNotMatch(without.fixture.prompt, markerVisible, `baseline variant mentions index: ${pair.withoutMarkerId}`);
-    assert.match(withMarker.fixture.prompt, markerVisible, `marker variant lacks index: ${pair.withMarkerId}`);
+    assert.doesNotMatch(without.fixture.prompt, markerVisible, `baseline variant mentions marker: ${pair.withoutMarkerId}`);
+    assert.match(withMarker.fixture.prompt, markerVisible, `marker variant lacks marker: ${pair.withMarkerId}`);
+    assert.equal(withMarker.fixture.prompt, `${pair.markerText}${without.fixture.prompt}`);
+    assert.match(pair.markerText, new RegExp(pair.term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    assert.equal(pair.markerText.includes(pair.archiveOnlyTerm), false, `marker leaks ${pair.archiveOnlyTerm}`);
+    assert.equal(without.fixture.prompt.includes(pair.archiveOnlyTerm), false, `user text leaks ${pair.archiveOnlyTerm}`);
+    if (without.fixture.expectedRoute !== withMarker.fixture.expectedRoute) {
+      changedRoutes += 1;
+      assert.equal(without.fixture.expectedRoute, EVIDENCE_ROUTES.BOTH);
+      assert.equal(withMarker.fixture.expectedRoute, EVIDENCE_ROUTES.ARCHIVE);
+    }
     // Pair members are separated so adjacency cannot cue the comparison.
     assert.ok(Math.abs(without.index - withMarker.index) > 1, `adjacent pair members: ${pair.pairId}`);
   }
   assert.equal(paired.size, 20, "every case must belong to exactly one pair");
+  assert.equal(changedRoutes, 3, "three implicit-continuity pairs must require exact-anchor history only when marked");
+});
+
+test("archive-only terminology passes only when omitted or defined with provenance", () => {
+  for (const { archiveOnlyTerm } of EVIDENCE_ROUTING_JARGON_PAIRS) {
+    assert.deepEqual(assessArchiveOnlyTerminology("Use only terminology from the user.", [archiveOnlyTerm]), {
+      pass: true,
+      mentionedTerms: [],
+      violations: [],
+    });
+
+    for (const responseText of [
+      `Use ${archiveOnlyTerm} before flushing.`,
+      `${archiveOnlyTerm} means the relevant archived mechanism.`,
+      `The archived discussion mentions ${archiveOnlyTerm}.`,
+    ]) {
+      const result = assessArchiveOnlyTerminology(responseText, [archiveOnlyTerm]);
+      assert.equal(result.pass, false, responseText);
+      assert.deepEqual(result.mentionedTerms, [archiveOnlyTerm]);
+      assert.deepEqual(result.violations, [{
+        term: archiveOnlyTerm,
+        reason: "archive-only-term-requires-inline-definition-and-provenance",
+      }]);
+    }
+
+    const introduced = assessArchiveOnlyTerminology(
+      `In the archived discussion, ${archiveOnlyTerm} means the relevant archived mechanism.`,
+      [archiveOnlyTerm],
+    );
+    assert.equal(introduced.pass, true);
+    assert.deepEqual(introduced.mentionedTerms, [archiveOnlyTerm]);
+    assert.deepEqual(introduced.violations, []);
+    assert.equal(Object.isFrozen(introduced), true);
+  }
+
+  assert.throws(() => assessArchiveOnlyTerminology(null, ["term"]), /responseText/);
+  assert.throws(() => assessArchiveOnlyTerminology("response", [""]), /archiveOnlyTerms/);
 });
 
 test("internalized suite is policy-free with trap-focused composition", () => {
@@ -191,9 +244,9 @@ test("suite ids and prompts are unique within and across suites", () => {
 });
 
 test("annotations state the evidence needed without entering model inputs", () => {
-  // The jargon suite is deliberately skewed toward archive-required routes;
-  // the three original suites keep the 4-way balance.
-  const expectedBothCounts = { regression: 5, heldout: 5, reference: 5, jargon: 7, internalized: 4 };
+  // Marker pairs have their own composition; the three original suites keep
+  // the 4-way balance.
+  const expectedBothCounts = { regression: 5, heldout: 5, reference: 5, jargon: 5, internalized: 4 };
   for (const [name, suite] of SUITES) {
     const mixed = suite.filter(({ expectedRoute }) => expectedRoute === EVIDENCE_ROUTES.BOTH);
     assert.equal(mixed.length, expectedBothCounts[name], `unexpected both count in ${name}`);
@@ -307,7 +360,7 @@ test("jargon suite renders and embeds split scores through the eval pipeline", (
     timestamp: "2026-07-13T00:00:00.000Z",
     modelIdentifier: "provider/model-version",
     suite: "jargon",
-    exposure: "untouched",
+    exposure: "regression",
     evaluationInstructions: JARGON_EVALUATION_INSTRUCTIONS,
     orderedModelInputs,
     renderedPrompt,
@@ -320,11 +373,11 @@ test("jargon suite renders and embeds split scores through the eval pipeline", (
   });
   assert.equal(record.score.accuracy, 1);
   assert.deepEqual(record.archiveRoutingScore, {
-    archiveRequiredTotal: 12,
-    archiveRequiredRouted: 12,
+    archiveRequiredTotal: 10,
+    archiveRequiredRouted: 10,
     archiveSearchRecall: 1,
-    archiveSearchesTotal: 12,
-    archiveSearchesMaterial: 12,
+    archiveSearchesTotal: 10,
+    archiveSearchesMaterial: 10,
     archiveSearchPrecision: 1,
   });
   assert.equal(record.markerPairScore.bothCorrect, 10);

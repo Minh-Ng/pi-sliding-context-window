@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { findModelProfile, loadConfig, resolveModelConfig } from "../src/config.js";
+import { defaultSocketPath } from "../src/daemon/paths.js";
 import { resolveContextLimits, shouldRotateWindow } from "../src/window.js";
 
 test("trusted project config can disable the footer label accent", () => {
@@ -19,6 +20,286 @@ test("trusted project config can disable the footer label accent", () => {
     assert.equal(config.statusLabelAccent, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("fresh installs use RocksDB while existing SQLite archives require an explicit cutover", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-rocks-config-"));
+  try {
+    const defaults = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(defaults.archiveBackend, "rocksdb");
+    assert.equal(defaults.rocksdbPath, join(directory, ".pi", "context-window", "archive.rocks"));
+    assert.equal(defaults.dbPath, join(directory, ".pi", "context-window", "archive.db"));
+    assert.equal(defaults.rocksdbMigrationSourcePath, defaults.dbPath);
+    assert.equal(defaults.socketPath, defaultSocketPath(defaults.rocksdbPath));
+    assert.equal(defaults.automaticRetrieval, true);
+    assert.equal(defaults.hintBudgetTokens, 160);
+    assert.equal(defaults.activeHintBudgetTokens, 640);
+    assert.equal(defaults.epochHintBudgetTokens, 640);
+    assert.equal(defaults.hintSourceCooldownHours, 24);
+    assert.equal(defaults.maxInlineUserTokens, 16_000);
+    assert.equal(defaults.ephemeralAutoRetrievalDays, 7);
+    assert.equal(defaults.conversationAutoRetrievalDays, 30);
+    assert.equal(defaults.derivedAutoRetrievalDays, 30);
+    assert.equal(defaults.ephemeralRetentionDays, 14);
+    assert.equal(defaults.conversationRetentionDays, 90);
+    assert.equal(defaults.derivedRetentionDays, 30);
+
+    mkdirSync(join(directory, ".pi", "context-window"), { recursive: true });
+    writeFileSync(defaults.dbPath, "legacy SQLite placeholder");
+    assert.equal(loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory })
+      .archiveBackend, "sqlite");
+    const explicitCutover = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: { CONTEXT_WINDOW_BACKEND: "rocksdb" },
+      home: directory,
+    });
+    assert.equal(explicitCutover.archiveBackend, "rocksdb");
+    assert.equal(explicitCutover.rocksdbMigrationSourcePath, defaults.dbPath);
+
+    const overridden = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: {
+        CONTEXT_WINDOW_BACKEND: "sqlite",
+        CONTEXT_WINDOW_ROCKSDB: "~/rocks/custom",
+        CONTEXT_WINDOW_SOCKET: "~/run/context-window.sock",
+        CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL: "false",
+        CONTEXT_WINDOW_HINT_BUDGET_TOKENS: "80",
+        CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS: "300",
+        CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS: "320",
+        CONTEXT_WINDOW_HINT_SOURCE_COOLDOWN_HOURS: "12",
+        CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS: "8000",
+        CONTEXT_WINDOW_EPHEMERAL_AUTO_RETRIEVAL_DAYS: "3",
+        CONTEXT_WINDOW_CONVERSATION_AUTO_RETRIEVAL_DAYS: "21",
+        CONTEXT_WINDOW_DERIVED_AUTO_RETRIEVAL_DAYS: "0",
+        CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS: "2",
+        CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS: "30",
+        CONTEXT_WINDOW_DERIVED_RETENTION_DAYS: "0",
+      },
+    });
+    assert.equal(overridden.archiveBackend, "sqlite");
+    assert.equal(overridden.rocksdbPath, join(directory, "rocks", "custom"));
+    assert.equal(overridden.socketPath, join(directory, "run", "context-window.sock"));
+    assert.equal(overridden.automaticRetrieval, false);
+    assert.equal(overridden.hintBudgetTokens, 80);
+    assert.equal(overridden.activeHintBudgetTokens, 300);
+    assert.equal(overridden.epochHintBudgetTokens, 300);
+    assert.equal(overridden.hintSourceCooldownHours, 12);
+    assert.equal(overridden.maxInlineUserTokens, 8_000);
+    assert.equal(overridden.ephemeralAutoRetrievalDays, 3);
+    assert.equal(overridden.conversationAutoRetrievalDays, 21);
+    assert.equal(overridden.derivedAutoRetrievalDays, 0);
+    assert.equal(overridden.ephemeralRetentionDays, 2);
+    assert.equal(overridden.conversationRetentionDays, 30);
+    assert.equal(overridden.derivedRetentionDays, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("active hint budget resolves its legacy alias by normal config precedence", () => {
+  const root = mkdtempSync(join(tmpdir(), "context-window-hint-budget-alias-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  try {
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "context-window.json"), JSON.stringify({
+      activeHintBudgetTokens: 500,
+    }));
+    writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({
+      "context-window": { epochHintBudgetTokens: 320 },
+    }));
+
+    const projectLegacy = loadConfig({ cwd: project, projectTrusted: true, env: {}, home });
+    assert.equal(projectLegacy.activeHintBudgetTokens, 320);
+    assert.equal(projectLegacy.epochHintBudgetTokens, 320);
+
+    const environmentLegacy = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: { CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS: "240" },
+      home,
+    });
+    assert.equal(environmentLegacy.activeHintBudgetTokens, 240);
+    assert.equal(environmentLegacy.epochHintBudgetTokens, 240);
+
+    const environmentPrimary = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS: "180",
+        CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS: "200",
+      },
+      home,
+    });
+    assert.equal(environmentPrimary.activeHintBudgetTokens, 180);
+    assert.equal(environmentPrimary.epochHintBudgetTokens, 180);
+
+    const invalidEnvironment = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS: "invalid",
+        CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS: "invalid",
+      },
+      home,
+    });
+    assert.equal(invalidEnvironment.activeHintBudgetTokens, 320);
+    assert.equal(invalidEnvironment.epochHintBudgetTokens, 320);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("new archive policy settings honor scope and environment precedence with invalid fallthrough", () => {
+  const root = mkdtempSync(join(tmpdir(), "context-window-policy-layers-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const projectSettings = join(project, ".pi", "settings.json");
+  try {
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "context-window.json"), JSON.stringify({
+      maxInlineUserTokens: 20_000,
+      hintSourceCooldownHours: 20,
+      ephemeralAutoRetrievalDays: 6,
+      conversationAutoRetrievalDays: 26,
+      derivedAutoRetrievalDays: 16,
+      ephemeralRetentionDays: 13,
+      conversationRetentionDays: 83,
+      derivedRetentionDays: 23,
+    }));
+    writeFileSync(join(project, ".pi", "context-window.json"), JSON.stringify({
+      maxInlineUserTokens: 18_000,
+      hintSourceCooldownHours: 18,
+      ephemeralAutoRetrievalDays: 5,
+      conversationAutoRetrievalDays: 25,
+      derivedAutoRetrievalDays: 15,
+      ephemeralRetentionDays: 12,
+      conversationRetentionDays: 82,
+      derivedRetentionDays: 22,
+    }));
+    writeFileSync(projectSettings, JSON.stringify({
+      "context-window": {
+        maxInlineUserTokens: 17_000,
+        hintSourceCooldownHours: 17,
+        ephemeralAutoRetrievalDays: 4,
+        conversationAutoRetrievalDays: 24,
+        derivedAutoRetrievalDays: 0,
+        ephemeralRetentionDays: 11,
+        conversationRetentionDays: 81,
+        derivedRetentionDays: 0,
+      },
+    }));
+
+    const projectPolicy = loadConfig({ cwd: project, projectTrusted: true, env: {}, home });
+    assert.deepEqual({
+      maxInlineUserTokens: projectPolicy.maxInlineUserTokens,
+      hintSourceCooldownHours: projectPolicy.hintSourceCooldownHours,
+      ephemeralAutoRetrievalDays: projectPolicy.ephemeralAutoRetrievalDays,
+      conversationAutoRetrievalDays: projectPolicy.conversationAutoRetrievalDays,
+      derivedAutoRetrievalDays: projectPolicy.derivedAutoRetrievalDays,
+      ephemeralRetentionDays: projectPolicy.ephemeralRetentionDays,
+      conversationRetentionDays: projectPolicy.conversationRetentionDays,
+      derivedRetentionDays: projectPolicy.derivedRetentionDays,
+    }, {
+      maxInlineUserTokens: 17_000,
+      hintSourceCooldownHours: 17,
+      ephemeralAutoRetrievalDays: 4,
+      conversationAutoRetrievalDays: 24,
+      derivedAutoRetrievalDays: 0,
+      ephemeralRetentionDays: 11,
+      conversationRetentionDays: 81,
+      derivedRetentionDays: 0,
+    });
+
+    const environmentPolicy = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS: "15000",
+        CONTEXT_WINDOW_HINT_SOURCE_COOLDOWN_HOURS: "12",
+        CONTEXT_WINDOW_EPHEMERAL_AUTO_RETRIEVAL_DAYS: "3",
+        CONTEXT_WINDOW_CONVERSATION_AUTO_RETRIEVAL_DAYS: "21",
+        CONTEXT_WINDOW_DERIVED_AUTO_RETRIEVAL_DAYS: "9",
+        CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS: "10",
+        CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS: "70",
+        CONTEXT_WINDOW_DERIVED_RETENTION_DAYS: "20",
+      },
+      home,
+    });
+    assert.deepEqual({
+      maxInlineUserTokens: environmentPolicy.maxInlineUserTokens,
+      hintSourceCooldownHours: environmentPolicy.hintSourceCooldownHours,
+      ephemeralAutoRetrievalDays: environmentPolicy.ephemeralAutoRetrievalDays,
+      conversationAutoRetrievalDays: environmentPolicy.conversationAutoRetrievalDays,
+      derivedAutoRetrievalDays: environmentPolicy.derivedAutoRetrievalDays,
+      ephemeralRetentionDays: environmentPolicy.ephemeralRetentionDays,
+      conversationRetentionDays: environmentPolicy.conversationRetentionDays,
+      derivedRetentionDays: environmentPolicy.derivedRetentionDays,
+    }, {
+      maxInlineUserTokens: 15_000,
+      hintSourceCooldownHours: 12,
+      ephemeralAutoRetrievalDays: 3,
+      conversationAutoRetrievalDays: 21,
+      derivedAutoRetrievalDays: 9,
+      ephemeralRetentionDays: 10,
+      conversationRetentionDays: 70,
+      derivedRetentionDays: 20,
+    });
+
+    writeFileSync(projectSettings, JSON.stringify({
+      "context-window": {
+        maxInlineUserTokens: null,
+        hintSourceCooldownHours: false,
+        ephemeralAutoRetrievalDays: "",
+        conversationAutoRetrievalDays: " ",
+        derivedAutoRetrievalDays: "invalid",
+        ephemeralRetentionDays: null,
+        conversationRetentionDays: false,
+        derivedRetentionDays: "",
+      },
+    }));
+    const invalidPolicy = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS: "",
+        CONTEXT_WINDOW_HINT_SOURCE_COOLDOWN_HOURS: " ",
+        CONTEXT_WINDOW_EPHEMERAL_AUTO_RETRIEVAL_DAYS: "",
+        CONTEXT_WINDOW_CONVERSATION_AUTO_RETRIEVAL_DAYS: " ",
+        CONTEXT_WINDOW_DERIVED_AUTO_RETRIEVAL_DAYS: "invalid",
+        CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS: "",
+        CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS: " ",
+        CONTEXT_WINDOW_DERIVED_RETENTION_DAYS: "invalid",
+      },
+      home,
+    });
+    assert.deepEqual({
+      maxInlineUserTokens: invalidPolicy.maxInlineUserTokens,
+      hintSourceCooldownHours: invalidPolicy.hintSourceCooldownHours,
+      ephemeralAutoRetrievalDays: invalidPolicy.ephemeralAutoRetrievalDays,
+      conversationAutoRetrievalDays: invalidPolicy.conversationAutoRetrievalDays,
+      derivedAutoRetrievalDays: invalidPolicy.derivedAutoRetrievalDays,
+      ephemeralRetentionDays: invalidPolicy.ephemeralRetentionDays,
+      conversationRetentionDays: invalidPolicy.conversationRetentionDays,
+      derivedRetentionDays: invalidPolicy.derivedRetentionDays,
+    }, {
+      maxInlineUserTokens: 18_000,
+      hintSourceCooldownHours: 18,
+      ephemeralAutoRetrievalDays: 5,
+      conversationAutoRetrievalDays: 25,
+      derivedAutoRetrievalDays: 15,
+      ephemeralRetentionDays: 12,
+      conversationRetentionDays: 82,
+      derivedRetentionDays: 22,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -526,6 +807,63 @@ test("invalid numeric settings fall through every format layer", () => {
     assert.equal(config.retainTurns, 7);
     assert.equal(config.rotationTokens, 70_000);
     assert.equal(config.rotationTokensExplicit, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("archive retention settings follow precedence and normalize the cleanup target", () => {
+  const root = mkdtempSync(join(tmpdir(), "context-window-retention-config-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  try {
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "settings.json"), JSON.stringify({
+      "context-window": {
+        maxArchiveBytes: 10_000,
+        targetArchiveBytes: 8_000,
+        recentDocumentProtectionDays: 9,
+        minimumTurnsPerSession: 11,
+      },
+    }));
+    writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({
+      "context-window": { targetArchiveBytes: 7_000 },
+    }));
+
+    const configured = loadConfig({ cwd: project, projectTrusted: true, env: {}, home });
+    assert.equal(configured.maxArchiveBytes, 10_000);
+    assert.equal(configured.targetArchiveBytes, 7_000);
+    assert.equal(configured.recentDocumentProtectionDays, 9);
+    assert.equal(configured.minimumTurnsPerSession, 11);
+
+    const environment = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_MAX_ARCHIVE_BYTES: "6000",
+        CONTEXT_WINDOW_TARGET_ARCHIVE_BYTES: "9000",
+        CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS: "3",
+        CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION: "4",
+      },
+      home,
+    });
+    assert.equal(environment.maxArchiveBytes, 6_000);
+    assert.equal(environment.targetArchiveBytes, 4_500);
+    assert.equal(environment.recentDocumentProtectionDays, 3);
+    assert.equal(environment.minimumTurnsPerSession, 4);
+
+    const disabledProtection = loadConfig({
+      cwd: project,
+      projectTrusted: true,
+      env: {
+        CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS: "0",
+        CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION: "0",
+      },
+      home,
+    });
+    assert.equal(disabledProtection.recentDocumentProtectionDays, 0);
+    assert.equal(disabledProtection.minimumTurnsPerSession, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,0 +1,481 @@
+import {
+  assertStoreRequest,
+  assertStoreResult,
+} from "../store-contract.js";
+import { lookupExact, planExactQuery } from "../rocksdb/index/exact.js";
+import { searchBm25 } from "../rocksdb/index/bm25.js";
+import { lookupStructural } from "../rocksdb/index/structural.js";
+import { KEYSPACE } from "../rocksdb/keys.js";
+import { readDocumentRange } from "../rocksdb/document-range.js";
+import { semanticIdentifier } from "../semantic-identifiers.js";
+import { manifestKeys } from "../rocksdb/manifests.js";
+import {
+  getOrCreateLocatorSecret,
+  signLocator,
+} from "./locator.js";
+import {
+  createRetrievalLease,
+  releaseLease,
+  RetrievalLeaseTargetUnavailableError,
+} from "./leases.js";
+
+const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1 });
+const WINDOW_SCAN_PAGE = 1_000;
+const MAX_LEGACY_STRUCTURAL_LOCATION_BYTES = 64 * 1_024;
+const MAX_STRUCTURAL_CANDIDATE_BYTES = 64 * 1_024;
+const MAX_INDEXED_STRUCTURAL_EXCERPT_BYTES = 1 * 1_024 * 1_024;
+
+function requireStore(store) {
+  if (!store || typeof store.snapshot !== "function" || typeof store.get !== "function") {
+    throw new TypeError("Search orchestration requires a writable RocksStore-compatible store.");
+  }
+  return store;
+}
+
+function normalizeRequest(request) {
+  assertStoreRequest("store.search", request);
+  if (typeof request.project !== "string" || request.project.length === 0) {
+    throw new TypeError("Search requires an authorized project boundary.");
+  }
+  const sessionIds = request.sessionIds ?? (request.sessionId === undefined ? [] : [request.sessionId]);
+  if (request.scope === "session" && sessionIds.length === 0) {
+    throw new TypeError("Session-scoped search requires sessionId or sessionIds.");
+  }
+  // `all` means all evidence authorized to this connection. The first cut has
+  // one authorized project per request, so it safely collapses to project
+  // scope instead of reading the structural index's cross-project prefix.
+  const effectiveScope = request.scope === "all" ? "project" : request.scope;
+  return Object.freeze({
+    ...request,
+    effectiveScope,
+    sessionIds: Object.freeze([...new Set(sessionIds)]),
+    excludeVisibleSourceKeys: Object.freeze([...new Set(request.excludeVisibleSourceKeys)]),
+  });
+}
+
+async function publishedGeneration(view) {
+  const publication = await view.get([KEYSPACE.META, "published-index-generation"]);
+  const generation = publication?.generation ?? 0;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("The published index generation is malformed.");
+  }
+  return generation;
+}
+
+export function normalizeModeScore(mode, score) {
+  if (typeof score !== "number" || !Number.isFinite(score) || score < 0) return 0;
+  if (mode === "exact") return Math.min(1, score);
+  if (mode === "structural") return Math.min(1, score / 100);
+  // BM25 is unbounded. Calibrate each result against one fixed curve instead
+  // of the current result set, so adding a weaker candidate cannot promote the
+  // top result to an artificial confidence of 1.0 or otherwise change it.
+  if (mode === "lexical") return score / (score + 1);
+  throw new TypeError(`Unknown retrieval mode ${mode}.`);
+}
+
+function candidateIdentity(candidate) {
+  return `${candidate.documentId}\0${candidate.version}`;
+}
+
+function exactCandidates(response) {
+  return response.results.map((result) => ({
+    ...result,
+    rawScore: result.score,
+    retrievalMode: "exact",
+    normalizedScore: normalizeModeScore("exact", result.score),
+    matchedTerms: Object.freeze([]),
+    termCoverage: 0,
+    termIdf: Object.freeze([]),
+    maxNormalizedIdf: 0,
+  }));
+}
+
+function lexicalCandidates(response) {
+  return response.results.map((result) => ({
+    ...result,
+    retrievalMode: "lexical",
+    normalizedScore: normalizeModeScore("lexical", result.rawScore),
+    matchedAnchors: Object.freeze([]),
+  }));
+}
+
+/** Find a containing/intersecting stored window without a total-window cap. */
+export function findStoredWindowForByteRange(view, documentId, version, startByte, endByte) {
+  let after;
+  let firstIntersecting;
+  while (true) {
+    const page = view.scan([KEYSPACE.WINDOW, documentId, version], {
+      limit: WINDOW_SCAN_PAGE,
+      ...(after === undefined ? {} : { after }),
+    });
+    for (const { payload: candidate } of page) {
+      const intersects = startByte === endByte
+        ? candidate.startByte === startByte || candidate.endByte === endByte
+        : candidate.endByte > startByte && candidate.startByte < endByte;
+      if (intersects && firstIntersecting === undefined) firstIntersecting = candidate;
+      if (candidate.startByte <= startByte && candidate.endByte >= endByte
+        && (startByte < candidate.endByte || candidate === page.at(-1)?.payload)) {
+        return candidate;
+      }
+      if (firstIntersecting !== undefined && candidate.startByte >= endByte) {
+        return firstIntersecting;
+      }
+    }
+    if (page.length < WINDOW_SCAN_PAGE) return firstIntersecting;
+    after = page.at(-1).keyBytes;
+  }
+}
+
+function structuralQueryRange(excerpt, query) {
+  const firstScalarBytes = excerpt.length === 0
+    ? 0
+    : Buffer.byteLength(Array.from(excerpt)[0], "utf8");
+  const excerptTokens = [...excerpt.matchAll(/[\p{L}\p{N}_-]{2,}/gu)];
+  const fallback = () => {
+    const match = excerptTokens[Math.floor(excerptTokens.length / 2)];
+    if (match === undefined) return Object.freeze({ startByte: 0, endByte: firstScalarBytes });
+    const startByte = Buffer.byteLength(excerpt.slice(0, match.index), "utf8");
+    return Object.freeze({
+      startByte,
+      endByte: startByte + Buffer.byteLength(match[0], "utf8"),
+    });
+  };
+  const terms = new Set(String(query ?? "").toLocaleLowerCase()
+    .match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
+  if (terms.size === 0) return fallback();
+  for (const match of excerptTokens) {
+    if (!terms.has(match[0].toLocaleLowerCase())) continue;
+    const startByte = Buffer.byteLength(excerpt.slice(0, match.index), "utf8");
+    return Object.freeze({
+      startByte,
+      endByte: startByte + Buffer.byteLength(match[0], "utf8"),
+    });
+  }
+  return fallback();
+}
+
+async function structuralCandidate(view, result, generation, request) {
+  if (result.project !== request.project) return undefined;
+  const manifest = await view.get(manifestKeys.document(result.documentId, result.version));
+  if (manifest === undefined || manifest.project !== request.project) return undefined;
+  if (request.effectiveScope === "session" && !request.sessionIds.includes(manifest.sessionId)) return undefined;
+  if (manifest.sourceMessageKeys.some((key) => request.excludeVisibleSourceKeys.includes(key))) return undefined;
+  if (view.scan([KEYSPACE.SUPERSESSION, result.documentId, result.version], { limit: 1 }).length > 0) {
+    return undefined;
+  }
+  const excerpt = String(result.snippet ?? "");
+  const excerptBytes = Buffer.byteLength(excerpt, "utf8");
+  if (excerptBytes > MAX_INDEXED_STRUCTURAL_EXCERPT_BYTES) return undefined;
+  let startByte = result.structural?.startByte;
+  let endByte = result.structural?.endByte;
+  if (Number.isSafeInteger(startByte) && Number.isSafeInteger(endByte)
+    && startByte >= 0 && endByte >= startByte && endByte <= manifest.byteLength) {
+    if (endByte - startByte !== excerptBytes) return undefined;
+  } else {
+    // Pre-coordinate structural postings remain compatible only while their
+    // source is explicitly small. Large legacy postings must be reindexed;
+    // query-time full reconstruction is never an acceptable fallback.
+    if (manifest.byteLength > MAX_LEGACY_STRUCTURAL_LOCATION_BYTES) return undefined;
+    const source = (await readDocumentRange(view, manifest, 0, manifest.byteLength)).text;
+    const codeUnitStart = excerpt.length === 0 ? 0 : source.indexOf(excerpt);
+    if (codeUnitStart < 0) return undefined;
+    startByte = Buffer.byteLength(source.slice(0, codeUnitStart), "utf8");
+    endByte = startByte + Buffer.byteLength(excerpt, "utf8");
+  }
+  const excerptStartByte = startByte;
+  const excerptEndByte = endByte;
+  const queryRange = structuralQueryRange(excerpt, request.query);
+  const targetStartByte = excerptStartByte + queryRange.startByte;
+  const targetEndByte = excerptStartByte + queryRange.endByte;
+  const window = findStoredWindowForByteRange(
+    view,
+    result.documentId,
+    result.version,
+    targetStartByte,
+    targetEndByte,
+  );
+  if (window === undefined) return undefined;
+  startByte = Math.max(excerptStartByte, window.startByte);
+  endByte = Math.min(excerptEndByte, window.endByte);
+  if (endByte - startByte > MAX_STRUCTURAL_CANDIDATE_BYTES) {
+    startByte = Math.max(startByte, targetStartByte - Math.floor(MAX_STRUCTURAL_CANDIDATE_BYTES / 2));
+    endByte = Math.min(endByte, startByte + MAX_STRUCTURAL_CANDIDATE_BYTES);
+    if (endByte < targetEndByte) {
+      endByte = Math.min(excerptEndByte, window.endByte, targetEndByte);
+      startByte = Math.max(excerptStartByte, window.startByte, endByte - MAX_STRUCTURAL_CANDIDATE_BYTES);
+    }
+  }
+  const selected = await readDocumentRange(view, manifest, startByte, endByte, { adjustUtf8: true });
+  startByte = selected.startByte;
+  endByte = selected.endByte;
+  const excerptBuffer = Buffer.from(excerpt, "utf8");
+  const expected = excerptBuffer.subarray(
+    startByte - excerptStartByte,
+    endByte - excerptStartByte,
+  ).toString("utf8");
+  if (selected.text !== expected) return undefined;
+  // The snippet may cover most of the containing window, but the signed match
+  // range must identify the query-bearing bytes. Bounded recall centers on the
+  // signed match rather than assuming the caller can consume the whole window.
+  const matchStartByte = Math.max(startByte, targetStartByte);
+  const matchEndByte = Math.min(endByte, targetEndByte);
+  if (matchEndByte < matchStartByte) return undefined;
+  return {
+    documentId: result.documentId,
+    version: result.version,
+    kind: manifest.kind,
+    createdAt: manifest.createdAt,
+    score: result.score,
+    rawScore: result.score,
+    normalizedScore: normalizeModeScore("structural", result.score),
+    retrievalMode: "structural",
+    matchType: result.structural?.relation ?? "structural",
+    margin: 0,
+    snippet: selected.text,
+    historical: true,
+    superseded: false,
+    matchedAnchors: Object.freeze([]),
+    matchedTerms: Object.freeze([]),
+    termCoverage: 0,
+    termIdf: Object.freeze([]),
+    maxNormalizedIdf: 0,
+    source: {
+      project: manifest.project,
+      sessionId: manifest.sessionId,
+      turnId: semanticIdentifier(result.structural?.sourceTurnId)
+        ?? semanticIdentifier(manifest.metadata?.turnId)
+        ?? null,
+      messageKey: semanticIdentifier(result.structural?.messageKey)
+        ?? (manifest.sourceKeyStatus === "unavailable"
+          ? undefined
+          : semanticIdentifier(manifest.sourceKey)),
+      sourceMessageKeys: manifest.sourceMessageKeys,
+    },
+    location: {
+      windowOrdinal: window.ordinal,
+      startByte: matchStartByte,
+      endByte: matchEndByte,
+      generation,
+    },
+  };
+}
+
+async function structuralCandidates(view, response, generation, request) {
+  const candidates = [];
+  for (const result of response.results) {
+    const candidate = await structuralCandidate(view, result, generation, request);
+    if (candidate !== undefined) candidates.push(candidate);
+  }
+  return candidates;
+}
+
+function compareCandidates(left, right) {
+  return MODE_PRIORITY[right.retrievalMode] - MODE_PRIORITY[left.retrievalMode]
+    || right.normalizedScore - left.normalizedScore
+    || (right.source.sessionId === left.source.sessionId ? 0 : 0)
+    || String(left.documentId).localeCompare(String(right.documentId));
+}
+
+function fuseCandidates(candidates, limit) {
+  const best = new Map();
+  for (const candidate of candidates) {
+    const identity = candidateIdentity(candidate);
+    const current = best.get(identity);
+    if (current === undefined || compareCandidates(candidate, current) < 0) best.set(identity, candidate);
+  }
+  return [...best.values()].sort(compareCandidates).slice(0, limit);
+}
+
+function preserveCandidateMargins(candidates) {
+  return candidates.map((candidate, index) => {
+    const sameModeNext = candidates.slice(index + 1)
+      .find(({ retrievalMode }) => retrievalMode === candidate.retrievalMode);
+    return {
+      ...candidate,
+      margin: Number((candidate.normalizedScore - (sameModeNext?.normalizedScore ?? 0)).toFixed(6)),
+    };
+  });
+}
+
+function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted }) {
+  const count = Number(exactAttempted) + Number(lexicalAttempted) + Number(structuralAttempted);
+  if (count > 1) return "hybrid";
+  if (exactAttempted) return "exact";
+  if (structuralAttempted) return "structural";
+  return "lexical";
+}
+
+async function collectCandidates(view, request, options) {
+  const generation = await publishedGeneration(view);
+  const plan = planExactQuery(request.query);
+  const candidateLimit = Math.min(100, Math.max(request.limit, request.limit * 3));
+  const candidates = [];
+  let exactAttempted = false;
+  let lexicalAttempted = false;
+  let structuralAttempted = false;
+  let structuralStatus;
+
+  if (plan.anchors.length > 0) {
+    exactAttempted = true;
+    const exact = await lookupExact(view, {
+      query: request.query,
+      project: request.project,
+      scope: request.effectiveScope,
+      sessionIds: request.sessionIds,
+      excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
+      limit: candidateLimit,
+      generation,
+      ...(options.exact ?? {}),
+    });
+    candidates.push(...exactCandidates(exact));
+  }
+
+  const exactResolved = candidates.some(({ retrievalMode }) => retrievalMode === "exact");
+  const lexicalAllowed = request.query.trim().length > 0
+    && !exactResolved
+    && options.broadenExactMiss !== false;
+  if (lexicalAllowed) {
+    lexicalAttempted = true;
+    const lexical = await searchBm25(view, {
+      query: request.query,
+      project: request.project,
+      scope: request.effectiveScope,
+      sessionIds: request.sessionIds,
+      excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
+      limit: candidateLimit,
+      ...(generation > 0 ? { generation } : {}),
+    }, options.bm25);
+    candidates.push(...lexicalCandidates(lexical));
+  }
+
+  if (request.relation !== null) {
+    structuralAttempted = true;
+    const structural = lookupStructural(view, {
+      relation: request.relation,
+      query: request.query,
+      project: request.project,
+      scope: request.effectiveScope,
+      sessionIds: request.sessionIds,
+      limit: candidateLimit,
+      generation,
+      scanLimit: options.structural?.scanLimit,
+    });
+    structuralStatus = structural.status;
+    candidates.push(...await structuralCandidates(view, structural, generation, request));
+  }
+
+  const fused = fuseCandidates(candidates, candidateLimit);
+  return Object.freeze({
+    generation,
+    candidates: Object.freeze(preserveCandidateMargins(fused)),
+    mode: responseMode({ exactAttempted, lexicalAttempted, structuralAttempted }),
+    structuralStatus,
+  });
+}
+
+async function candidateStillLive(store, candidate, request) {
+  return store.snapshot(async (view) => {
+    if (view.scan([KEYSPACE.SUPERSESSION, candidate.documentId, candidate.version], { limit: 1 }).length > 0) {
+      return false;
+    }
+    const manifest = await view.get(manifestKeys.document(candidate.documentId, candidate.version));
+    if (manifest === undefined || manifest.project !== request.project
+      || manifest.sessionId !== candidate.source.sessionId) return false;
+    if (request.effectiveScope === "session" && !request.sessionIds.includes(manifest.sessionId)) return false;
+    return true;
+  });
+}
+
+async function locateCandidates(store, collected, request, options, secret) {
+  const now = options.now ?? Date.now();
+  if (!Number.isSafeInteger(now) || now < 0) throw new TypeError("now must be a non-negative timestamp.");
+  const results = [];
+  for (const candidate of collected.candidates) {
+    let lease;
+    try {
+      lease = await createRetrievalLease(store, {
+        ownerId: options.ownerId ?? "search",
+        documentId: candidate.documentId,
+        documentVersion: candidate.version,
+        now,
+        ttlMs: options.leaseMs,
+      });
+    } catch (error) {
+      if (error instanceof RetrievalLeaseTargetUnavailableError) continue;
+      throw error;
+    }
+    if (!await candidateStillLive(store, candidate, request)) {
+      await releaseLease(store, lease.leaseId);
+      continue;
+    }
+    const locator = signLocator({
+      locatorVersion: 1,
+      documentId: candidate.documentId,
+      documentVersion: candidate.version,
+      windowOrdinal: candidate.location.windowOrdinal,
+      matchRange: {
+        startByte: candidate.location.startByte,
+        endByte: candidate.location.endByte,
+      },
+      indexGeneration: collected.generation,
+      leaseId: lease.leaseId,
+      project: request.project,
+      sessionId: candidate.source.sessionId,
+      scope: request.effectiveScope,
+      issuedAt: lease.issuedAt,
+      expiresAt: lease.expiresAt,
+    }, secret);
+    results.push({
+      documentId: candidate.documentId,
+      version: candidate.version,
+      kind: candidate.kind,
+      score: candidate.normalizedScore,
+      rawScore: candidate.rawScore ?? candidate.score,
+      calibratedScore: candidate.normalizedScore,
+      retrievalMode: candidate.retrievalMode,
+      createdAt: candidate.createdAt,
+      matchType: candidate.matchType,
+      margin: candidate.margin,
+      matchedAnchors: candidate.matchedAnchors ?? [],
+      matchedTerms: candidate.matchedTerms ?? [],
+      termCoverage: candidate.termCoverage ?? 0,
+      termIdf: candidate.termIdf ?? [],
+      maxNormalizedIdf: candidate.maxNormalizedIdf ?? 0,
+      snippet: candidate.snippet,
+      historical: true,
+      superseded: false,
+      locator,
+      source: {
+        sessionId: candidate.source.sessionId,
+        project: request.project,
+        ...(candidate.source.turnId ? { turnId: candidate.source.turnId } : {}),
+        ...(candidate.source.messageKey ? { messageKey: candidate.source.messageKey } : {}),
+      },
+    });
+    if (results.length === request.limit) break;
+  }
+  return results;
+}
+
+/** Exact-first, bounded, project-authorized archive search with leased locators. */
+export async function searchArchive(store, request, options = {}) {
+  requireStore(store);
+  const normalized = normalizeRequest(request);
+  const secret = await getOrCreateLocatorSecret(store, {
+    secret: options.secret,
+    now: options.now,
+  });
+  const collected = await store.snapshot((view) => collectCandidates(view, normalized, options));
+  const results = await locateCandidates(store, collected, normalized, options, secret);
+  let status = results.length === 0 ? "not-found" : "resolved";
+  if (results.length > 0 && collected.mode === "structural"
+    && ["ambiguous", "legacy-fallback"].includes(collected.structuralStatus)) {
+    status = collected.structuralStatus;
+  }
+  return assertStoreResult("store.search", {
+    mode: collected.mode,
+    status,
+    indexGeneration: collected.generation,
+    results,
+  });
+}

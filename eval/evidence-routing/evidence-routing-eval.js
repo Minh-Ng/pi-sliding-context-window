@@ -26,7 +26,7 @@ export function canonicalEffectiveProductionGuidance({
 }
 
 export const EFFECTIVE_PRODUCTION_GUIDANCE = canonicalEffectiveProductionGuidance();
-export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "7";
+export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "8";
 
 export function hashEffectiveProductionGuidance(guidance = EFFECTIVE_PRODUCTION_GUIDANCE) {
   const canonicalGuidance = canonicalEffectiveProductionGuidance(guidance);
@@ -41,7 +41,7 @@ export const HELD_OUT_EVALUATION_INSTRUCTIONS = "Held-out evidence-routing evalu
 
 export const REFERENCE_EVALUATION_INSTRUCTIONS = "Reference-detection evidence-routing evaluation. Return exactly 20 lines `reference-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: a request names a concept whose location may be unknown. Route archive when the referent is out-of-window prior wording/intent/decisions/rejected approaches; live when the question is whether a named concept currently exists or behaves in the checkout (files/symbols/config/runtime); both when the referent's location is genuinely ambiguous (could be prior conversation or the repository) or requires reconciling past intent with current state — probe both to locate rather than assuming; neither when the named concept is already visible in this prompt/recent context or is general knowledge. Naming a concept never by itself implies it is archived; do not assume archive for something that may be current repository state.";
 
-export const JARGON_EVALUATION_INSTRUCTIONS = "Jargon-disambiguation evidence-routing evaluation. Return exactly 20 lines `jargon-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: each case names an unrecognized term. Route both when older intent and current inspection are both required, or when the term's location is ambiguous between rotated-out conversation and the repository — probe both rather than assuming. A quoted context-index line is visible context listing terms from turns already rotated to the archive: a term listed there resolves its origin to archived conversation (archive), while a visible index that omits the term is evidence the referent is live or external (live). Questions exclusively about current repository or runtime state stay live regardless of index listings. Route neither when the needed evidence is already supplied in the prompt. Avoid speculative archive search.";
+export const JARGON_EVALUATION_INSTRUCTIONS = "Continuity-marker evidence-routing evaluation. Return exactly 20 lines `jargon-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain.\nPolicy: a continuity marker confirms only that eligible earlier discussion matched the quoted exact anchor from the current user message; it does not recover a definition, decision, assertion, or current fact. When prior project-specific meaning is material, route archive and search that exact anchor before using it. Questions exclusively about current repository or runtime state remain live, mixed historical-and-current questions remain both, and self-contained or general-knowledge questions remain neither. Without a marker, route both when a project term's location is genuinely ambiguous between rotated-out conversation and the repository. Archive-only terminology must not be treated as already-shared vocabulary.";
 
 export const INTERNALIZED_EVALUATION_INSTRUCTIONS = "Internalized evidence-routing evaluation. Return exactly 20 lines `internalized-NNN: route`; route must be archive/live/both/neither. Do not inspect repository files. Do not explain. No routing policy is provided: apply your own judgment about which evidence source each case requires.";
 
@@ -55,6 +55,10 @@ function hashText(value) {
 
 function benchmarkCase(id, prompt, expectedRoute, annotation) {
   return Object.freeze({ id, prompt, expectedRoute, annotation });
+}
+
+function continuityMarker(anchor) {
+  return `[Continuity marker: eligible earlier discussion matched exact current-message anchor ${JSON.stringify(anchor)}; no archived assertion was recovered.] `;
 }
 
 /**
@@ -145,53 +149,52 @@ export const EVIDENCE_ROUTING_REFERENCE_SUITE = Object.freeze([
 ]);
 
 /**
- * Jargon-disambiguation held-out suite of paired cases. Each pair holds one
- * unrecognized term constant and varies only whether a context-index (TOC
- * marker) line is visible, isolating the marker's routing effect from case
- * difficulty. Composition is deliberately skewed toward archive-required
- * routes (both 7, archive 5) with live (4) and neither (4) distractors — the
- * suite exists to measure recall on archive-required cases, and uses its own
- * composition rule instead of the shared 4-way balance. Untouched at
- * creation; degrades to regression exposure after first inspection.
+ * Continuity-marker regression suite of paired cases. Each pair holds the
+ * complete user text constant and varies only the prepended marker. Marker
+ * positives route from an ambiguous location (`both`) to exact-anchor history
+ * (`archive`); current-only, mixed, self-contained, and general cases do not
+ * change route merely because a marker exists. The original retained jargon
+ * artifact remains an immutable record of the earlier fixture generation.
  */
 export const EVIDENCE_ROUTING_JARGON_SUITE = Object.freeze([
-  benchmarkCase("jargon-001", "The term flushGuard keeps coming up as if established, but nothing in view defines it; is it from our earlier discussion or the codebase, and what is it?", EVIDENCE_ROUTES.BOTH, "The term's origin is ambiguous between rotated-out conversation and repository code, so recover historical mentions and inspect the current code, then reconcile."),
-  benchmarkCase("jargon-002", "A visible context-index line reads - turn-77ab \"plan the migration\" — sentinel rebase, cutover window; what did we mean by sentinel rebase?", EVIDENCE_ROUTES.ARCHIVE, "The visible context index attributes the term to an archived turn, so its meaning is out-of-window prior wording recovered from the archive rather than current code."),
-  benchmarkCase("jargon-003", "Does an export named epochGate exist anywhere in the code on disk right now?", EVIDENCE_ROUTES.LIVE, "Whether a named export currently exists is mutable repository state that only live inspection of the checkout can establish."),
-  benchmarkCase("jargon-004", "Define soft eviction as dropping cache entries without invalidating readers; given only that definition, is deleting an entry and its readers a soft eviction?", EVIDENCE_ROUTES.NEITHER, "The definition needed to answer is supplied inside the prompt itself, so neither archived discussion nor live repository inspection adds material evidence."),
-  benchmarkCase("jargon-005", "Is the backfill contract we settled on earlier still what the implementation in the checkout actually does?", EVIDENCE_ROUTES.BOTH, "Recover the historically agreed contract from the archive first, then inspect the current implementation and reconcile any drift."),
-  benchmarkCase("jargon-006", "The visible context-index lines mention only rotation limits and cache topics, not quorum stitching; so what is quorum stitching in this project?", EVIDENCE_ROUTES.LIVE, "A visible index of archived turns omits the term, which is evidence the referent is not archived conversation, so locate it by live inspection of the repository."),
-  benchmarkCase("jargon-007", "When I first introduced the term drip migration, long before it scrolled out of view, what did I say it meant?", EVIDENCE_ROUTES.ARCHIVE, "The requested meaning is the user's own earlier wording from turns no longer visible, which is historical conversational evidence independent of current files."),
-  benchmarkCase("jargon-008", "shadow reindex is referenced like something we both know, yet I cannot tell whether it came from our conversation or from this repository; track down what it is.", EVIDENCE_ROUTES.BOTH, "Recover any historical discussion of the term and inspect the current repository in parallel, since the referent's location is genuinely ambiguous."),
-  benchmarkCase("jargon-009", "This message defines lease fencing as pinning a task to a single owner, and a context-index line lists an older mention too; using only what is on screen, restate what lease fencing means.", EVIDENCE_ROUTES.NEITHER, "The definition is already supplied in the visible prompt, so the indexed older mention is immaterial and no retrieval or inspection is needed."),
-  benchmarkCase("jargon-010", "A visible context-index line reads - turn-3f9c \"debounce the writer\" — flushGuard, writeQueue; what did we mean when we coined flushGuard?", EVIDENCE_ROUTES.ARCHIVE, "The context index locates the coinage in an archived turn, so the meaning is prior conversational wording recovered from the archive, not current repository state."),
-  benchmarkCase("jargon-011", "Somewhere along the way sentinel rebase became shorthand, but I do not know if we invented it or the repo defines it; figure out which and explain it.", EVIDENCE_ROUTES.BOTH, "Recover historical mentions from the archive and inspect the current repository together, because the shorthand's origin is ambiguous between the two."),
-  benchmarkCase("jargon-012", "None of the visible context-index lines list shadow reindex anywhere; given that, what is shadow reindex in this project?", EVIDENCE_ROUTES.LIVE, "The visible archive index omitting the term is evidence against an archived origin, so the referent should be located by live inspection of the current repository."),
-  benchmarkCase("jargon-013", "A context-index line reads - turn-c04d \"scope the retry work\" — carry-forward set, retry ledger; remind me what our carry-forward set referred to.", EVIDENCE_ROUTES.ARCHIVE, "The index line ties the phrase to a rotated-out turn, making its meaning archived prior wording rather than anything derivable from the current checkout."),
-  benchmarkCase("jargon-014", "What is quorum stitching here? Nothing on screen explains it and I cannot tell whether it was discussion shorthand or a repo concept.", EVIDENCE_ROUTES.BOTH, "Recover the term from historical conversation and inspect the current repository simultaneously, as its location is ambiguous between archive and code."),
-  benchmarkCase("jargon-015", "Even though a context-index line lists soft eviction under turn-5c1e, take my definition here — dropping cache entries without invalidating readers — and say whether a full flush qualifies.", EVIDENCE_ROUTES.NEITHER, "An in-prompt definition supplies all needed evidence, so the indexed archived mention should not bait retrieval and no live inspection is material."),
-  benchmarkCase("jargon-016", "People keep saying carry-forward set as if it were settled vocabulary; confirm where that phrase comes from and what it covers.", EVIDENCE_ROUTES.BOTH, "Recover possible historical coinage from the archive while inspecting current repository usage, because the phrase could originate in either source."),
-  benchmarkCase("jargon-017", "A context-index line lists epochGate under turn-91d2, but my question is only this: does an export named epochGate exist in the code on disk right now?", EVIDENCE_ROUTES.LIVE, "The question is exclusively about current repository state, so the archived mention in the index does not make history material; inspect the checkout live."),
-  benchmarkCase("jargon-018", "The context index shows - turn-b7e1 \"sequence the rollout\" — drip migration, cohort gates; quote what I originally said drip migration meant.", EVIDENCE_ROUTES.ARCHIVE, "Exact original wording lives in the archived turn referenced by the index, which is historical evidence that current files cannot supply."),
-  benchmarkCase("jargon-019", "The context index lists backfill contract under turn-2a9f; is that agreed contract still what the implementation in the checkout actually does?", EVIDENCE_ROUTES.BOTH, "Recover the agreed contract from the archived turn and inspect the current implementation, then reconcile intent with the state of the code."),
-  benchmarkCase("jargon-020", "Right here I define lease fencing as pinning a task to a single owner; using only that sentence, does assigning two owners break lease fencing?", EVIDENCE_ROUTES.NEITHER, "All evidence required is contained in the prompt's own definition, so neither the archive nor the live repository contributes anything material."),
+  benchmarkCase("jargon-001", "What does flushGuard mean in this project? Nothing visible defines it.", EVIDENCE_ROUTES.BOTH, "Recover possible historical meaning with archive evidence and inspect current code because the unmarked project term may live in either source."),
+  benchmarkCase("jargon-002", `${continuityMarker("drip migration")}Quote what I originally said drip migration meant before it left the visible context.`, EVIDENCE_ROUTES.ARCHIVE, "Exact original wording is historical evidence; the marker locates an anchor but does not itself contain the requested wording."),
+  benchmarkCase("jargon-003", "Does the current repository define quorum stitching anywhere?", EVIDENCE_ROUTES.LIVE, "The question is exclusively about current repository contents, which only live inspection can establish."),
+  benchmarkCase("jargon-004", "In general distributed-systems terms, what could shadow reindex mean? Do not use project-specific history or files.", EVIDENCE_ROUTES.NEITHER, "The question explicitly requests general knowledge and excludes project history and files."),
+  benchmarkCase("jargon-005", "What does sentinel rebase mean in this project? Nothing visible defines it.", EVIDENCE_ROUTES.BOTH, "Recover possible historical meaning with archive evidence and inspect current code because the unmarked project term may live in either source."),
+  benchmarkCase("jargon-006", "This message defines soft eviction as dropping cache entries without invalidating readers; given only that definition, is deleting an entry and its readers a soft eviction?", EVIDENCE_ROUTES.NEITHER, "The prompt supplies the complete definition, making archive and live evidence immaterial."),
+  benchmarkCase("jargon-007", `${continuityMarker("flushGuard")}What does flushGuard mean in this project? Nothing visible defines it.`, EVIDENCE_ROUTES.ARCHIVE, "The marker resolves the term to prior discussion, but its meaning must still be recovered by an exact-anchor archive search."),
+  benchmarkCase("jargon-008", `${continuityMarker("epochGate")}Does an export named epochGate exist anywhere in the code on disk right now?`, EVIDENCE_ROUTES.LIVE, "A continuity marker does not prove current repository state; the exclusively current question remains live."),
+  benchmarkCase("jargon-009", `${continuityMarker("shadow reindex")}In general distributed-systems terms, what could shadow reindex mean? Do not use project-specific history or files.`, EVIDENCE_ROUTES.NEITHER, "Prior project usage is immaterial because the question explicitly requests general knowledge only."),
+  benchmarkCase("jargon-010", `${continuityMarker("sentinel rebase")}What does sentinel rebase mean in this project? Nothing visible defines it.`, EVIDENCE_ROUTES.ARCHIVE, "The marker proves only a prior match, so an exact-anchor archive search is required to recover the term's meaning."),
+  benchmarkCase("jargon-011", "What does carry-forward set mean in this project? Nothing visible defines it.", EVIDENCE_ROUTES.BOTH, "Recover possible historical meaning with archive evidence and inspect current repository state because the unmarked term's location is ambiguous."),
+  benchmarkCase("jargon-012", `${continuityMarker("lease fencing")}Here lease fencing means pinning a task to one owner; using only that definition, does assigning two owners break lease fencing?`, EVIDENCE_ROUTES.NEITHER, "The visible definition is sufficient, so the marker must not trigger an immaterial archive search."),
+  benchmarkCase("jargon-013", "Quote what I originally said drip migration meant before it left the visible context.", EVIDENCE_ROUTES.ARCHIVE, "The explicit request for exact prior wording requires archive evidence with or without a marker."),
+  benchmarkCase("jargon-014", `${continuityMarker("quorum stitching")}Does the current repository define quorum stitching anywhere?`, EVIDENCE_ROUTES.LIVE, "The marker is not current-state evidence, so repository inspection remains authoritative."),
+  benchmarkCase("jargon-015", `${continuityMarker("soft eviction")}This message defines soft eviction as dropping cache entries without invalidating readers; given only that definition, is deleting an entry and its readers a soft eviction?`, EVIDENCE_ROUTES.NEITHER, "The prompt contains all material evidence despite the marker."),
+  benchmarkCase("jargon-016", "Does the current implementation still match the backfill contract we agreed on?", EVIDENCE_ROUTES.BOTH, "The agreement requires archive evidence and the current implementation requires live inspection."),
+  benchmarkCase("jargon-017", "Does an export named epochGate exist anywhere in the code on disk right now?", EVIDENCE_ROUTES.LIVE, "The current export set is mutable repository state."),
+  benchmarkCase("jargon-018", "Here lease fencing means pinning a task to one owner; using only that definition, does assigning two owners break lease fencing?", EVIDENCE_ROUTES.NEITHER, "The definition in the prompt supplies all required evidence."),
+  benchmarkCase("jargon-019", `${continuityMarker("carry-forward set")}What does carry-forward set mean in this project? Nothing visible defines it.`, EVIDENCE_ROUTES.ARCHIVE, "The marker locates prior discussion but does not recover meaning; search its exact anchor before answering."),
+  benchmarkCase("jargon-020", `${continuityMarker("backfill contract")}Does the current implementation still match the backfill contract we agreed on?`, EVIDENCE_ROUTES.BOTH, "The marker cannot replace either historical recovery or live inspection for this mixed question."),
 ]);
 
 /**
- * Pair map for the jargon suite: each pair shares one term; the variants
- * differ only in whether a context-index line is visible in the prompt.
+ * Pair map for the jargon suite. `withMarker` is byte-for-byte `markerText`
+ * followed by `withoutMarker`; candidate-only terms model neighboring archive
+ * vocabulary that must not leak into an answer as familiar terminology.
  */
 export const EVIDENCE_ROUTING_JARGON_PAIRS = Object.freeze([
-  Object.freeze({ pairId: "pair-flush-guard", term: "flushGuard", withoutMarkerId: "jargon-001", withMarkerId: "jargon-010" }),
-  Object.freeze({ pairId: "pair-sentinel-rebase", term: "sentinel rebase", withoutMarkerId: "jargon-011", withMarkerId: "jargon-002" }),
-  Object.freeze({ pairId: "pair-quorum-stitching", term: "quorum stitching", withoutMarkerId: "jargon-014", withMarkerId: "jargon-006" }),
-  Object.freeze({ pairId: "pair-shadow-reindex", term: "shadow reindex", withoutMarkerId: "jargon-008", withMarkerId: "jargon-012" }),
-  Object.freeze({ pairId: "pair-epoch-gate", term: "epochGate", withoutMarkerId: "jargon-003", withMarkerId: "jargon-017" }),
-  Object.freeze({ pairId: "pair-backfill-contract", term: "backfill contract", withoutMarkerId: "jargon-005", withMarkerId: "jargon-019" }),
-  Object.freeze({ pairId: "pair-soft-eviction", term: "soft eviction", withoutMarkerId: "jargon-004", withMarkerId: "jargon-015" }),
-  Object.freeze({ pairId: "pair-carry-forward-set", term: "carry-forward set", withoutMarkerId: "jargon-016", withMarkerId: "jargon-013" }),
-  Object.freeze({ pairId: "pair-drip-migration", term: "drip migration", withoutMarkerId: "jargon-007", withMarkerId: "jargon-018" }),
-  Object.freeze({ pairId: "pair-lease-fencing", term: "lease fencing", withoutMarkerId: "jargon-020", withMarkerId: "jargon-009" }),
+  Object.freeze({ pairId: "pair-flush-guard", term: "flushGuard", archiveOnlyTerm: "writeQueue", markerText: continuityMarker("flushGuard"), withoutMarkerId: "jargon-001", withMarkerId: "jargon-007" }),
+  Object.freeze({ pairId: "pair-sentinel-rebase", term: "sentinel rebase", archiveOnlyTerm: "cutover window", markerText: continuityMarker("sentinel rebase"), withoutMarkerId: "jargon-005", withMarkerId: "jargon-010" }),
+  Object.freeze({ pairId: "pair-quorum-stitching", term: "quorum stitching", archiveOnlyTerm: "voting braid", markerText: continuityMarker("quorum stitching"), withoutMarkerId: "jargon-003", withMarkerId: "jargon-014" }),
+  Object.freeze({ pairId: "pair-shadow-reindex", term: "shadow reindex", archiveOnlyTerm: "mirror sweep", markerText: continuityMarker("shadow reindex"), withoutMarkerId: "jargon-004", withMarkerId: "jargon-009" }),
+  Object.freeze({ pairId: "pair-epoch-gate", term: "epochGate", archiveOnlyTerm: "rotation latch", markerText: continuityMarker("epochGate"), withoutMarkerId: "jargon-017", withMarkerId: "jargon-008" }),
+  Object.freeze({ pairId: "pair-backfill-contract", term: "backfill contract", archiveOnlyTerm: "repair ledger", markerText: continuityMarker("backfill contract"), withoutMarkerId: "jargon-016", withMarkerId: "jargon-020" }),
+  Object.freeze({ pairId: "pair-soft-eviction", term: "soft eviction", archiveOnlyTerm: "reader tombstone", markerText: continuityMarker("soft eviction"), withoutMarkerId: "jargon-006", withMarkerId: "jargon-015" }),
+  Object.freeze({ pairId: "pair-carry-forward-set", term: "carry-forward set", archiveOnlyTerm: "retry ledger", markerText: continuityMarker("carry-forward set"), withoutMarkerId: "jargon-011", withMarkerId: "jargon-019" }),
+  Object.freeze({ pairId: "pair-drip-migration", term: "drip migration", archiveOnlyTerm: "cohort gates", markerText: continuityMarker("drip migration"), withoutMarkerId: "jargon-013", withMarkerId: "jargon-002" }),
+  Object.freeze({ pairId: "pair-lease-fencing", term: "lease fencing", archiveOnlyTerm: "owner epoch", markerText: continuityMarker("lease fencing"), withoutMarkerId: "jargon-018", withMarkerId: "jargon-012" }),
 ]);
 
 /**
@@ -568,9 +571,9 @@ export function scoreArchiveRequiredRouting(labels, results) {
 }
 
 /**
- * Within-pair marker effect for the jargon suite. Each pair holds the term
- * constant and varies only context-index visibility, so per-pair correctness
- * deltas isolate the marker's contribution from case difficulty.
+ * Within-pair marker effect for the jargon suite. Each pair holds all user
+ * text constant and varies only continuity-marker visibility, so per-pair
+ * correctness deltas isolate the marker's contribution from case difficulty.
  */
 export function scoreJargonMarkerPairs(parsedOrderedLabels) {
   if (!Array.isArray(parsedOrderedLabels)) {
@@ -605,5 +608,60 @@ export function scoreJargonMarkerPairs(parsedOrderedLabels) {
     markerVariantOnlyCorrect,
     baselineVariantOnlyCorrect,
     bothWrong,
+  });
+}
+
+/**
+ * Deterministic safety check for terminology visible only in an archive
+ * candidate. Omission passes. If a response uses such a term, the sentence
+ * introducing it must both define it and identify an archived or live source.
+ * This is deliberately a narrow evaluation grammar rather than a general
+ * natural-language classifier.
+ */
+export function assessArchiveOnlyTerminology(responseText, archiveOnlyTerms) {
+  if (typeof responseText !== "string") {
+    throw new TypeError("responseText must be a string");
+  }
+  if (
+    !Array.isArray(archiveOnlyTerms)
+    || !archiveOnlyTerms.every((term) => typeof term === "string" && term.trim() !== "")
+  ) {
+    throw new TypeError("archiveOnlyTerms must contain non-empty strings");
+  }
+
+  const sentences = responseText
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+  const mentionedTerms = [];
+  const violations = [];
+  const provenancePattern = /\b(?:(?:archived|earlier|historical) (?:conversation|discussion|evidence|source|turn)|(?:current|live) (?:file|repository|runtime|source))\b/iu;
+
+  for (const term of archiveOnlyTerms) {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const termPattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "iu");
+    const definitionPattern = new RegExp(
+      `(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])\\s+(?:means|refers to|is (?:a|an|the)\\b)`,
+      "iu",
+    );
+    const termSentences = sentences.filter((sentence) => termPattern.test(sentence));
+    if (termSentences.length === 0) continue;
+    mentionedTerms.push(term);
+
+    const hasDefinedProvenance = termSentences.some(
+      (sentence) => definitionPattern.test(sentence) && provenancePattern.test(sentence),
+    );
+    if (!hasDefinedProvenance) {
+      violations.push(Object.freeze({
+        term,
+        reason: "archive-only-term-requires-inline-definition-and-provenance",
+      }));
+    }
+  }
+
+  return Object.freeze({
+    pass: violations.length === 0,
+    mentionedTerms: Object.freeze(mentionedTerms),
+    violations: Object.freeze(violations),
   });
 }

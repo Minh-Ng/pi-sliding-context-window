@@ -255,6 +255,19 @@ test("externalizes large tool results deterministically", () => {
   assert.ok(estimateTokens(result.messages) < estimateTokens(original));
 });
 
+test("failed tool-result archival leaves the original provider content intact", () => {
+  const original = [user("run", 1), tool("x".repeat(10_000), 2, "abc")];
+  const result = externalizeLargeToolResults(original, {
+    maxTokens: 100,
+    previewTokens: 40,
+    store() { return undefined; },
+  });
+
+  assert.equal(result.changed, false);
+  assert.equal(result.messages, original);
+  assert.equal(result.messages[1].content[0].text, "x".repeat(10_000));
+});
+
 test("message keys hash the complete deterministic serialization", () => {
   const prefix = "x".repeat(8_100);
   const first = user(`${prefix}a`, 1);

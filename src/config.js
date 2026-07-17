@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { defaultSocketPath } from "./daemon/paths.js";
 
 export const DEFAULT_CONFIG = Object.freeze({
   rotationContextRatio: 0.65,
@@ -12,10 +13,31 @@ export const DEFAULT_CONFIG = Object.freeze({
   hardLimitTokens: 128_000,
   retainTurns: 5,
   maxToolResultTokens: 4_000,
+  maxInlineUserTokens: 16_000,
   searchResults: 3,
   searchResultTokens: 1_500,
+  automaticRetrieval: true,
+  hintBudgetTokens: 160,
+  activeHintBudgetTokens: 640,
+  // Compatibility alias. loadConfig resolves both names to one value.
+  epochHintBudgetTokens: 640,
+  hintSourceCooldownHours: 24,
+  ephemeralAutoRetrievalDays: 7,
+  conversationAutoRetrievalDays: 30,
+  derivedAutoRetrievalDays: 30,
+  ephemeralRetentionDays: 14,
+  conversationRetentionDays: 90,
+  derivedRetentionDays: 30,
+  maxArchiveBytes: 1_073_741_824,
+  targetArchiveBytes: 805_306_368,
+  recentDocumentProtectionDays: 7,
+  minimumTurnsPerSession: 20,
   preventAutoCompaction: true,
   statusLabelAccent: true,
+  archiveBackend: "rocksdb",
+  rocksdbPath: join(homedir(), ".pi", "context-window", "archive.rocks"),
+  socketPath: undefined,
+  // Existing archives remain here until an explicit offline cutover.
   dbPath: join(homedir(), ".pi", "context-window", "archive.db"),
   models: Object.freeze({}),
 });
@@ -45,6 +67,14 @@ function positiveInteger(value, fallback) {
   return parsePositiveInteger(value) ?? fallback;
 }
 
+function parseNonNegativeInteger(value) {
+  if (typeof value !== "number" && (typeof value !== "string" || value.trim() === "")) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 function parsePositiveRatio(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 1 ? parsed : undefined;
@@ -67,6 +97,14 @@ function booleanValue(value, fallback) {
   if (value === undefined) return fallback;
   if (typeof value === "boolean") return value;
   return !["0", "false", "no", "off"].includes(String(value).toLowerCase());
+}
+
+function parseArchiveBackend(value) {
+  return value === "rocksdb" || value === "sqlite" ? value : undefined;
+}
+
+function resolvedPath(value, home) {
+  return resolve(String(value).replace(/^~(?=$|\/)/, home));
 }
 
 function normalizeModelProfiles(value) {
@@ -171,6 +209,7 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
   const defaultConfig = {
     ...DEFAULT_CONFIG,
     dbPath: join(home, ".pi", "context-window", "archive.db"),
+    rocksdbPath: join(home, ".pi", "context-window", "archive.rocks"),
   };
   const merged = Object.assign({}, defaultConfig, ...layers);
   const values = (key) => layers.map((layer) => layer[key]).reverse();
@@ -185,6 +224,19 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     environmentValue,
     ...values(key),
   );
+  const aliasedNumeric = (primaryKey, legacyKey, parser, primaryEnvironmentValue, legacyEnvironmentValue) => {
+    const environmentValue = firstValid(
+      parser,
+      primaryEnvironmentValue,
+      legacyEnvironmentValue,
+    );
+    if (environmentValue !== undefined) return environmentValue;
+    for (const layer of [...layers].reverse()) {
+      const layerValue = firstValid(parser, layer[primaryKey], layer[legacyKey]);
+      if (layerValue !== undefined) return layerValue;
+    }
+    return defaultConfig[primaryKey];
+  };
   let models = {};
   for (const layer of layers) {
     models = mergeModelProfiles(models, normalizeModelProfiles(layer.models));
@@ -195,11 +247,28 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
   const environmentRotationTurns = parsePositiveInteger(env.CONTEXT_WINDOW_ROTATION_TURNS);
   const explicitRotationTokens = explicitNumeric("rotationTokens", env.CONTEXT_WINDOW_ROTATION_TOKENS);
   const explicitHardLimitTokens = explicitNumeric("hardLimitTokens", env.CONTEXT_WINDOW_HARD_LIMIT_TOKENS);
+  const configuredArchiveBackend = firstValid(
+    parseArchiveBackend,
+    env.CONTEXT_WINDOW_BACKEND,
+    ...values("archiveBackend"),
+  );
+  const dbPath = resolvedPath(env.CONTEXT_WINDOW_DB ?? merged.dbPath, home);
+  const rocksdbPath = resolvedPath(env.CONTEXT_WINDOW_ROCKSDB ?? merged.rocksdbPath, home);
+  const sqliteSourceExists = existsSync(dbPath);
+  const archiveBackend = configuredArchiveBackend
+    ?? (sqliteSourceExists ? "sqlite" : DEFAULT_CONFIG.archiveBackend);
   const environmentOverrides = {
     rotationContextRatio: environmentRotationRatio !== undefined,
     hardLimitContextRatio: environmentHardRatio !== undefined,
     rotationTurns: environmentRotationTurns !== undefined,
   };
+  const activeHintBudgetTokens = aliasedNumeric(
+    "activeHintBudgetTokens",
+    "epochHintBudgetTokens",
+    parseNonNegativeInteger,
+    env.CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS,
+    env.CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS,
+  );
 
   const config = {
     rotationContextRatio: numeric("rotationContextRatio", parsePositiveRatio, env.CONTEXT_WINDOW_ROTATION_CONTEXT_RATIO),
@@ -211,14 +280,87 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     hardLimitTokensExplicit: explicitHardLimitTokens !== undefined,
     retainTurns: numeric("retainTurns", parsePositiveInteger, env.CONTEXT_WINDOW_RETAIN_TURNS),
     maxToolResultTokens: numeric("maxToolResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_TOOL_RESULT_TOKENS),
+    maxInlineUserTokens: numeric("maxInlineUserTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS),
     searchResults: numeric("searchResults", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULTS),
     searchResultTokens: numeric("searchResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULT_TOKENS),
+    automaticRetrieval: booleanValue(
+      env.CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL ?? merged.automaticRetrieval,
+      DEFAULT_CONFIG.automaticRetrieval,
+    ),
+    hintBudgetTokens: numeric(
+      "hintBudgetTokens",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_HINT_BUDGET_TOKENS,
+    ),
+    activeHintBudgetTokens,
+    epochHintBudgetTokens: activeHintBudgetTokens,
+    hintSourceCooldownHours: numeric(
+      "hintSourceCooldownHours",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_HINT_SOURCE_COOLDOWN_HOURS,
+    ),
+    ephemeralAutoRetrievalDays: numeric(
+      "ephemeralAutoRetrievalDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_EPHEMERAL_AUTO_RETRIEVAL_DAYS,
+    ),
+    conversationAutoRetrievalDays: numeric(
+      "conversationAutoRetrievalDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_CONVERSATION_AUTO_RETRIEVAL_DAYS,
+    ),
+    derivedAutoRetrievalDays: numeric(
+      "derivedAutoRetrievalDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_DERIVED_AUTO_RETRIEVAL_DAYS,
+    ),
+    ephemeralRetentionDays: numeric(
+      "ephemeralRetentionDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS,
+    ),
+    conversationRetentionDays: numeric(
+      "conversationRetentionDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS,
+    ),
+    derivedRetentionDays: numeric(
+      "derivedRetentionDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_DERIVED_RETENTION_DAYS,
+    ),
+    maxArchiveBytes: numeric("maxArchiveBytes", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_ARCHIVE_BYTES),
+    targetArchiveBytes: numeric("targetArchiveBytes", parsePositiveInteger, env.CONTEXT_WINDOW_TARGET_ARCHIVE_BYTES),
+    recentDocumentProtectionDays: numeric(
+      "recentDocumentProtectionDays",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS,
+    ),
+    minimumTurnsPerSession: numeric(
+      "minimumTurnsPerSession",
+      parseNonNegativeInteger,
+      env.CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION,
+    ),
     preventAutoCompaction: booleanValue(env.CONTEXT_WINDOW_PREVENT_AUTO_COMPACTION ?? merged.preventAutoCompaction, DEFAULT_CONFIG.preventAutoCompaction),
     statusLabelAccent: booleanValue(env.CONTEXT_WINDOW_STATUS_LABEL_ACCENT ?? merged.statusLabelAccent, DEFAULT_CONFIG.statusLabelAccent),
-    dbPath: resolve(String(env.CONTEXT_WINDOW_DB ?? merged.dbPath).replace(/^~(?=$|\/)/, home)),
+    // Existing SQLite users stay on SQLite until they explicitly complete the
+    // offline migration and opt into RocksDB. Fresh installations use RocksDB.
+    archiveBackend,
+    rocksdbPath,
+    dbPath,
+    // Packaged RocksDB adapters always pass the configured SQLite path to the
+    // daemon authority gate. The daemon decides atomically whether that path
+    // is absent (fresh RocksDB) or requires a verified migration.
+    ...(archiveBackend === "rocksdb"
+      ? { rocksdbMigrationSourcePath: dbPath }
+      : {}),
     models,
     environmentOverrides,
   };
+  config.socketPath = resolvedPath(
+    env.CONTEXT_WINDOW_SOCKET ?? merged.socketPath ?? defaultSocketPath(config.rocksdbPath),
+    home,
+  );
 
   if (config.hardLimitTokens < config.rotationTokens) {
     if (config.rotationTokensExplicit) config.hardLimitTokens = config.rotationTokens;
@@ -226,6 +368,9 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
   }
   if (config.rotationTurns <= config.retainTurns) {
     config.rotationTurns = config.retainTurns + 1;
+  }
+  if (config.targetArchiveBytes >= config.maxArchiveBytes) {
+    config.targetArchiveBytes = Math.max(1, Math.floor(config.maxArchiveBytes * 0.75));
   }
   return config;
 }

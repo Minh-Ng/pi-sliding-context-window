@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cache-aware epoch context window with local SQLite FTS5/BM25 recall",
+  "description": "Cache-aware epoch context window with a single-owner RocksDB archive and bounded recall",
   "license": "MIT",
   "files": [
     "bin",
+    "docs/rocksdb-archive",
     "extensions",
     "src",
     "README.md",
@@ -14,10 +15,12 @@
     "!test/**"
   ],
   "engines": {
-    "node": ">=22.13.0"
+    "node": "^22.19.0 || >=24.0.0"
   },
   "bin": {
-    "context-window-mcp": "./bin/context-window-mcp.js"
+    "context-window-mcp": "./bin/context-window-mcp.js",
+    "context-windowd": "./bin/context-windowd.js",
+    "context-window-migrate": "./bin/context-window-migrate.js"
   },
   "pi": {
     "extensions": [
@@ -25,16 +28,30 @@
     ]
   },
   "scripts": {
+    "bench:archive": "node bench/archive/cli.js",
+    "bench:archive:release": "node bench/archive/release-cli.js",
+    "bench:archive:system": "node bench/archive/system-cli.js",
     "test": "node --test",
-    "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --test"
+    "test:daemon": "node --test test/store-contract.test.js test/daemon.test.js test/daemon-operations.test.js test/daemon-archive.test.js test/daemon-maintenance.test.js test/direct-document-recall.test.js",
+    "test:migration": "node --test test/migration.test.js",
+    "test:rocksdb": "node --test test/rocksdb-binding.test.js test/rocksdb-store.test.js test/rocksdb-chunks.test.js test/rocksdb-indexer.test.js test/rocksdb-exact.test.js test/rocksdb-bm25.test.js test/rocksdb-structural.test.js test/rocksdb-retention.test.js test/retrieval-locator-leases.test.js test/retrieval-search.test.js test/retrieval-recall.test.js test/retrieval-hints.test.js",
+    "eval:migration-rehearsal": "node eval/release/migration-rehearsal.js",
+    "eval:release": "node eval/release/cli.js",
+    "eval:release-verifiers": "node eval/release/verifiers.js",
+    "eval:retrieval": "node eval/retrieval/release-gate.js",
+    "eval:hints": "node eval/retrieval/cli.js --backend eval/retrieval/rocksdb-backend.js --suite hints --output artifacts/retrieval/rocksdb-hints.json --require-all",
+    "eval:sqlite-baseline": "node eval/retrieval/cli.js --backend sqlite --suite lexical --output artifacts/retrieval/sqlite-baseline.json --require-all",
+    "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --check bin/context-windowd.js && node --check bin/context-window-migrate.js && node --test"
   },
   "dependencies": {
+    "@harperfast/rocksdb-js": "2.4.0",
     "typebox": "1.1.38"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.6"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.7",
     "@types/node": "24.13.3",
     "typescript": "5.9.3"
   }

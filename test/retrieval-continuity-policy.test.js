@@ -145,6 +145,15 @@ test("current-state-only and general-knowledge messages suppress automatic histo
 });
 
 test("implicit continuity is limited to eligible conversation sources", () => {
+  assert.equal(decideContinuityDisclosure({
+    message: "What deployment color is used for canary deploys?",
+    candidate: lexicalCandidate({
+      kind: "decision-candidate",
+      matchedTerms: ["color", "us", "canari"],
+      termCoverage: 0.75,
+    }),
+  }).outcome, "continuity-marker");
+
   const decision = decideContinuityDisclosure({
     message: "Could tablets help with compaction here?",
     candidate: lexicalCandidate({ kind: "tool-result" }),

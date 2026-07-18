@@ -88,6 +88,8 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(SEARCH_TOOL_DESCRIPTION, /search the marker's exact anchor before using it/i);
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /marker itself as a recovered fact, decision, definition, or current-state claim/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /archive candidate.*plain language.*archived discussion or a live source/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /project-specific term.*not defined in visible context.*about to search.*live source.*also run context_window_search.*exact term/i.test(guideline)));
+  assert.match(SEARCH_TOOL_DESCRIPTION, /project-specific term.*not defined in visible context.*search the archive for that exact term.*origin as ambiguous/i);
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,

@@ -110,6 +110,7 @@ function normalizePreflightRequest(request) {
     conversationAutoRetrievalDays,
     derivedAutoRetrievalDays,
     reconstruct: request.reconstruct === true,
+    includeDiagnostics: request.includeDiagnostics === true,
   });
 }
 
@@ -212,6 +213,7 @@ function recordFor(request, options, queryHash, decision) {
     outcome: decision.outcome,
     reason: decision.reason,
     indexGeneration: decision.indexGeneration,
+    diagnostics: decision.diagnostics,
     documentId: decision.candidate?.documentId ?? null,
     documentVersion: decision.candidate?.version ?? null,
     leaseId: decision.leaseId ?? null,
@@ -220,6 +222,19 @@ function recordFor(request, options, queryHash, decision) {
     tokenCount: decision.hint?.tokenCount ?? 0,
     hints,
     createdAt,
+  });
+}
+
+function candidateDiagnostics(candidate) {
+  if (candidate === undefined) return null;
+  return Object.freeze({
+    documentId: candidate.documentId,
+    kind: candidate.kind,
+    retrievalMode: candidate.retrievalMode,
+    matchedTerms: Object.freeze([...(candidate.matchedTerms ?? [])]),
+    termCoverage: candidate.termCoverage ?? 0,
+    maxNormalizedIdf: candidate.maxNormalizedIdf ?? 0,
+    margin: candidate.margin ?? 0,
   });
 }
 
@@ -330,7 +345,7 @@ export async function preflightArchive(store, request, options = {}) {
         ? {}
         : { inactivityMs: options.hintInactivityMs }),
     });
-    return frozenHintResponse(current);
+    return frozenHintResponse(current, { includeDiagnostics: normalized.includeDiagnostics });
   }
   if (normalized.reconstruct) {
     throw new Error(`No frozen hint decision exists for ${normalized.messageKey}.`);
@@ -408,6 +423,14 @@ export async function preflightArchive(store, request, options = {}) {
     outcome: revealed ? classification.outcome : "suppress",
     reason: classification.reason,
     indexGeneration: search.indexGeneration,
+    diagnostics: Object.freeze({
+      outcome: revealed ? classification.outcome : "suppress",
+      reason: classification.reason,
+      indexGeneration: search.indexGeneration,
+      searchMode: search.mode,
+      searchStatus: search.status,
+      candidate: candidateDiagnostics(candidate),
+    }),
     candidate: revealed ? candidate : undefined,
     leaseId: undefined,
     hint,
@@ -445,7 +468,7 @@ export async function preflightArchive(store, request, options = {}) {
       return used + frozenRecord.tokenCount > activeBudget ? "hint-budget" : undefined;
     },
   });
-  return frozenHintResponse(persisted);
+  return frozenHintResponse(persisted, { includeDiagnostics: normalized.includeDiagnostics });
   });
 }
 

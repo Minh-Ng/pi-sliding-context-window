@@ -267,6 +267,40 @@ export function formatArchiveStorage(storage) {
   return sections.join("\n");
 }
 
+function diagnosticPercentage(value) {
+  return `${Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100)}%`;
+}
+
+export function formatAutomaticRetrievalDiagnostics(diagnostics) {
+  if (!diagnostics) {
+    return "No automatic retrieval decision has been observed in this process.";
+  }
+  const lines = [
+    `Automatic retrieval: ${diagnostics.outcome}`,
+    `Reason: ${diagnostics.reason}`,
+  ];
+  if (diagnostics.error) lines.push(`Error: ${diagnostics.error}`);
+  if (diagnostics.messageKey) lines.push(`Message: ${diagnostics.messageKey}`);
+  if (diagnostics.searchMode || diagnostics.searchStatus) {
+    lines.push(`Search: ${diagnostics.searchMode ?? "unknown"} / ${diagnostics.searchStatus ?? "unknown"}`);
+  }
+  if (Number.isSafeInteger(diagnostics.indexGeneration)) {
+    lines.push(`Index generation: ${diagnostics.indexGeneration}`);
+  }
+  if (!diagnostics.candidate) {
+    lines.push("Candidate: none");
+    return lines.join("\n");
+  }
+  const candidate = diagnostics.candidate;
+  const matchedTerms = Array.isArray(candidate.matchedTerms) ? candidate.matchedTerms : [];
+  lines.push(
+    `Candidate: ${candidate.documentId} (${candidate.kind}, ${candidate.retrievalMode})`,
+    `Matched terms: ${matchedTerms.length > 0 ? matchedTerms.join(", ") : "none"}`,
+    `Coverage: ${diagnosticPercentage(candidate.termCoverage)}; distinctiveness: ${diagnosticPercentage(candidate.maxNormalizedIdf)}; margin: ${diagnosticPercentage(candidate.margin)}`,
+  );
+  return lines.join("\n");
+}
+
 function identity(text) {
   return text;
 }

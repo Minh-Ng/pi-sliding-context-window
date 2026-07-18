@@ -1065,6 +1065,7 @@ test("automatic preflight caches every frozen decision and survives later retrie
     ephemeralAutoRetrievalDays: 7,
     conversationAutoRetrievalDays: 30,
     derivedAutoRetrievalDays: 30,
+    includeDiagnostics: true,
     epochId: "hint-session:0",
     epochBudgetTokens: 320,
   });
@@ -1101,6 +1102,56 @@ test("automatic preflight caches every frozen decision and survives later retrie
   assert.deepEqual(reconstructed.slice(3), [secondAnswer, third]);
   assert.equal(requests.length, 2);
   assert.equal(session.status().preflightError, "daemon unavailable");
+});
+
+test("automatic retrieval diagnostics preserve the last sanitized preflight decision", () => {
+  const archive = memoryArchive();
+  archive.preflight = () => ({
+    modelVisibleText: "",
+    hints: [],
+    diagnostics: {
+      outcome: "suppress",
+      reason: "weak-evidence",
+      indexGeneration: 7,
+      searchMode: "lexical",
+      searchStatus: "resolved",
+      candidate: {
+        documentId: "decision-7",
+        kind: "decision-candidate",
+        retrievalMode: "lexical",
+        matchedTerms: ["canari", "deploi"],
+        termCoverage: 0.4,
+        maxNormalizedIdf: 1,
+        margin: 0.5,
+      },
+    },
+  });
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, automaticRetrieval: true },
+    sessionId: "diagnostic-session",
+    project: "/project",
+  });
+  const prompt = user("What color is used for canary deploys?", 1);
+  session.process([prompt]);
+
+  assert.deepEqual(session.automaticRetrievalDiagnostics(), {
+    outcome: "suppress",
+    reason: "weak-evidence",
+    indexGeneration: 7,
+    searchMode: "lexical",
+    searchStatus: "resolved",
+    candidate: {
+      documentId: "decision-7",
+      kind: "decision-candidate",
+      retrievalMode: "lexical",
+      matchedTerms: ["canari", "deploi"],
+      termCoverage: 0.4,
+      maxNormalizedIdf: 1,
+      margin: 0.5,
+    },
+    messageKey: messageKey(prompt),
+  });
 });
 
 test("rotation sends retained user keys under one unchanged active hint budget", () => {

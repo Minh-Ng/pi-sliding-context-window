@@ -12,6 +12,7 @@ import {
 } from "../src/epoch-window.js";
 import {
   formatArchiveStorage,
+  formatAutomaticRetrievalDiagnostics,
   formatRecalledDocument,
   formatSearchResults,
   formatStatusDetails,
@@ -445,7 +446,7 @@ export function createContextEpochWindow({
     });
 
     pi.registerCommand("window", {
-      description: "Context epoch controls: /window [status|rotate|search <query>|archive status|archive prune|archive reclaim]",
+      description: "Context epoch controls: /window [status|rotate|search <query>|recall why|archive status|archive prune|archive reclaim]",
       handler: async (args, ctx) => {
         const active = requireSession();
         updateStatus(ctx);
@@ -459,6 +460,12 @@ export function createContextEpochWindow({
         if (input.startsWith("search ")) {
           const results = active.search(input.slice(7));
           ctx.ui.notify(formatSearchResults(results, active.config.searchResultTokens), "info");
+          return;
+        }
+        if (input === "recall why") {
+          ctx.ui.notify(formatAutomaticRetrievalDiagnostics(
+            active.automaticRetrievalDiagnostics(),
+          ), "info");
           return;
         }
         if (input === "archive status") {

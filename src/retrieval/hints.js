@@ -158,10 +158,20 @@ export function estimateHintTokens(text) {
   return estimateModelVisibleTokens(text);
 }
 
-export function frozenHintResponse(record) {
+export function frozenHintResponse(record, { includeDiagnostics = false } = {}) {
   return Object.freeze({
     modelVisibleText: record.modelVisibleText,
     hints: Object.freeze(record.hints.map((hint) => Object.freeze({ ...hint }))),
+    ...(includeDiagnostics
+      ? {
+          diagnostics: Object.freeze(record.diagnostics ?? {
+            outcome: record.outcome,
+            reason: record.reason,
+            indexGeneration: record.indexGeneration,
+            candidate: null,
+          }),
+        }
+      : {}),
   });
 }
 
@@ -340,6 +350,15 @@ export async function persistFrozenHint(store, record, options = {}) {
           ...record,
           outcome: "suppress",
           reason: suppressionReason,
+          ...(record.diagnostics === undefined
+            ? {}
+            : {
+                diagnostics: Object.freeze({
+                  ...record.diagnostics,
+                  outcome: "suppress",
+                  reason: suppressionReason,
+                }),
+              }),
           documentId: null,
           documentVersion: null,
           leaseId: null,

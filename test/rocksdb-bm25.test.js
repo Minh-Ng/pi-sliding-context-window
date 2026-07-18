@@ -67,6 +67,10 @@ test("tokenizer stems deterministic terms and retains original UTF-8 positions",
   assert.equal(normalizeBm25Term("reconstruction"), "reconstruct");
   assert.equal(normalizeBm25Term("ＤＵＰＬＩＣＡＴＥＤ"), "duplic");
   assert.deepEqual(tokenizeBm25Query("Duplicated duplicating bytes"), ["duplic", "byte"]);
+  assert.deepEqual(
+    tokenizeBm25Query("What deployment color are used for canary deploys"),
+    ["deploy", "color", "us", "canari", "deploi"],
+  );
 
   const text = "Café 🪨 DUPLICATED/雪";
   const tokens = tokenizeBm25(text);

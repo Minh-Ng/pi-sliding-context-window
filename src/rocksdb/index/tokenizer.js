@@ -2,6 +2,14 @@ export const BM25_TOKENIZER_VERSION = 1;
 export const MAX_BM25_TERM_CODE_POINTS = 128;
 
 const WORD = /[\p{L}\p{M}\p{N}_]+/gu;
+const QUERY_STOP_WORDS = new Set([
+  "a", "am", "an", "are", "as", "at", "be", "been", "being", "but", "by",
+  "can", "could", "did", "do", "does", "for", "from", "had", "has", "have", "here",
+  "how", "i", "if", "in", "is", "it", "may", "might", "must", "of", "on", "or",
+  "should", "that", "the", "then", "there", "these", "they", "this", "those", "to",
+  "was", "we", "were", "what", "when", "where", "which", "who", "whom", "whose",
+  "why", "will", "with", "would", "you",
+]);
 
 function isConsonant(word, index) {
   const character = word[index];
@@ -176,6 +184,8 @@ export function tokenizeBm25Query(query, options = {}) {
   const terms = [];
   const seen = new Set();
   for (const token of tokenizeBm25(query)) {
+    const surface = token.surface.normalize("NFKC").toLowerCase();
+    if (QUERY_STOP_WORDS.has(surface)) continue;
     if (seen.has(token.term)) continue;
     seen.add(token.term);
     terms.push(token.term);

@@ -21,7 +21,12 @@ export const CONTINUITY_REASON = Object.freeze({
 const HISTORICAL_CUE = /\b(?:earlier|histor(?:y|ical)|previous(?:ly)?|prior|we decided|did we decide|what did we|how did we|why did we|when (?:we|it|context)|reconstruct(?:ed|ion)?|restored|used to)\b/iu;
 const CURRENT_STATE_CUE = /\b(?:right now|currently|current (?:code|config|configuration|file|files|implementation|repository|state|status|tree|runtime)|working tree|(?:code|file|files|repository) on disk|on-disk (?:code|file|files|repository)|checked[- ]out (?:code|file|files|repository)|local (?:code|file|files|repository|tree)|live (?:code|repository|state|runtime|status)|today|latest (?:code|config|configuration|file|implementation|repository|status|runtime))\b/iu;
 const GENERAL_KNOWLEDGE_CUE = /(?:\b(?:in general|generally|as a general concept)\b|^(?:what does .+ stand for|define |what is the definition of ))/iu;
-const CONVERSATION_KINDS = new Set(["conversation", "conversation-source", "turn"]);
+const CONVERSATION_KINDS = new Set([
+  "conversation",
+  "conversation-source",
+  "decision-candidate",
+  "turn",
+]);
 
 function requireMessage(message) {
   if (typeof message !== "string" || message.length === 0) {

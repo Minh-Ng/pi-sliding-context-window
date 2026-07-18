@@ -439,6 +439,7 @@ export class EpochWindowSession {
     this.effectiveRetainTurns = undefined;
     this.compactionFallbackReason = undefined;
     this.lastPreflightError = undefined;
+    this.lastAutomaticRetrieval = undefined;
     this.lastHintCleanupError = undefined;
     this.toc = [];
     this.activeArchiveIds = new Set();
@@ -463,6 +464,7 @@ export class EpochWindowSession {
     this.effectiveRetainTurns = undefined;
     this.compactionFallbackReason = undefined;
     this.lastPreflightError = undefined;
+    this.lastAutomaticRetrieval = undefined;
     this.lastHintCleanupError = undefined;
     this.toc = [];
     this.activeArchiveIds = new Set();
@@ -962,6 +964,12 @@ export class EpochWindowSession {
         // later after this exact provider prefix has already been used.
         this.frozenHintTextByMessageKey.set(targetKey, "");
         this.activeHintMessageKeys.add(targetKey);
+        this.lastAutomaticRetrieval = Object.freeze({
+          messageKey: targetKey,
+          outcome: "error",
+          reason: "preflight-unavailable",
+          candidate: null,
+        });
         continue;
       }
       if (!reconstruct) {
@@ -984,6 +992,7 @@ export class EpochWindowSession {
           ephemeralAutoRetrievalDays: this.config.ephemeralAutoRetrievalDays ?? 7,
           conversationAutoRetrievalDays: this.config.conversationAutoRetrievalDays ?? 30,
           derivedAutoRetrievalDays: this.config.derivedAutoRetrievalDays ?? 30,
+          includeDiagnostics: true,
           epochId: `${this.sessionId}:${this.rotations}`,
           epochBudgetTokens: activeHintBudgetTokens,
           ...(reconstruct ? { reconstruct: true } : {}),
@@ -993,6 +1002,12 @@ export class EpochWindowSession {
           : "";
         this.frozenHintTextByMessageKey.set(targetKey, modelVisibleText);
         this.activeHintMessageKeys.add(targetKey);
+        if (response?.diagnostics && typeof response.diagnostics === "object") {
+          this.lastAutomaticRetrieval = Object.freeze({
+            ...structuredClone(response.diagnostics),
+            messageKey: targetKey,
+          });
+        }
         if (modelVisibleText) {
           next ??= [...messages];
           next[index] = appendArchivedHint(target, modelVisibleText);
@@ -1004,6 +1019,13 @@ export class EpochWindowSession {
         this.frozenHintTextByMessageKey.set(targetKey, "");
         this.activeHintMessageKeys.add(targetKey);
         lastError = error instanceof Error ? error.message : String(error);
+        this.lastAutomaticRetrieval = Object.freeze({
+          messageKey: targetKey,
+          outcome: "error",
+          reason: "preflight-error",
+          candidate: null,
+          error: lastError,
+        });
       }
     }
     this.lastPreflightError = lastError;
@@ -1015,6 +1037,12 @@ export class EpochWindowSession {
       this.onRotation(this.rotationState());
     }
     return next ?? messages;
+  }
+
+  automaticRetrievalDiagnostics() {
+    return this.lastAutomaticRetrieval === undefined
+      ? undefined
+      : structuredClone(this.lastAutomaticRetrieval);
   }
 
   reconcileHintLifecycle(activeMessages, retiredMessages = [], retiredKeys = new Set()) {

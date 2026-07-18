@@ -5,14 +5,14 @@
   "versions": {
     "localEvidenceSchema": 1,
     "node": "24.18.0",
-    "pi": "0.80.7",
+    "pi": "0.80.10",
     "rocksdb": "2.4.0",
     "storeSchema": 1,
     "protocol": 1
   },
   "hashes": {
     "localEvidenceSchema": "sha256:f0f9dc220b318850b29505a507a4cbed98ba31cbb694a96cdc152d279ac62053",
-    "dependencyLock": "sha256:c03eb877f8f7a2c1f71696b7775906530b08d4c46cf36744ba9ca435af1dc8ea"
+    "dependencyLock": "sha256:98616320cd82c918a1652d868580b4c9be6f56a4c36c1d53bdf47f196da676c8"
   },
   "counts": {
     "fullTestsPassed": 600,
@@ -32,10 +32,10 @@
     "requiredPathCommandsFound": 2
   },
   "durationsMilliseconds": {
-    "fullCheck": 25641,
+    "fullCheck": 28442,
     "retrievalEvaluation": 545,
-    "oversizedCompaction": 7311,
-    "piLaunch": 796
+    "oversizedCompaction": 13365,
+    "piLaunch": 1278
   },
   "byteTotals": {
     "liveLogical": 0,

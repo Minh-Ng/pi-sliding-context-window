@@ -6,6 +6,7 @@ import { tokenizeWithByteOffsets } from "../src/rocksdb/windows.js";
 import {
   capText,
   formatArchiveStorage,
+  formatAutomaticRetrievalDiagnostics,
   formatByteSize,
   formatRecalledDocument,
   formatSearchResults,
@@ -375,6 +376,36 @@ test("archive storage formatting distinguishes logical usage, physical files, an
     dbPath: "/tmp/archive.db",
     archiveStorage: storage,
   })), /Archive logical usage/);
+});
+
+test("automatic retrieval diagnostics explain selection without archived text", () => {
+  const output = formatAutomaticRetrievalDiagnostics({
+    outcome: "continuity-marker",
+    reason: "implicit-concept-continuity",
+    messageKey: "user:canary",
+    indexGeneration: 12,
+    searchMode: "lexical",
+    searchStatus: "resolved",
+    candidate: {
+      documentId: "canary-color-decision",
+      kind: "decision-candidate",
+      retrievalMode: "lexical",
+      matchedTerms: ["us", "canari", "deploi"],
+      termCoverage: 0.6,
+      maxNormalizedIdf: 1,
+      margin: 0.4,
+    },
+  });
+
+  assert.match(output, /Automatic retrieval: continuity-marker/u);
+  assert.match(output, /Candidate: canary-color-decision \(decision-candidate, lexical\)/u);
+  assert.match(output, /Matched terms: us, canari, deploi/u);
+  assert.match(output, /Coverage: 60%; distinctiveness: 100%; margin: 40%/u);
+  assert.doesNotMatch(output, /cobalt|RECALL_PROBE/u);
+  assert.equal(
+    formatAutomaticRetrievalDiagnostics(undefined),
+    "No automatic retrieval decision has been observed in this process.",
+  );
 });
 
 test("footer maps current epoch values directly to their limits", () => {

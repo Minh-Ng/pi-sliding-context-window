@@ -206,11 +206,16 @@ test("custom archive factories can replace the SQLite backend", async () => {
     /requires query or relation/,
   );
 
+  await commands.get("window").handler("recall why", ctx);
   await commands.get("window").handler("archive status", ctx);
   await commands.get("window").handler("archive prune", ctx);
   await commands.get("window").handler("archive reclaim", ctx);
-  assert.match(notifications[0].message, /metrics are unavailable/);
-  assert.deepEqual(notifications.slice(1), [
+  assert.deepEqual(notifications[0], {
+    message: "No automatic retrieval decision has been observed in this process.",
+    level: "info",
+  });
+  assert.match(notifications[1].message, /metrics are unavailable/);
+  assert.deepEqual(notifications.slice(2), [
     { message: "Archive cleanup is unavailable for this backend.", level: "warning" },
     { message: "Archive reclamation is unavailable for this backend.", level: "warning" },
   ]);

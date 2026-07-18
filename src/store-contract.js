@@ -456,10 +456,30 @@ const automaticHint = object({
   disclosureType: enumeration(["historical-snippet", "continuity-marker"]),
 }, ["documentId", "text", "tokenCount", "sourceKind", "archivedDataDelimited"]);
 
+const preflightCandidateDiagnostics = object({
+  documentId: identifier,
+  kind: identifier,
+  retrievalMode: enumeration(["exact", "lexical", "structural"]),
+  matchedTerms: array(identifier, { maxItems: 256 }),
+  termCoverage: number({ minimum: 0, maximum: 1 }),
+  maxNormalizedIdf: number({ minimum: 0, maximum: 1 }),
+  margin: normalizedScore,
+});
+
+const preflightDiagnostics = object({
+  outcome: enumeration(["historical-snippet", "continuity-marker", "suppress"]),
+  reason: identifier,
+  indexGeneration: nonNegativeInteger,
+  searchMode: enumeration(RETRIEVAL_MODES),
+  searchStatus: enumeration(["resolved", "not-found", "ambiguous", "legacy-fallback"]),
+  candidate: nullable(preflightCandidateDiagnostics),
+}, ["outcome", "reason", "indexGeneration", "candidate"]);
+
 const preflightResponse = object({
   modelVisibleText: text,
   hints: array(automaticHint),
-});
+  diagnostics: preflightDiagnostics,
+}, ["modelVisibleText", "hints"]);
 
 const sourceProvenance = anyOf(
   object({
@@ -666,6 +686,7 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       conversationAutoRetrievalDays: nonNegativeInteger,
       derivedAutoRetrievalDays: nonNegativeInteger,
       reconstruct: boolean(),
+      includeDiagnostics: boolean(),
       epochId: identifier,
       epochBudgetTokens: integer({ minimum: 0, maximum: 100_000 }),
     }, [

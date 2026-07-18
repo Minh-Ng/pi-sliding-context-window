@@ -97,6 +97,7 @@ function request(messageKey, message, overrides = {}) {
     conversationAutoRetrievalDays: overrides.conversationAutoRetrievalDays,
     derivedAutoRetrievalDays: overrides.derivedAutoRetrievalDays,
     reconstruct: overrides.reconstruct,
+    includeDiagnostics: overrides.includeDiagnostics,
   };
 }
 
@@ -164,6 +165,50 @@ test("implicit recurring concepts reveal only a current-message continuity marke
   assert.match(response.modelVisibleText, /chunks/u);
   assert.doesNotMatch(response.modelVisibleText, /large tool output bytes|DEDUP_ARCHIVE_DECISION/u);
   assert.doesNotMatch(response.modelVisibleText, /candidate|locator|documentId/u);
+});
+
+test("natural deployment wording triggers continuity for an archived decision candidate", async (t) => {
+  const { store, worker } = await fixture(t, "hint-natural-decision");
+  await admit(
+    store,
+    "canary-color-decision",
+    "RECALL_PROBE_7F3A means use cobalt for canary deploys.",
+    {
+      kind: "decision-candidate",
+      sourceKey: "assistant:canary-color-decision",
+      createdAt: 300,
+    },
+  );
+  await worker.drain();
+
+  const response = await preflightArchive(store, request(
+    "user:natural-decision",
+    "What deployment color are used for canary deploys",
+    { includeDiagnostics: true },
+  ), { now: 1_000 });
+
+  assert.equal(response.hints.length, 1);
+  assert.equal(response.hints[0].disclosureType, "continuity-marker");
+  assert.match(response.modelVisibleText, /used/u);
+  assert.match(response.modelVisibleText, /canary/u);
+  assert.match(response.modelVisibleText, /deploys/u);
+  assert.doesNotMatch(response.modelVisibleText, /RECALL_PROBE_7F3A|cobalt/u);
+  assert.deepEqual(response.diagnostics, {
+    outcome: "continuity-marker",
+    reason: "implicit-concept-continuity",
+    indexGeneration: response.diagnostics.indexGeneration,
+    searchMode: "lexical",
+    searchStatus: "resolved",
+    candidate: {
+      documentId: "canary-color-decision",
+      kind: "decision-candidate",
+      retrievalMode: "lexical",
+      matchedTerms: ["canari", "deploi", "us"],
+      termCoverage: 3 / 5,
+      maxNormalizedIdf: 1,
+      margin: response.diagnostics.candidate.margin,
+    },
+  });
 });
 
 test("current-only, already-visible, and general questions add zero model-visible tokens", async (t) => {

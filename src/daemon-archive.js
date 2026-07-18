@@ -867,6 +867,9 @@ export class DaemonArchive {
         ? {}
         : { derivedAutoRetrievalDays: request.derivedAutoRetrievalDays }),
       ...(request.reconstruct === undefined ? {} : { reconstruct: request.reconstruct === true }),
+      ...(request.includeDiagnostics === undefined
+        ? {}
+        : { includeDiagnostics: request.includeDiagnostics === true }),
       ...(request.epochId === undefined ? {} : { epochId: String(request.epochId) }),
       ...(request.epochBudgetTokens === undefined
         ? {}

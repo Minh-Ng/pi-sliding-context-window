@@ -8,8 +8,16 @@ import { LineFramer } from "../src/daemon/framing.js";
 import {
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  SUPERSEDE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
-import { formatArchiveStorage, formatRecalledDocument, formatSearchResults } from "../src/presentation.js";
+import {
+  formatArchiveStorage,
+  formatPromotePacket,
+  formatRecalledDocument,
+  formatRedactResult,
+  formatSearchResults,
+  formatSupersedeResult,
+} from "../src/presentation.js";
 import { STRUCTURAL_RELATIONS } from "../src/structural.js";
 import {
   MAX_DOCUMENT_TEXT_BYTES,
@@ -118,6 +126,45 @@ const tools = [
     description: "Show local context archive status.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "context_window_supersede",
+    description: SUPERSEDE_TOOL_DESCRIPTION,
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+        version: { type: "integer", minimum: 1 },
+        note: { type: "string", maxLength: 4_096 },
+      },
+      required: ["documentId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "context_window_promote",
+    description: "Recall an archived document and return a promote-to-codebase checklist. Does not pin or edit the repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "context_window_redact",
+    description: "Tombstone archived documents for the current session or project after an explicit confirm token.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["session", "project"] },
+        confirm: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+      },
+      required: ["scope", "confirm"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function textResult(text, isError = false) {
@@ -163,6 +210,40 @@ function callTool(name, args = {}) {
         `Project documents: ${archive.count({ project, scope: "project" })}`,
         formatArchiveStorage(archive.stats()),
       ].join("\n"));
+    case "context_window_supersede": {
+      if (typeof archive.supersede !== "function") {
+        return textResult("Archive supersession is unavailable for this backend.", true);
+      }
+      const result = archive.supersede({
+        documentId: String(args.documentId ?? ""),
+        version: args.version,
+        sessionId,
+        note: args.note,
+      });
+      return textResult(formatSupersedeResult(result));
+    }
+    case "context_window_promote": {
+      const document = archive.get(String(args.id ?? ""));
+      if (!document) return textResult("No archived document found to promote.", true);
+      return textResult(formatPromotePacket({
+        documentId: document.documentId ?? document.id ?? args.id,
+        kind: document.kind,
+        createdAt: document.createdAt,
+        text: document.text,
+        subjectKey: document.subjectKey,
+      }));
+    }
+    case "context_window_redact": {
+      if (typeof archive.redact !== "function") {
+        return textResult("Archive redaction is unavailable for this backend.", true);
+      }
+      const result = archive.redact({
+        scope: String(args.scope ?? ""),
+        sessionId,
+        confirm: String(args.confirm ?? ""),
+      });
+      return textResult(formatRedactResult(result));
+    }
     default:
       return textResult(`Unknown tool: ${name}`, true);
   }

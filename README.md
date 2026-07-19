@@ -68,18 +68,23 @@ Restart Pi, then inspect it:
 /window
 /window search refresh token
 /window recall why
+/window promote <documentId>
+/window supersede <documentId> [note]
 /window rotate
 /window archive status
 /window archive prune
 /window archive reclaim
+/window archive redact session confirm <token>
+/window archive redact project confirm <token>
 ```
 
-`/window recall why` explains the last automatic retrieval decision, including its suppression reason and sanitized match metrics. It never prints archived source text.
+`/window recall why` explains the last automatic retrieval decision, including its suppression reason and sanitized match metrics. It never prints archived source text. `/window promote` prints a checklist for landing a durable decision in the repo (not an archive pin). `/window supersede` marks a prior archived decision as no longer live for search. Scoped redaction tombstones archive documents for one session or project after an explicit confirm token.
 
 Agent tools:
 
 - `context_window_search` — BM25 search over archived turns and tool output, or structural lookup of the latest archived question, request, correction, or answer
 - `context_recall` — recover an archived document by ID
+- `context_window_supersede` — admit a correction that supersedes a prior archived document
 
 `context_recall` keeps direct document-ID compatibility. Search internally returns authenticated, version-bound locators and exact recall uses them without substituting newer versions.
 

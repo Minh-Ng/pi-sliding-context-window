@@ -192,6 +192,8 @@ Every resolved response includes archive kind, session, creation time, ordered s
 
 An explicit correction removes the superseded version from exact, lexical, structural, and automatic candidate generation immediately. Existing locators for the old version return `superseded` and never substitute replacement bytes. The replacement remains independently searchable, while the old canonical source stays available for audit until normal storage retention removes it. Similar lexical neighbors without an explicit supersession link remain independent records.
 
+A project may hold at most one live document per explicitly assigned `subjectKey` (`meta/subject-live/...`). Admitting another document with that key requires `supersedes` targeting the current live holder. Epoch rotation does not infer decision identity from shared file names or symbols; use `/window supersede` or `context_window_supersede` when a prior decision is actually reversed.
+
 **Safety boundaries**
 
 - Archived evidence is not proof of current files or runtime state.

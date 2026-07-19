@@ -731,6 +731,9 @@ async function beginExpiry(store, candidate, now, options = {}) {
   const initialCleanupManifest = await store.get(
     retentionKeys.cleanupManifest(candidate.documentId, candidate.version),
   );
+  if (typeof initialManifest?.subjectKey === "string" && initialManifest.subjectKey.length > 0) {
+    await store.get(manifestKeys.subjectLive(initialManifest.project, initialManifest.subjectKey));
+  }
   const documentGuard = guardKeys.document(candidate.documentId, candidate.version);
   const sessionGuard = initialManifest ? guardKeys.session(initialManifest.sessionId) : undefined;
   await warmGuard(store, documentGuard);
@@ -757,7 +760,9 @@ async function beginExpiry(store, candidate, now, options = {}) {
         ?? initialCleanupManifest
         ?? initialManifest;
       if (manifest === undefined) {
-        await transaction.remove(candidate.record.keyBytes);
+        if (candidate.record?.keyBytes !== undefined) {
+          await transaction.remove(candidate.record.keyBytes);
+        }
         return Object.freeze({ status: "missing", tombstone: existing });
       }
       const deleteOutboxSequence = await enqueueDeleteOutbox(transaction, candidate, now);
@@ -785,24 +790,27 @@ async function beginExpiry(store, candidate, now, options = {}) {
       });
     }
     if (!await currentCandidate(transaction, candidate)) {
-      await transaction.remove(candidate.record.keyBytes);
+      if (candidate.record?.keyBytes !== undefined) await transaction.remove(candidate.record.keyBytes);
       return Object.freeze({ status: "stale" });
     }
     const manifest = initialManifest;
     if (manifest === undefined) {
-      await transaction.remove(candidate.record.keyBytes);
+      if (candidate.record?.keyBytes !== undefined) await transaction.remove(candidate.record.keyBytes);
       return Object.freeze({ status: "missing" });
     }
-    if (await isDocumentProtected(transaction, manifest, { now })) {
+    if (options.ignoreProtection !== true
+      && await isDocumentProtected(transaction, manifest, { now })) {
       return Object.freeze({ status: "protected" });
     }
     const tombstone = Object.freeze({
       documentId: candidate.documentId,
       documentVersion: candidate.version,
       status: "expired",
-      reason: options.forced === true
-        ? `Emergency retention shortened eligible ephemeral payload before scheduled expiry at ${candidate.expiresAt}.`
-        : `Retention class ${candidate.retentionClass} expired at ${candidate.expiresAt}.`,
+      reason: typeof options.reason === "string" && options.reason.length > 0
+        ? options.reason
+        : options.forced === true
+          ? `Emergency retention shortened eligible ephemeral payload before scheduled expiry at ${candidate.expiresAt}.`
+          : `Retention class ${candidate.retentionClass} expired at ${candidate.expiresAt}.`,
       recordedAt: now,
     });
     await transaction.putImmutable(
@@ -810,6 +818,14 @@ async function beginExpiry(store, candidate, now, options = {}) {
       tombstone,
       { kind: "supersession" },
     );
+    if (typeof manifest.subjectKey === "string" && manifest.subjectKey.length > 0) {
+      const subjectKey = manifestKeys.subjectLive(manifest.project, manifest.subjectKey);
+      const live = await transaction.get(subjectKey);
+      if (live?.documentId === candidate.documentId
+        && live?.documentVersion === candidate.version) {
+        await transaction.remove(subjectKey);
+      }
+    }
     const deleteOutboxSequence = await enqueueDeleteOutbox(transaction, candidate, now);
     await transaction.put(retentionKeys.cleanup(candidate.documentId, candidate.version), {
       retentionFormatVersion: RETENTION_FORMAT_VERSION,
@@ -831,6 +847,50 @@ async function beginExpiry(store, candidate, now, options = {}) {
       tombstone,
       deleteOutboxSequence,
     });
+  });
+}
+
+/**
+ * Tombstone one document version without requiring an expiry-queue hit.
+ * Used by scoped archive redaction. Respects pins/leases unless
+ * `ignoreProtection` is true (user-confirmed redact).
+ */
+export async function tombstoneDocument(store, {
+  documentId,
+  version,
+  now = Date.now(),
+  reason = "Explicit archive redaction.",
+  ignoreProtection = false,
+} = {}) {
+  identifier(documentId, "documentId");
+  positiveInteger(version, "version");
+  timestamp(now, "now");
+  if (typeof reason !== "string" || reason.length === 0) {
+    throw new TypeError("reason must be a non-empty string.");
+  }
+  const manifest = await store.get(manifestKeys.document(documentId, version));
+  if (manifest === undefined) {
+    const existing = await store.get([KEYSPACE.SUPERSESSION, documentId, version]);
+    if (existing !== undefined) {
+      return Object.freeze({ status: "already-tombstoned", tombstone: existing, manifest: undefined });
+    }
+    return Object.freeze({ status: "missing" });
+  }
+  const candidate = Object.freeze({
+    record: undefined,
+    documentId,
+    version,
+    retentionClass: typeof manifest.retentionClass === "string"
+      ? manifest.retentionClass
+      : "conversation-source",
+    expiresAt: now,
+    generation: 0,
+    legacy: true,
+  });
+  return beginExpiry(store, candidate, now, {
+    ignoreProtection: ignoreProtection === true,
+    reason,
+    forced: true,
   });
 }
 

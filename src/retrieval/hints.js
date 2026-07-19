@@ -38,6 +38,21 @@ export const hintKeys = Object.freeze({
       identifier(messageKey, "messageKey"),
     ];
   },
+  messagePrefix(project, sessionId) {
+    return [
+      ...ROOT,
+      "message",
+      identifier(project, "project"),
+      identifier(sessionId, "sessionId"),
+    ];
+  },
+  projectMessagePrefix(project) {
+    return [
+      ...ROOT,
+      "message",
+      identifier(project, "project"),
+    ];
+  },
   activity(project, sessionId) {
     return [
       ...ROOT,
@@ -491,6 +506,50 @@ async function removeFrozenHintFromView(transaction, record, key) {
     }, { kind: "retrieval-hint-activity" });
   }
   if (record.leaseId) await releaseLeaseFromView(transaction, record.leaseId);
+}
+
+/** Remove one bounded page of frozen hints for a project or selected sessions. */
+export async function clearScopedHints(store, {
+  project,
+  sessionIds,
+  limit = 1_000,
+} = {}) {
+  identifier(project, "project");
+  if (sessionIds !== undefined && !Array.isArray(sessionIds)) {
+    throw new TypeError("sessionIds must be an array when provided.");
+  }
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100_000) {
+    throw new TypeError("limit must be a positive safe integer at most 100000.");
+  }
+  const prefixes = sessionIds === undefined
+    ? [hintKeys.projectMessagePrefix(project)]
+    : [...new Set(sessionIds)].sort().map((sessionId) => hintKeys.messagePrefix(
+        project,
+        identifier(sessionId, "sessionId"),
+      ));
+  let visited = 0;
+  let cleared = 0;
+  let moreWork = false;
+  for (const prefix of prefixes) {
+    const records = store.scan(prefix, { limit: limit - visited + 1 });
+    for (const { payload } of records) {
+      if (visited === limit) {
+        moreWork = true;
+        break;
+      }
+      visited += 1;
+      if (typeof payload?.sessionId !== "string" || payload.sessionId.length === 0
+        || typeof payload.messageKey !== "string" || payload.messageKey.length === 0) continue;
+      const result = await removeFrozenHint(store, {
+        project,
+        sessionId: payload.sessionId,
+        messageKey: payload.messageKey,
+      });
+      if (result.status === "removed") cleared += 1;
+    }
+    if (moreWork) break;
+  }
+  return Object.freeze({ cleared, moreWork });
 }
 
 /** Remove one hint when its containing turn rotates out of the active epoch. */

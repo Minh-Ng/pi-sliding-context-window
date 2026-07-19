@@ -12,6 +12,7 @@ import { admitDocument, manifestKeys } from "../src/rocksdb/manifests.js";
 import { outboxKeys } from "../src/rocksdb/outbox.js";
 import { encodeKey, KEYSPACE } from "../src/rocksdb/keys.js";
 import { retentionKeys } from "../src/rocksdb/retention.js";
+import { hintKeys } from "../src/retrieval/hints.js";
 
 async function runningRuntime(t, runtimeOptions = {}, daemonOptions = {}) {
   const directory = mkdtempSync(join(tmpdir(), "context-window-operations-"));
@@ -30,6 +31,8 @@ async function runningRuntime(t, runtimeOptions = {}, daemonOptions = {}) {
     "store.release-protection",
     "store.pin",
     "store.unpin",
+    "store.resolve-subject",
+    "store.redact",
     "retention.run",
     "retention.status",
     "store.compact",
@@ -297,6 +300,99 @@ function largeDocument(project, documentId = "large-tool") {
     sourceKeyStatus: "preserved",
   };
 }
+
+test("store.redact resumes at the first unprocessed document", async (t) => {
+  const { runtime, store } = await runningRuntime(t);
+  const project = "/workspace/redact-pagination";
+  const sessionId = "session-redact-pagination";
+  for (let index = 1; index <= 3; index += 1) {
+    await runtime.handlers()["store.put"]({
+      idempotencyKey: `redact-pagination:${index}`,
+      document: {
+        ...document(project, 1_000 + index),
+        documentId: `redact-pagination-${index}`,
+        sourceKey: `user:${index}`,
+        sessionId,
+        metadata: { turnId: `turn-${index}` },
+        sourceMessageKeys: [`user:${index}`],
+      },
+      retentionClass: "conversation-source",
+    }, { project });
+  }
+
+  const first = await runtime.handlers()["store.redact"]({
+    scope: "session",
+    sessionId,
+    confirm: sessionId,
+    batchSize: 2,
+  }, { project });
+  assert.equal(first.status, "more-work");
+  assert.equal(first.scanned, 2);
+  assert.equal(first.tombstoned, 2);
+
+  const second = await runtime.handlers()["store.redact"]({
+    scope: "session",
+    sessionId,
+    confirm: sessionId,
+    batchSize: 2,
+    cursor: first.nextCursor,
+  }, { project });
+  assert.equal(second.status, "complete");
+  assert.equal(second.scanned, 1);
+  assert.equal(second.tombstoned, 1);
+  for (let index = 1; index <= 3; index += 1) {
+    assert.notEqual(await store.get([
+      KEYSPACE.SUPERSESSION,
+      `redact-pagination-${index}`,
+      1,
+    ]), undefined);
+  }
+});
+
+test("project redaction drains hint-only sessions across bounded waves", async (t) => {
+  const { runtime, store } = await runningRuntime(t);
+  const project = "/workspace/redact-hints";
+  const sessionId = "session-without-archived-documents";
+  for (let index = 1; index <= 3; index += 1) {
+    await store.put(hintKeys.message(project, sessionId, `user:${index}`), {
+      project,
+      sessionId,
+      messageKey: `user:${index}`,
+      epochId: "epoch-1",
+      createdAt: index,
+      queryHash: `query-${index}`,
+      outcome: "suppress",
+      reason: "fixture",
+      indexGeneration: 0,
+      documentId: null,
+      documentVersion: null,
+      leaseId: null,
+      locator: null,
+      modelVisibleText: "",
+      tokenCount: 0,
+      hints: [],
+    });
+  }
+
+  const first = await runtime.handlers()["store.redact"]({
+    scope: "project",
+    confirm: "redact-hints",
+    batchSize: 2,
+  }, { project });
+  assert.equal(first.status, "more-work");
+  assert.equal(first.nextCursor, "hints");
+  assert.equal(first.hintsCleared, 2);
+
+  const second = await runtime.handlers()["store.redact"]({
+    scope: "project",
+    confirm: "redact-hints",
+    batchSize: 2,
+    cursor: first.nextCursor,
+  }, { project });
+  assert.equal(second.status, "complete");
+  assert.equal(second.hintsCleared, 1);
+  assert.equal(store.scan(hintKeys.projectMessagePrefix(project)).length, 0);
+});
 
 test("large canonical puts return before indexing the admitted outbox entry", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-large-put-"));

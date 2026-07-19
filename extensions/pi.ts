@@ -5,6 +5,7 @@ import {
   EVIDENCE_ROUTING_GUIDELINES,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  SUPERSEDE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import {
   EpochWindowSession,
@@ -13,10 +14,13 @@ import {
 import {
   formatArchiveStorage,
   formatAutomaticRetrievalDiagnostics,
+  formatPromotePacket,
   formatRecalledDocument,
+  formatRedactResult,
   formatSearchResults,
   formatStatusDetails,
   formatStatusLine,
+  formatSupersedeResult,
 } from "../src/presentation.js";
 import { archiveDocumentProvenance } from "../src/provenance.js";
 import { ancestorSessionIds, stableSessionId } from "../src/session-id.js";
@@ -445,8 +449,31 @@ export function createContextEpochWindow({
       },
     });
 
+    pi.registerTool({
+      name: "context_window_supersede",
+      label: "context_window_supersede",
+      description: SUPERSEDE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        documentId: Type.String({ description: "Archived document id to supersede" }),
+        version: Type.Optional(Type.Integer({ minimum: 1 })),
+        note: Type.Optional(Type.String({ description: "Replacement decision text" })),
+      }, { additionalProperties: false }),
+      async execute(_toolCallId, params) {
+        const active = requireSession();
+        const result = active.supersedeArchive({
+          documentId: params.documentId,
+          version: params.version,
+          note: params.note,
+        });
+        return {
+          content: [{ type: "text", text: formatSupersedeResult(result) }],
+          details: result,
+        };
+      },
+    });
+
     pi.registerCommand("window", {
-      description: "Context epoch controls: /window [status|rotate|search <query>|recall why|archive status|archive prune|archive reclaim]",
+      description: "Context epoch controls: /window [status|rotate|search <query>|recall why|promote <id>|supersede <id>|archive status|archive prune|archive reclaim|archive redact session|project confirm <token>]",
       handler: async (args, ctx) => {
         const active = requireSession();
         updateStatus(ctx);
@@ -466,6 +493,38 @@ export function createContextEpochWindow({
           ctx.ui.notify(formatAutomaticRetrievalDiagnostics(
             active.automaticRetrievalDiagnostics(),
           ), "info");
+          return;
+        }
+        if (input.startsWith("promote ")) {
+          const id = input.slice("promote ".length).trim();
+          if (!id) {
+            ctx.ui.notify("Usage: /window promote <documentId|locator>", "warning");
+            return;
+          }
+          try {
+            ctx.ui.notify(formatPromotePacket(active.promoteArchive(id)), "info");
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
+          return;
+        }
+        if (input.startsWith("supersede ")) {
+          const rest = input.slice("supersede ".length).trim();
+          const match = /^(?<id>\S+)(?:\s+(?<note>[\s\S]+))?$/u.exec(rest);
+          const documentId = match?.groups?.id;
+          if (!documentId) {
+            ctx.ui.notify("Usage: /window supersede <documentId> [replacement note]", "warning");
+            return;
+          }
+          try {
+            const result = active.supersedeArchive({
+              documentId,
+              note: match?.groups?.note?.trim(),
+            });
+            ctx.ui.notify(formatSupersedeResult(result), "info");
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
           return;
         }
         if (input === "archive status") {
@@ -490,6 +549,55 @@ export function createContextEpochWindow({
           }
           const level = result.status === "error" ? "error" : result.status === "busy" ? "warning" : "info";
           ctx.ui.notify(`${result.status}\n${formatArchiveStorage(result.after)}`, level);
+          return;
+        }
+        if (input.startsWith("archive redact ")) {
+          const rest = input.slice("archive redact ".length).trim();
+          const sessionMatch = /^session(?:\s+confirm\s+(?<confirm>\S+))?$/u.exec(rest);
+          const projectMatch = /^project(?:\s+confirm\s+(?<confirm>\S+))?$/u.exec(rest);
+          if (sessionMatch && !sessionMatch.groups?.confirm) {
+            const suffix = String(active.sessionId).slice(-8);
+            ctx.ui.notify(
+              `Confirm session redact with: /window archive redact session confirm ${suffix}`,
+              "warning",
+            );
+            return;
+          }
+          if (projectMatch && !projectMatch.groups?.confirm) {
+            const base = String(active.project).replace(/[/\\]+$/u, "").split(/[/\\]/u).pop()
+              || active.project;
+            ctx.ui.notify(
+              `Confirm project redact with: /window archive redact project confirm ${base}`,
+              "warning",
+            );
+            return;
+          }
+          try {
+            if (sessionMatch?.groups?.confirm) {
+              const result = active.redactArchive({
+                scope: "session",
+                sessionId: active.sessionId,
+                confirm: sessionMatch.groups.confirm,
+              });
+              ctx.ui.notify(formatRedactResult(result), "info");
+              return;
+            }
+            if (projectMatch?.groups?.confirm) {
+              const result = active.redactArchive({
+                scope: "project",
+                confirm: projectMatch.groups.confirm,
+              });
+              ctx.ui.notify(formatRedactResult(result), "info");
+              return;
+            }
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return;
+          }
+          ctx.ui.notify(
+            "Usage: /window archive redact session|project confirm <token>",
+            "warning",
+          );
           return;
         }
         ctx.ui.notify(formatStatusDetails(active.status()), "info");

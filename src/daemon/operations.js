@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 import { statfsSync } from "node:fs";
+import { basename } from "node:path";
 import { canonicalDocumentIdentityHash } from "../document-identity.js";
 import {
   admitDocument,
   manifestKeys,
   readCanonicalDocument,
+  resolveLiveSubject,
   retiredDocumentStatus,
 } from "../rocksdb/manifests.js";
-import { KEYSPACE } from "../rocksdb/keys.js";
+import { encodeKey, KEYSPACE } from "../rocksdb/keys.js";
 import { createExactIndexHandler } from "../rocksdb/index/exact.js";
 import { createBm25IndexHandler } from "../rocksdb/index/bm25.js";
 import { createStructuralIndexHandler } from "../rocksdb/index/structural.js";
@@ -25,10 +27,11 @@ import {
   releaseProtection,
   retentionStatus,
   runRetention,
+  tombstoneDocument,
   unpinDocument,
 } from "../rocksdb/retention.js";
 import { cleanupExpiredLeases } from "../retrieval/leases.js";
-import { removeFrozenHint } from "../retrieval/hints.js";
+import { clearScopedHints, removeFrozenHint } from "../retrieval/hints.js";
 import { recallArchive } from "../retrieval/recall.js";
 import { preflightArchive } from "../retrieval/preflight.js";
 import { searchArchive } from "../retrieval/search.js";
@@ -724,6 +727,149 @@ export class DaemonOperations {
     return this.runRetentionWave(payload, { project: context.project });
   }
 
+  async resolveSubject(payload, context) {
+    const live = await resolveLiveSubject(this.store, {
+      project: context.project,
+      subjectKey: payload.subjectKey,
+    });
+    if (live === undefined) {
+      return { status: "not-found", subjectKey: payload.subjectKey };
+    }
+    return {
+      status: "resolved",
+      documentId: live.documentId,
+      version: live.version,
+      kind: live.kind,
+      subjectKey: live.subjectKey,
+    };
+  }
+
+  assertRedactConfirm(payload, context) {
+    const confirm = payload.confirm;
+    if (payload.scope === "project") {
+      const projectBase = basename(context.project.replace(/[/\\]+$/u, "")) || context.project;
+      if (confirm !== projectBase && confirm !== context.project) {
+        throw codedError(
+          "UNAUTHORIZED",
+          `Redact confirmation must match the project basename (${projectBase}) or full project path.`,
+        );
+      }
+      return;
+    }
+    const sessionIds = [...new Set(payload.sessionIds
+      ?? (payload.sessionId === undefined ? [] : [payload.sessionId]))];
+    if (sessionIds.length === 0) {
+      throw codedError("UNAUTHORIZED", "Session redact requires sessionId or sessionIds.");
+    }
+    const ok = sessionIds.every((sessionId) => (
+      sessionId === confirm
+      || (confirm.length >= 4 && sessionId.endsWith(confirm))
+    ));
+    if (!ok) {
+      throw codedError(
+        "UNAUTHORIZED",
+        "Redact confirmation must match a target session id or its trailing 4+ characters.",
+      );
+    }
+  }
+
+  async redact(payload, context) {
+    this.assertRedactConfirm(payload, context);
+    return this.store.withSharedWrite(async () => {
+      const gate = await migrationRetentionGate(this.store);
+      if (!gate.allowed) {
+        throw codedError("STORE_BUSY", "Archive redaction is blocked during migration.");
+      }
+      const now = Number.isSafeInteger(payload.now) ? payload.now : Date.now();
+      const batchSize = payload.batchSize;
+      const sessionIds = [...new Set(payload.sessionIds
+        ?? (payload.sessionId === undefined ? [] : [payload.sessionId]))];
+      const prefixes = (payload.scope === "session"
+        ? sessionIds.map((sessionId) => manifestKeys.sessionDocumentReferencePrefix(
+          context.project,
+          sessionId,
+        ))
+        : [[KEYSPACE.META, "session-document-reference", context.project]])
+        .sort((left, right) => Buffer.compare(encodeKey(left), encodeKey(right)));
+      let after;
+      const clearingHints = payload.cursor === "hints";
+      if (!clearingHints && typeof payload.cursor === "string" && payload.cursor.length > 0) {
+        after = Buffer.from(payload.cursor, "base64url");
+      }
+      let scanned = 0;
+      let tombstoned = 0;
+      let alreadyTombstoned = 0;
+      let protectedCount = 0;
+      let missing = 0;
+      let hintsCleared = 0;
+      let nextCursor;
+      let moreWork = false;
+      let lastProcessedKey;
+      if (!clearingHints) {
+        for (const prefix of prefixes) {
+          for (const record of scanPages(this.store, prefix)) {
+            const reference = record.payload;
+            if (after !== undefined) {
+              if (!record.keyBytes || Buffer.compare(record.keyBytes, after) <= 0) continue;
+            }
+            if (scanned >= batchSize) {
+              moreWork = true;
+              nextCursor = lastProcessedKey.toString("base64url");
+              break;
+            }
+            scanned += 1;
+            lastProcessedKey = record.keyBytes;
+            const begun = await tombstoneDocument(this.store, {
+              documentId: reference.documentId,
+              version: reference.documentVersion,
+              now,
+              reason: `Explicit ${payload.scope} archive redaction.`,
+              ignoreProtection: true,
+            });
+            if (begun.status === "tombstoned") {
+              tombstoned += 1;
+              if (begun.deleteOutboxSequence !== undefined) {
+                await this.publishIndexDelete(begun.deleteOutboxSequence);
+              }
+            } else if (begun.status === "already-tombstoned") {
+              alreadyTombstoned += 1;
+              if (begun.deleteOutboxSequence !== undefined) {
+                await this.publishIndexDelete(begun.deleteOutboxSequence);
+              }
+            } else if (begun.status === "protected") {
+              protectedCount += 1;
+            } else if (begun.status === "missing") {
+              missing += 1;
+            }
+          }
+          if (moreWork) break;
+        }
+      }
+      if (!moreWork) {
+        const cleared = await clearScopedHints(this.store, {
+          project: context.project,
+          ...(payload.scope === "session" ? { sessionIds } : {}),
+          limit: batchSize,
+        });
+        hintsCleared += cleared.cleared;
+        if (cleared.moreWork) {
+          moreWork = true;
+          nextCursor = "hints";
+        }
+      }
+      return {
+        status: moreWork ? "more-work" : "complete",
+        scanned,
+        tombstoned,
+        alreadyTombstoned,
+        protected: protectedCount,
+        missing,
+        hintsCleared,
+        ...(nextCursor === undefined ? {} : { nextCursor }),
+      };
+    });
+  }
+
   handlers() {
     return {
       "store.put": (payload, context) => this.put(payload, context),
@@ -737,6 +883,8 @@ export class DaemonOperations {
       "store.release-protection": (payload, context) => this.releaseProtection(payload, context),
       "store.pin": (payload, context) => this.pin(payload, context),
       "store.unpin": (payload, context) => this.unpin(payload, context),
+      "store.resolve-subject": (payload, context) => this.resolveSubject(payload, context),
+      "store.redact": (payload, context) => this.redact(payload, context),
       "retention.run": (payload, context) => this.retention(payload, context),
       "retention.status": (_payload, context) => retentionStatus(this.store, { project: context.project }),
       "store.compact": (payload) => this.compact(payload),

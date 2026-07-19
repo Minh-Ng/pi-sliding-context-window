@@ -985,6 +985,9 @@ test("rotation indexes deterministic structural scores for original messages", (
 
 test("rotation archives verbatim decision candidates with turn provenance", () => {
   const archive = memoryArchive();
+  archive.resolveSubject = () => {
+    throw new Error("rotation must not infer supersession from an exact anchor");
+  };
   const session = new EpochWindowSession({
     archive,
     config,
@@ -992,7 +995,7 @@ test("rotation archives verbatim decision candidates with turn provenance", () =
     project: "/project",
     onRotation: () => {},
   });
-  const decisionText = "We agreed to keep the queue rather than callbacks.";
+  const decisionText = "We agreed to keep src/config.js for queue settings rather than callbacks.";
   const messages = [
     user("queue or callbacks?", 1), assistant(decisionText, 2),
     user("two", 3), assistant("answer two", 4),
@@ -1007,6 +1010,7 @@ test("rotation archives verbatim decision candidates with turn provenance", () =
   const [candidate] = candidates;
   // Verbatim: the archived sentence is an exact span of the serialized turn.
   assert.equal(candidate.text, `[assistant] ${decisionText}`);
+  assert.equal(candidate.subjectKey, undefined);
   const turnDocument = documents.find((document) => document.kind === "turn"
     && document.metadata.sourceMessageKeys[0] === messageKey(messages[0]));
   assert.equal(candidate.metadata.sourceTurnId, turnDocument.id);

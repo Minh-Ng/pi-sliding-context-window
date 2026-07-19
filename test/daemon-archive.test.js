@@ -903,6 +903,81 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
   }
 });
 
+test("real daemon exposes supersession and completes multi-wave redaction", async () => {
+  const paths = fixture("context-window-redact-facade-");
+  const project = "/project/redact-facade";
+  const sessionId = "session-redact-facade";
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project,
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    const status = archive.request("daemon.status", {});
+    daemonProcessId = status.processId;
+    assert.ok(status.capabilities.includes("store.resolve-subject"));
+    assert.ok(status.capabilities.includes("store.redact"));
+
+    archive.put({
+      id: "decision-before",
+      sessionId,
+      project,
+      kind: "decision-candidate",
+      text: "Use the original queue implementation.",
+      createdAt: 100,
+      subjectKey: "decision:queue-implementation",
+    });
+    assert.equal(
+      archive.resolveSubject("decision:queue-implementation").documentId,
+      "decision-before",
+    );
+    const replacement = archive.supersede({
+      documentId: "decision-before",
+      note: "Use the replacement queue implementation.",
+    });
+    assert.equal(replacement.superseded.documentId, "decision-before");
+    assert.equal(
+      archive.resolveSubject("decision:queue-implementation").documentId,
+      replacement.documentId,
+    );
+    assert.equal(archive.get("decision-before"), undefined);
+
+    for (let index = 1; index <= 3; index += 1) {
+      archive.put({
+        id: `redact-facade-${index}`,
+        sessionId,
+        project,
+        kind: "turn",
+        text: `Scoped redaction fixture ${index}.`,
+        createdAt: 200 + index,
+      });
+    }
+    const before = archive.count({ scope: "session", sessionId, project });
+    const redacted = archive.redact({
+      scope: "session",
+      sessionId,
+      confirm: sessionId,
+      batchSize: 2,
+    });
+    assert.equal(redacted.status, "complete");
+    assert.equal(redacted.tombstoned, before);
+    assert.equal(redacted.alreadyTombstoned, 1);
+    assert.equal(redacted.scanned, before + redacted.alreadyTombstoned);
+    assert.equal(archive.count({ scope: "session", sessionId, project }), 0);
+    for (let index = 1; index <= 3; index += 1) {
+      assert.equal(archive.get(`redact-facade-${index}`), undefined);
+    }
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("a direct StoreClient first write permanently claims RocksDB before SQLite can open", async () => {
   const paths = fixture("context-window-direct-client-authority-");
   const sourcePath = join(paths.directory, "archive.db");

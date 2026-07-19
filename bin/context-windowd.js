@@ -131,6 +131,8 @@ const runtimeOperations = [
   "store.release-protection",
   "store.pin",
   "store.unpin",
+  "store.resolve-subject",
+  "store.redact",
   "retention.run",
   "retention.status",
   "store.compact",

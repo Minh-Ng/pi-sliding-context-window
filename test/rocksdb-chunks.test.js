@@ -491,14 +491,14 @@ test("explicit supersession rejects invalid targets without partial canonical wr
     documentId: "future-target",
     createdAt: 500,
     text: "Future-dated decision.",
-    subjectKey,
+    subjectKey: "decision:invalid-targets-future",
   });
   const foreign = semanticPutRequest({
     documentId: "foreign-target",
     project: "/workspace/foreign",
     createdAt: 100,
     text: "Foreign decision.",
-    subjectKey,
+    subjectKey: "decision:invalid-targets-foreign",
   });
   await admitDocument(store, target);
   await admitDocument(store, future);
@@ -510,7 +510,7 @@ test("explicit supersession rejects invalid targets without partial canonical wr
         documentId: "missing-replacement",
         createdAt: 200,
         text: "Missing target correction.",
-        subjectKey,
+        subjectKey: "decision:invalid-targets-missing",
         supersedes: { documentId: "does-not-exist", version: 1 },
       }),
       code: "NOT_FOUND",
@@ -520,7 +520,7 @@ test("explicit supersession rejects invalid targets without partial canonical wr
         documentId: "cross-project-replacement",
         createdAt: 200,
         text: "Cross-project correction.",
-        subjectKey,
+        subjectKey: "decision:invalid-targets-cross",
         supersedes: { documentId: foreign.document.documentId, version: 1 },
       }),
       code: "CONFLICT",
@@ -541,7 +541,7 @@ test("explicit supersession rejects invalid targets without partial canonical wr
         documentId: "forward-replacement",
         createdAt: 400,
         text: "Forward correction.",
-        subjectKey,
+        subjectKey: "decision:invalid-targets-future",
         supersedes: { documentId: future.document.documentId, version: 1 },
       }),
       code: "CONFLICT",
@@ -644,7 +644,6 @@ test("explicit supersession rejects cycles atomically while ordinary versioning 
     documentId: "cycle-b",
     createdAt: 110,
     text: "Decision B version one.",
-    subjectKey,
   });
   await admitDocument(store, a1);
   await admitDocument(store, b1);

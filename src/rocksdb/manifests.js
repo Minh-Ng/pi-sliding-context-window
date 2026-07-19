@@ -189,6 +189,14 @@ export const manifestKeys = Object.freeze({
       identifier(sessionId, "sessionId"),
     ];
   },
+  subjectLive(project, subjectKey) {
+    return [
+      KEYSPACE.META,
+      "subject-live",
+      identifier(project, "project"),
+      identifier(subjectKey, "subjectKey"),
+    ];
+  },
   window(documentId, version, ordinal) {
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
       throw new TypeError("ordinal must be a non-negative safe integer.");
@@ -792,12 +800,17 @@ function prepareDocumentAdmissionCore(request, options = {}, semanticState = {})
     windows,
     chunking: options.chunking === undefined ? undefined : { ...options.chunking },
     windowParameters,
-    transitions: [{
-      key: manifestKeys.documentHistory(document.documentId),
-      kind: "document-history",
-      previous: options.documentHistory,
-      payload: admittedDocumentHistory(document),
-    }],
+    transitions: [
+      {
+        key: manifestKeys.documentHistory(document.documentId),
+        kind: "document-history",
+        previous: options.documentHistory,
+        payload: admittedDocumentHistory(document),
+      },
+      ...(document.subjectKey === undefined || options.subjectLiveTransition === undefined
+        ? []
+        : [options.subjectLiveTransition]),
+    ],
     mustBeAbsent: [
       [KEYSPACE.SUPERSESSION, document.documentId, document.version],
       ...(options.supersession === undefined
@@ -854,11 +867,17 @@ function prepareValidatedDocumentAdmission(request, options, state) {
   const {
     semanticSupersession,
     semanticTargetManifest,
+    previousSubjectLive: _previousSubjectLive,
+    subjectLiveTransition,
     ...validatedVersionState
   } = state;
   return prepareDocumentAdmissionCore(
     request,
-    { ...options, ...validatedVersionState },
+    {
+      ...options,
+      ...validatedVersionState,
+      ...(subjectLiveTransition === undefined ? {} : { subjectLiveTransition }),
+    },
     { semanticSupersession, semanticTargetManifest },
   );
 }
@@ -1129,6 +1148,50 @@ async function serializeSemanticAdmission(store, callback) {
   }
 }
 
+async function admissionSubjectLive(store, request) {
+  const document = request.document;
+  if (document.subjectKey === undefined) return {};
+  const previousSubjectLive = await store.get(
+    manifestKeys.subjectLive(document.project, document.subjectKey),
+  );
+  if (previousSubjectLive !== undefined
+    && previousSubjectLive.documentId !== document.documentId) {
+    const priorMarker = await store.get([
+      KEYSPACE.SUPERSESSION,
+      previousSubjectLive.documentId,
+      previousSubjectLive.documentVersion,
+    ]);
+    if (priorMarker === undefined) {
+      const target = document.supersedes;
+      if (target === undefined
+        || target.documentId !== previousSubjectLive.documentId
+        || target.version !== previousSubjectLive.documentVersion) {
+        throw semanticAdmissionError(
+          "CONFLICT",
+          `subjectKey ${document.subjectKey} is live at `
+          + `${previousSubjectLive.documentId}@${previousSubjectLive.documentVersion}; `
+          + "admit with supersedes targeting that live subject.",
+        );
+      }
+    }
+  }
+  return {
+    previousSubjectLive,
+    subjectLiveTransition: Object.freeze({
+      key: manifestKeys.subjectLive(document.project, document.subjectKey),
+      kind: "subject-live",
+      previous: previousSubjectLive,
+      payload: Object.freeze({
+        project: document.project,
+        subjectKey: document.subjectKey,
+        documentId: document.documentId,
+        documentVersion: document.version,
+        kind: document.kind,
+      }),
+    }),
+  };
+}
+
 async function documentAdmissionState(store, request, { diagnostic = false } = {}) {
   const versionState = request.document.version === 1 && !diagnostic
     ? { documentHistory: undefined, supersession: undefined }
@@ -1136,7 +1199,31 @@ async function documentAdmissionState(store, request, { diagnostic = false } = {
   return {
     ...versionState,
     ...await admissionExplicitSupersession(store, request),
+    ...await admissionSubjectLive(store, request),
   };
+}
+
+/** Resolve the live document currently holding a project subjectKey, if any. */
+export async function resolveLiveSubject(store, { project, subjectKey } = {}) {
+  identifier(project, "project");
+  identifier(subjectKey, "subjectKey");
+  const live = await store.get(manifestKeys.subjectLive(project, subjectKey));
+  if (live === undefined) return undefined;
+  const marker = await store.get([
+    KEYSPACE.SUPERSESSION,
+    live.documentId,
+    live.documentVersion,
+  ]);
+  if (marker !== undefined) return undefined;
+  const manifest = await store.get(manifestKeys.document(live.documentId, live.documentVersion));
+  if (manifest === undefined || manifest.project !== project) return undefined;
+  return Object.freeze({
+    documentId: live.documentId,
+    version: live.documentVersion,
+    kind: live.kind ?? manifest.kind,
+    subjectKey,
+    project,
+  });
 }
 
 /** Admit one validated document at RocksStore's atomic acknowledgement boundary. */

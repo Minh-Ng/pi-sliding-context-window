@@ -749,6 +749,53 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
     request: object({ pinId: identifier }),
     result: object({ status: enumeration(["unpinned", "not-found"]), pinId: identifier }),
   },
+  "store.resolve-subject": {
+    request: object({
+      subjectKey: identifier,
+    }, ["subjectKey"]),
+    result: anyOf(
+      object({
+        status: enumeration(["resolved"]),
+        documentId: identifier,
+        version: positiveInteger,
+        kind: identifier,
+        subjectKey: identifier,
+      }, ["status", "documentId", "version", "kind", "subjectKey"]),
+      object({
+        status: enumeration(["not-found"]),
+        subjectKey: identifier,
+      }, ["status", "subjectKey"]),
+    ),
+  },
+  "store.redact": {
+    request: object({
+      scope: enumeration(["session", "project"]),
+      sessionId: identifier,
+      sessionIds: array(identifier, { maxItems: MAX_SESSION_LINEAGE_IDS }),
+      confirm: identifier,
+      batchSize: integer({ minimum: 1, maximum: 1_000 }),
+      now: timestamp,
+      cursor: identifier,
+    }, ["scope", "confirm", "batchSize"]),
+    result: object({
+      status: enumeration(["complete", "more-work"]),
+      scanned: nonNegativeInteger,
+      tombstoned: nonNegativeInteger,
+      alreadyTombstoned: nonNegativeInteger,
+      protected: nonNegativeInteger,
+      missing: nonNegativeInteger,
+      hintsCleared: nonNegativeInteger,
+      nextCursor: identifier,
+    }, [
+      "status",
+      "scanned",
+      "tombstoned",
+      "alreadyTombstoned",
+      "protected",
+      "missing",
+      "hintsCleared",
+    ]),
+  },
   "retention.run": {
     request: object({
       now: timestamp,

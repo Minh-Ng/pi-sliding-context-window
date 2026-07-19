@@ -8,6 +8,7 @@ import {
   EVIDENCE_ROUTING_GUIDELINES,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  SUPERSEDE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import { Archive } from "../src/archive.js";
 import { loadConfig } from "../src/config.js";
@@ -61,12 +62,15 @@ test("archive tools advertise evidence-source routing", async () => {
 
   const search = tools.get("context_window_search");
   const recall = tools.get("context_recall");
+  const supersede = tools.get("context_window_supersede");
   assert.ok(search);
   assert.ok(recall);
+  assert.ok(supersede);
   assert.equal(tools.has("context_window_recall"), false);
 
   assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);
   assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);
+  assert.equal(supersede.description, SUPERSEDE_TOOL_DESCRIPTION);
   assert.deepEqual(search.promptGuidelines, EVIDENCE_ROUTING_GUIDELINES);
   assert.equal(search.promptSnippet, undefined);
   assert.equal(recall.promptGuidelines, undefined);
@@ -74,7 +78,7 @@ test("archive tools advertise evidence-source routing", async () => {
   for (const guideline of search.promptGuidelines) {
     assert.match(
       guideline,
-      /context_window_search|context_recall/,
+      /context_window_search|context_recall|context_window_supersede|AGENTS\.md/,
       `unattributed flattened guideline: ${guideline}`,
     );
   }

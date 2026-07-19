@@ -9,7 +9,7 @@ RocksDB background compaction optimizes and reclaims physical storage. Applicati
 | Ephemeral payload | Large raw tool output and redundant previews | Shortest age window |
 | Conversation source | User and assistant messages, turn manifests | Longer age window |
 | Derived evidence | Exact terms, structural scores, verbatim decision excerpts | Rebuildable; follows source or explicit promotion |
-| Durable evidence | Manual archives, explicit pins, promoted decisions | No automatic expiry while pinned |
+| Durable evidence | Manual archives, explicit pins | No automatic expiry while pinned. Product longevity for decisions is promotion into the repository (AGENTS.md / ADR / config), not pin UI. |
 | Active evidence | Current epoch, current TOC targets, active retrieval leases | Temporarily protected |
 
 Durations remain configuration, not schema. Production storage defaults are 14 days for ephemeral payloads, 90 days for conversation sources, and 30 days for source-linked derived evidence. Manual archives use durable evidence and do not expire automatically. A zero-day class override disables automatic expiry. Active leases and pins remain protections, not alternate copies of evidence.

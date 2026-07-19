@@ -541,6 +541,98 @@ export class DaemonArchive {
       : response.document;
   }
 
+  resolveSubject(subjectKey) {
+    const response = this.request("store.resolve-subject", {
+      subjectKey: requiredString(subjectKey, "subjectKey"),
+    });
+    if (response.status !== "resolved") return undefined;
+    return {
+      documentId: response.documentId,
+      version: response.version,
+      kind: response.kind,
+      subjectKey: response.subjectKey,
+    };
+  }
+
+  supersede({
+    documentId,
+    version,
+    sessionId,
+    text,
+    note,
+  } = {}) {
+    const targetId = requiredString(documentId, "documentId");
+    const head = this.canonicalGet(targetId, version);
+    if (head === undefined) {
+      throw new Error(`Cannot supersede missing document ${targetId}.`);
+    }
+    const targetVersion = version === undefined ? head.version : version;
+    const subjectKey = typeof head.subjectKey === "string" && head.subjectKey.length > 0
+      ? head.subjectKey
+      : undefined;
+    const replacementText = String(text ?? note ?? "").trim()
+      || `Supersedes ${targetId}@${targetVersion}.`;
+    const id = this.put({
+      sessionId: requiredString(sessionId ?? head.sessionId, "sessionId"),
+      project: this.project,
+      kind: "decision-candidate",
+      text: replacementText,
+      createdAt: Math.max(Date.now(), Number(head.createdAt) + 1 || Date.now()),
+      metadata: {
+        supersedeOf: targetId,
+        supersedeVersion: targetVersion,
+      },
+      ...(subjectKey === undefined ? {} : { subjectKey }),
+      supersedes: { documentId: targetId, version: targetVersion },
+    });
+    if (!id) throw new Error("Failed to admit superseding document.");
+    return { documentId: id, superseded: { documentId: targetId, version: targetVersion } };
+  }
+
+  redact({
+    scope,
+    sessionId,
+    sessionIds,
+    confirm,
+    batchSize = 256,
+  } = {}) {
+    let cursor;
+    let aggregate = {
+      status: "complete",
+      scanned: 0,
+      tombstoned: 0,
+      alreadyTombstoned: 0,
+      protected: 0,
+      missing: 0,
+      hintsCleared: 0,
+    };
+    for (let wave = 0; wave < 10_000; wave += 1) {
+      const result = this.request("store.redact", {
+        scope: requiredString(scope, "scope"),
+        ...(sessionId === undefined ? {} : { sessionId: String(sessionId) }),
+        ...(sessionIds === undefined ? {} : { sessionIds: [...sessionIds] }),
+        confirm: requiredString(confirm, "confirm"),
+        batchSize,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      aggregate = {
+        status: result.status,
+        scanned: aggregate.scanned + result.scanned,
+        tombstoned: aggregate.tombstoned + result.tombstoned,
+        alreadyTombstoned: aggregate.alreadyTombstoned + result.alreadyTombstoned,
+        protected: aggregate.protected + result.protected,
+        missing: aggregate.missing + result.missing,
+        hintsCleared: aggregate.hintsCleared + result.hintsCleared,
+      };
+      if (result.status !== "more-work" || result.nextCursor === undefined) {
+        aggregate.status = "complete";
+        break;
+      }
+      cursor = result.nextCursor;
+    }
+    return aggregate;
+  }
+
   canonicalHeadState(id, version) {
     const response = this.request("store.get", {
       documentId: requiredString(id, "id"),

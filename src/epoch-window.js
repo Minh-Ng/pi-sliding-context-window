@@ -667,6 +667,39 @@ export class EpochWindowSession {
     return this.archive.reclaim?.(options);
   }
 
+  resolveSubject(subjectKey) {
+    return this.archive.resolveSubject?.(subjectKey);
+  }
+
+  supersedeArchive(request) {
+    if (typeof this.archive.supersede !== "function") {
+      throw new Error("Archive supersession is unavailable for this backend.");
+    }
+    return this.archive.supersede({
+      ...request,
+      sessionId: request.sessionId ?? this.sessionId,
+    });
+  }
+
+  redactArchive(request) {
+    if (typeof this.archive.redact !== "function") {
+      throw new Error("Archive redaction is unavailable for this backend.");
+    }
+    return this.archive.redact(request);
+  }
+
+  promoteArchive(id) {
+    const document = this.recall(id);
+    if (!document) return undefined;
+    return {
+      documentId: document.documentId ?? document.id ?? id,
+      kind: document.kind,
+      createdAt: document.createdAt,
+      text: document.text,
+      subjectKey: document.subjectKey,
+    };
+  }
+
   checkpointCompaction(preparation, { branchEntries = [] } = {}) {
     try {
       if (!preparation || typeof preparation !== "object" || Array.isArray(preparation)

@@ -18,6 +18,9 @@ export const SEARCH_TOOL_DESCRIPTION =
 export const RECALL_TOOL_DESCRIPTION =
   "Recover one exact archived source document by an id from context_window_search or an archive marker. Use for exact original wording or source evidence, not as proof of current mutable state; verify current state with live tools.";
 
+export const SUPERSEDE_TOOL_DESCRIPTION =
+  "Mark a prior archived decision or document as superseded by a correction. Use when the user reverses an earlier decision so search and automatic retrieval stop treating the old version as live. Prefer writing durable constraints into the repository (AGENTS.md, ADR, config) rather than pinning archive records.";
+
 export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "Before answering, classify the evidence needed: already in visible context (answer directly), current mutable project state (use live tools), or an out-of-window referent such as prior intent, rationale, decisions, rejected approaches, continuity, or scope disputes (use context_window_search); combine archive and live only when both are required.",
   "Use context_recall—not task records or assistant summaries—when exact original wording or source evidence is required; recall only ids returned by context_window_search or archive markers.",
@@ -28,6 +31,8 @@ export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "Before you quote or assert a specific earlier detail (a number, name, exact phrasing, or committed decision) not visible in the current context, run context_window_search for its anchor rather than reconstructing it from memory. A continuity marker only confirms that eligible earlier discussion matched the quoted anchor from the current user message; if prior project-specific meaning is material, search that exact anchor before answering, and do not treat the marker itself as a recovered fact, decision, definition, or current-state claim.",
   "Do not introduce terminology found only in an archive candidate returned by context_window_search or context_recall as if the user already knows it. Omit it unless it is necessary; when necessary, define it in plain language and identify whether it came from archived discussion or a live source.",
   "When context_window_search has no exact identifier for a conceptually phrased historical question, include 3–8 concise likely synonyms or domain terms in one query; search exact file names, symbols, error strings, commits, PRs, and specific values verbatim first and never broaden those anchors. If a conceptual archive-required search misses, make at most one reformulated context_window_search call with likely alternate wording.",
+  "When the user reverses a prior archived decision, call context_window_supersede (or admit the new decision with supersedes) so the old version leaves search; do not leave both as equal live hits.",
+  "When a decision or constraint must outlive the archive retention window (cross-session process, security, standing project rule), write it into the repository (AGENTS.md, CLAUDE.md, ADR, or config). The archive is provenance, not the system of record; do not pin archive documents for longevity.",
 ]);
 
 export const ARCHIVED_EVIDENCE_LABEL =

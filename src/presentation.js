@@ -229,6 +229,45 @@ export function formatByteSize(bytes) {
   return `${(value / 1_073_741_824).toFixed(2)} GiB`;
 }
 
+export function formatPromotePacket(packet) {
+  if (!packet) return "No archived document found to promote.";
+  const created = Number.isSafeInteger(packet.createdAt)
+    ? new Date(packet.createdAt).toISOString().slice(0, 10)
+    : "unknown-date";
+  const excerpt = String(packet.text ?? "").trim();
+  const lines = [
+    "Promote to codebase (archive is not durable storage)",
+    "",
+    `Document: ${packet.documentId}${packet.kind ? ` (${packet.kind})` : ""}`,
+    `Excerpt (${created}):`,
+    excerpt || "(empty)",
+    "",
+    "Suggested landings:",
+    "- AGENTS.md / CLAUDE.md — agent-facing constraint",
+    "- docs/adr/… — human decision record",
+    "- code/config — if it is already an implementation fact",
+    "",
+    "Next: edit the repo (agent or you). Do not pin the archive.",
+    "Archive copy remains searchable until normal retention expires.",
+  ];
+  if (packet.subjectKey) lines.splice(3, 0, `Subject: ${packet.subjectKey}`);
+  return lines.join("\n");
+}
+
+export function formatRedactResult(result) {
+  if (!result) return "Archive redaction is unavailable for this backend.";
+  return [
+    `Redact ${result.status}: scanned ${result.scanned}, tombstoned ${result.tombstoned}`,
+    `already-tombstoned ${result.alreadyTombstoned}, missing ${result.missing}, protected ${result.protected}`,
+    `hints cleared ${result.hintsCleared}`,
+  ].join("\n");
+}
+
+export function formatSupersedeResult(result) {
+  if (!result) return "Archive supersession failed.";
+  return `Superseded ${result.superseded.documentId}@${result.superseded.version} with ${result.documentId}.`;
+}
+
 export function formatArchiveStorage(storage) {
   if (!storage) return "Archive storage metrics are unavailable for this backend.";
   if (storage.backend === "rocksdb" || storage.rocksdb) {

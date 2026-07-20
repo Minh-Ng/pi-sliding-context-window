@@ -562,7 +562,6 @@ test("an oversized latest turn requires archive-first compaction without mutatin
   assert.equal(archive.documents.size, 0);
   assert.equal(session.status().rotations, 0);
   assert.equal(session.status().compactionFallbackReason, "oversized-latest-turn");
-  assert.equal(session.shouldCancelCompaction("threshold", 100), false);
   assert.equal(session.rotationState().boundaryKey, undefined);
 });
 
@@ -974,22 +973,90 @@ test("session controller updates limits immediately when the model changes", () 
   assert.equal(session.status().modelPattern, "openai/gpt-*");
 });
 
-test("session controller cancels threshold compaction only when both measurements are safe", () => {
-  const session = new EpochWindowSession({
-    archive: memoryArchive(),
-    config,
-    sessionId: "session-1",
-    project: "/project",
-  });
-  session.process([user("measured", 1)]);
+test("adaptive rotation derives limits from each model's Pi input budget", () => {
+  for (const { contextWindow, reserveTokens, expectedRotation } of [
+    { contextWindow: 100_000, reserveTokens: 20_000, expectedRotation: 52_000 },
+    { contextWindow: 372_000, reserveTokens: 128_000, expectedRotation: 158_600 },
+    { contextWindow: 1_000_000, reserveTokens: 256_000, expectedRotation: 483_600 },
+  ]) {
+    const model = { provider: "provider", id: "model", contextWindow, maxTokens: 10_000 };
+    const session = new EpochWindowSession({
+      archive: memoryArchive(),
+      config: {
+        ...config,
+        rotationContextRatio: 0.65,
+        hardLimitContextRatio: 0.8,
+        rotationTokensExplicit: false,
+        hardLimitTokensExplicit: false,
+        piCompactionReserveTokens: reserveTokens,
+        models: {},
+      },
+      sessionId: `model-${contextWindow}`,
+      project: "/project",
+      model,
+    });
+    const status = session.status({ includeArchiveCount: false });
+    assert.equal(status.inputWindowTokens, contextWindow - reserveTokens);
+    assert.equal(status.piCompactionReserveTokens, reserveTokens);
+    assert.equal(status.rotationTokens, expectedRotation);
+  }
 
-  assert.equal(session.shouldCancelCompaction("threshold", 99_999), true);
-  assert.equal(session.shouldCancelCompaction("threshold"), false);
-  assert.equal(session.shouldCancelCompaction("threshold", 100_000), false);
-  assert.equal(session.shouldCancelCompaction("threshold", 120_000), false);
-  assert.equal(session.shouldCancelCompaction("threshold", 371_566), false);
-  assert.equal(session.shouldCancelCompaction("overflow", 100_000), false);
-  assert.equal(session.shouldCancelCompaction("manual", 100_000), false);
+  const modelFallback = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: {
+      ...config,
+      rotationContextRatio: 0.65,
+      hardLimitContextRatio: 0.8,
+      rotationTokensExplicit: false,
+      hardLimitTokensExplicit: false,
+      piCompactionReserveTokens: undefined,
+      models: {},
+    },
+    sessionId: "model-output-fallback",
+    project: "/project",
+    model: { provider: "provider", id: "model", contextWindow: 200_000, maxTokens: 40_000 },
+  });
+  assert.equal(modelFallback.status({ includeArchiveCount: false }).rotationTokens, 104_000);
+
+  const explicitZero = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: {
+      ...config,
+      rotationContextRatio: 0.65,
+      hardLimitContextRatio: 0.8,
+      rotationTokensExplicit: false,
+      hardLimitTokensExplicit: false,
+      piCompactionReserveTokens: 0,
+      models: {},
+    },
+    sessionId: "zero-reserve",
+    project: "/project",
+    model: { provider: "provider", id: "model", contextWindow: 100_000, maxTokens: 40_000 },
+  });
+  assert.equal(explicitZero.status({ includeArchiveCount: false }).inputWindowTokens, 100_000);
+  assert.equal(explicitZero.status({ includeArchiveCount: false }).piCompactionReserveTokens, 0);
+  assert.equal(explicitZero.status({ includeArchiveCount: false }).rotationTokens, 65_000);
+
+  const exhausted = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: {
+      ...config,
+      piCompactionReserveTokens: 100_000,
+      models: {},
+    },
+    sessionId: "exhausted-input-budget",
+    project: "/project",
+    model: { provider: "provider", id: "model", contextWindow: 100_000 },
+  });
+  assert.equal(exhausted.status({ includeArchiveCount: false }).inputWindowTokens, 0);
+  assert.throws(
+    () => exhausted.process([user("cannot send", 1)], {
+      provider: "provider",
+      id: "model",
+      contextWindow: 100_000,
+    }),
+    /no usable model input budget/u,
+  );
 });
 
 test("rotation indexes deterministic structural scores for original messages", () => {

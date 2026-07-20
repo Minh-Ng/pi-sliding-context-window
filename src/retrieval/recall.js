@@ -411,6 +411,7 @@ async function recallSnapshot(view, request, options, secret, claims) {
   const renderedText = renderRecalledEvidence(response, request.maxTokens, {
     focusStartByte: Math.max(0, claims.matchRange.startByte - startByte),
     focusEndByte: Math.max(0, claims.matchRange.endByte - startByte),
+    format: options.renderFormat,
   });
   return assertStoreResult("store.recall", {
     ...response,

@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   findModelProfile,
@@ -42,6 +42,7 @@ test("global cap settings persist atomically without clobbering shared Pi settin
     mkdirSync(join(directory, ".pi", "agent"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       theme: "dark",
+      compaction: { reserveTokens: 128_000 },
       "context-window": {
         rotationTurns: 20,
         rotationTokens: 96_000,
@@ -52,6 +53,7 @@ test("global cap settings persist atomically without clobbering shared Pi settin
     saveGlobalConfig({ rotationTurns: 30, rotationTokens: 128_000 }, { home: directory });
     assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {
       theme: "dark",
+      compaction: { reserveTokens: 128_000 },
       "context-window": {
         rotationTurns: 30,
         rotationTokens: 128_000,
@@ -63,12 +65,46 @@ test("global cap settings persist atomically without clobbering shared Pi settin
     assert.equal(config.rotationTurns, 30);
     assert.equal(config.rotationTokens, 128_000);
     assert.equal(config.rotationTokensExplicit, true);
+    assert.equal(config.piCompactionReserveTokens, 128_000);
 
     saveGlobalConfig({ rotationTokens: undefined }, { home: directory });
     config = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
     assert.equal(config.rotationTokens, 96_000);
     assert.equal(config.rotationTokensExplicit, false);
     assert.equal(config.automaticRetrieval, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Pi compaction reserve follows trusted settings precedence and environment override", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-pi-reserve-"));
+  const globalPath = join(directory, ".pi", "agent", "settings.json");
+  const projectPath = join(directory, ".pi", "settings.json");
+  try {
+    mkdirSync(dirname(globalPath), { recursive: true });
+    mkdirSync(dirname(projectPath), { recursive: true });
+    writeFileSync(globalPath, JSON.stringify({ compaction: { reserveTokens: 128_000 } }));
+    writeFileSync(projectPath, JSON.stringify({ compaction: { reserveTokens: 64_000 } }));
+
+    assert.equal(loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: {},
+      home: directory,
+    }).piCompactionReserveTokens, 128_000);
+    assert.equal(loadConfig({
+      cwd: directory,
+      projectTrusted: true,
+      env: {},
+      home: directory,
+    }).piCompactionReserveTokens, 64_000);
+    assert.equal(loadConfig({
+      cwd: directory,
+      projectTrusted: true,
+      env: { CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS: "0" },
+      home: directory,
+    }).piCompactionReserveTokens, 0);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

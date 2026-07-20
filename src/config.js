@@ -19,6 +19,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   rotationTokens: 96_000,
   rotationTurns: 20,
   hardLimitTokens: 128_000,
+  piCompactionReserveTokens: undefined,
   retainTurns: 5,
   maxToolResultTokens: 4_000,
   maxInlineUserTokens: 16_000,
@@ -312,17 +313,21 @@ export function resolveModelConfig(config, model) {
 export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = process.env, home = homedir() } = {}) {
   const globalDirectory = join(home, ".pi", "agent");
   const projectDirectory = join(cwd, ".pi");
+  const globalSettingsPath = join(globalDirectory, "settings.json");
+  const projectSettingsPath = join(projectDirectory, "settings.json");
   // Layers are ordered from lowest to highest precedence. Project files are
   // intentionally not even read until Pi has marked the project as trusted.
   const layers = [
     readJson(join(globalDirectory, "context-window.json")),
-    readNamespacedJson(join(globalDirectory, "settings.json")),
+    readNamespacedJson(globalSettingsPath),
   ];
+  const sharedSettings = [readJson(globalSettingsPath)];
   if (projectTrusted) {
     layers.push(
       readJson(join(projectDirectory, "context-window.json")),
-      readNamespacedJson(join(projectDirectory, "settings.json")),
+      readNamespacedJson(projectSettingsPath),
     );
+    sharedSettings.push(readJson(projectSettingsPath));
   }
 
   const defaultConfig = {
@@ -368,6 +373,11 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
   const environmentRotationTurns = parsePositiveInteger(env.CONTEXT_WINDOW_ROTATION_TURNS);
   const explicitRotationTokens = explicitNumeric("rotationTokens", env.CONTEXT_WINDOW_ROTATION_TOKENS);
   const explicitHardLimitTokens = explicitNumeric("hardLimitTokens", env.CONTEXT_WINDOW_HARD_LIMIT_TOKENS);
+  const piCompactionReserveTokens = firstValid(
+    parseNonNegativeInteger,
+    env.CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS,
+    ...sharedSettings.map((settings) => settings.compaction?.reserveTokens).reverse(),
+  );
   const configuredArchiveBackend = firstValid(
     parseArchiveBackend,
     env.CONTEXT_WINDOW_BACKEND,
@@ -399,6 +409,7 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     rotationTurns: numeric("rotationTurns", parsePositiveInteger, env.CONTEXT_WINDOW_ROTATION_TURNS),
     hardLimitTokens: explicitHardLimitTokens ?? DEFAULT_CONFIG.hardLimitTokens,
     hardLimitTokensExplicit: explicitHardLimitTokens !== undefined,
+    piCompactionReserveTokens,
     retainTurns: numeric("retainTurns", parsePositiveInteger, env.CONTEXT_WINDOW_RETAIN_TURNS),
     maxToolResultTokens: numeric("maxToolResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_TOOL_RESULT_TOKENS),
     maxInlineUserTokens: numeric("maxInlineUserTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS),

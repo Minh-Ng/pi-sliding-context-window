@@ -299,11 +299,23 @@ export function resolveContextLimits(config, model) {
     };
   }
 
-  // Message estimation excludes the system prompt, tool schemas, provider framing,
-  // and future output. Ratios reserve explicit headroom, while legacy absolute
-  // settings remain optional caps when users have configured them.
-  const ratioRotationLimit = Math.max(1, Math.floor(contextWindow * modelConfig.rotationContextRatio));
-  const ratioHardLimit = Math.max(1, Math.floor(contextWindow * modelConfig.hardLimitContextRatio));
+  // Adaptive ratios apply to the host's usable input budget, not the model's
+  // combined input+output context window. Prefer Pi's configured compaction
+  // reserve; model.maxTokens is a conservative fallback when host settings are
+  // unavailable. Legacy absolute settings remain optional caps.
+  const configuredReserve = Number(config.piCompactionReserveTokens);
+  const modelOutputLimit = Number(model?.maxTokens);
+  const hasConfiguredReserve = Number.isSafeInteger(configuredReserve) && configuredReserve >= 0;
+  const hasModelOutputLimit = Number.isSafeInteger(modelOutputLimit) && modelOutputLimit > 0;
+  const reserveTokens = hasConfiguredReserve
+    ? configuredReserve
+    : hasModelOutputLimit
+      ? modelOutputLimit
+      : 0;
+  const reserveKnown = hasConfiguredReserve || hasModelOutputLimit;
+  const inputWindow = Math.max(0, contextWindow - reserveTokens);
+  const ratioRotationLimit = Math.max(1, Math.floor(inputWindow * modelConfig.rotationContextRatio));
+  const ratioHardLimit = Math.max(1, Math.floor(inputWindow * modelConfig.hardLimitContextRatio));
   const hardLimitTokens = config.hardLimitTokensExplicit === false
     ? ratioHardLimit
     : Math.min(config.hardLimitTokens, ratioHardLimit);
@@ -313,6 +325,10 @@ export function resolveContextLimits(config, model) {
   return {
     rotationTokens: Math.min(configuredRotationLimit, hardLimitTokens),
     hardLimitTokens,
+    ...(reserveKnown ? {
+      inputWindowTokens: inputWindow,
+      piCompactionReserveTokens: reserveTokens,
+    } : {}),
     rotationTurns: modelConfig.rotationTurns,
     modelPattern: modelConfig.pattern,
   };

@@ -969,7 +969,7 @@ test("searchDetailed surfaces cross-encoder rerank provenance instead of droppin
     daemonProcessId = archive.stats().processId;
 
     // The daemon's own store.search response can carry `reranked: true` on a
-    // result the cross-encoder reordered (proven end-to-end in
+    // result the cross-encoder scored (proven end-to-end in
     // retrieval-search.test.js and relevance-feedback.test.js); this test
     // isolates the facade's own reshaping of that response, which built its
     // result objects from a fixed key set (matching the RM3 expandedTerms
@@ -1023,7 +1023,7 @@ test("searchDetailed surfaces cross-encoder rerank provenance instead of droppin
     assert.equal(
       Object.hasOwn(detailed.results[1], "reranked"),
       false,
-      "reranked is present only on the specific result the cross-encoder actually reordered",
+      "reranked is present only on the specific result the cross-encoder scored",
     );
   } finally {
     try { archive?.close(); } catch {}
@@ -1079,6 +1079,94 @@ test("gatherDetailed forwards the store's expired-match summary instead of dropp
       project: "/different/project",
     });
     assert.deepEqual(wrongProject.expiredMatches, { count: 0, retentionClasses: [] });
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("gatherDetailed forwards cross-encoder rerank provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-gather-rerank-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/gather-rerank-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // gather.js already puts `reranked: true` on anchor evidence the
+    // cross-encoder scored (proven end-to-end in retrieval-gather.test.js
+    // and relevance-feedback.test.js); this test isolates the facade's own
+    // reshaping of that response, which previously rebuilt each evidence
+    // entry from a fixed key set and silently dropped `reranked`, so gather
+    // provenance never reached clients even though search's equivalent
+    // reshaping already forwarded it.
+    const document = {
+      documentId: "reranked-doc",
+      version: 1,
+      sessionId: "session-a",
+      project: "/project/gather-rerank-wiring",
+      kind: "note",
+      createdAt: Date.now(),
+      renderedText: "rendered anchor text",
+      text: "raw anchor text",
+      stalenessLabel: "current",
+      chunks: [{ chunkId: "c1", ordinal: 0, startByte: 0, endByte: 4, text: "text" }],
+      continuationLocators: [],
+      sourceMessages: { status: "available", keys: [], totalKeys: 0, truncated: false },
+    };
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.gather") return realRequest(operation, payload, options);
+      return {
+        status: "resolved",
+        mode: "lexical",
+        intent: payload.intent ?? "auto",
+        anchorCount: 1,
+        candidateCount: 1,
+        returnedTokens: 0,
+        truncated: false,
+        hasMore: false,
+        evidence: [
+          {
+            relation: "anchor",
+            anchorRank: 1,
+            distance: 0,
+            locator: "cw1.reranked-doc",
+            document,
+            score: 0.9,
+            retrievalMode: "lexical",
+            reranked: true,
+          },
+          {
+            relation: "before",
+            anchorRank: 1,
+            distance: 1,
+            locator: "cw1.untouched-doc",
+            document: { ...document, documentId: "untouched-doc" },
+          },
+        ],
+        expiredMatches: { count: 0, retentionClasses: [] },
+      };
+    };
+    const gathered = archive.gatherDetailed("RERANK_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/gather-rerank-wiring",
+      scope: "session",
+    });
+    assert.equal(gathered.evidence[0].reranked, true);
+    assert.equal(
+      Object.hasOwn(gathered.evidence[1], "reranked"),
+      false,
+      "reranked is present only on evidence the cross-encoder scored, matching searchDetailed's forwarding",
+    );
   } finally {
     try { archive?.close(); } catch {}
     await stopProcess(daemonProcessId);

@@ -46,19 +46,23 @@ const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, seman
 
 /**
  * Candidate pool size to fetch per mode and fuse over. Explicit search/gather
- * with an enabled cross-encoder reranker (options.reranker, never set by
+ * with an operational cross-encoder reranker (options.reranker, never set by
  * automatic preflight) widens this to at least the reranker's own candidate
  * window: the eval that justified building the reranker
  * (eval/retrieval/reranker-verdict.json) measured its Recall@3/MRR recovery
  * over 40-candidate pools, so a caller-limit-scaled pool of 9-30 candidates
  * (the default limit=3..10 without this widening) would starve the reranker
  * of exactly the deeper, lower-fused-rank candidates it exists to promote.
- * Automatic preflight and any explicit search with the reranker disabled or
- * absent keep the original, cheaper limit-scaled pool.
+ * Automatic preflight, any explicit search with the reranker disabled or
+ * absent, and a reranker that is enabled but not actually operational right
+ * now (latched unavailable after a load failure, or the pinned model was
+ * simply never installed) all keep the original, cheaper limit-scaled pool:
+ * widening it in those cases would only pay the larger fused-tier fetch/rank
+ * cost for candidates nothing is ever going to rerank.
  */
 function resolveCandidateLimit(limit, reranker) {
   const base = Math.min(100, Math.max(limit, limit * 3));
-  if (!reranker || reranker.enabled !== true) return base;
+  if (!reranker || typeof reranker.isOperational !== "function" || !reranker.isOperational()) return base;
   const window = Number.isSafeInteger(reranker.candidateWindow) && reranker.candidateWindow > 0
     ? reranker.candidateWindow
     : base;
@@ -1063,8 +1067,10 @@ async function locateCandidates(store, collected, request, options, secret) {
       ...(candidate.nearDuplicates > 0 ? { nearDuplicates: candidate.nearDuplicates } : {}),
       // Provenance for `/window recall why`-style explanations, matching the
       // RM3 expandedTerms precedent: present only when this specific result
-      // was actually reordered by the cross-encoder (LocalReranker.rerank),
-      // never a blanket flag for every explicit search.
+      // was scored by the cross-encoder (LocalReranker.rerank), never a
+      // blanket flag for every explicit search. "Scored," not "moved": see
+      // the matching comment on store-contract-schema.js's `reranked` field
+      // for why reorder-only would flicker with tie patterns.
       ...(candidate.reranked === true ? { reranked: true } : {}),
       locator,
       source: {

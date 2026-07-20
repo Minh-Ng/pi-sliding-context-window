@@ -1203,3 +1203,162 @@ test("near-duplicate dedup applies uniformly whether or not the connection has v
   );
   assert.ok(withoutOptIn.results.every((result) => !Object.hasOwn(result, "nearDuplicates")));
 });
+
+function fakeRerankClientForOperations() {
+  return {
+    metadata: Object.freeze({ id: "fake", revision: "test" }),
+    async score(query, passages) {
+      return passages.map((passage) => passage.length);
+    },
+    async close() {},
+  };
+}
+
+test("cross-project search strips reranked provenance from a multi-alias merge instead of implying a cross-alias-aware scoring decision", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-alias-rerank-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const canonical = "/workspace/alias-rerank-canonical";
+  const alias = "/workspace/alias-rerank-alias";
+  const sessionId = "session-alias-rerank";
+
+  async function admitDoc(documentId, project, text, createdAt) {
+    await admitDocument(store, {
+      idempotencyKey: `alias-rerank:${documentId}`,
+      document: {
+        documentId,
+        version: 1,
+        sourceKey: `tool:${documentId}`,
+        sessionId,
+        project,
+        kind: "tool-result",
+        createdAt,
+        text,
+        metadata: {},
+        sourceMessageKeys: [`tool:${documentId}`],
+      },
+      retentionClass: "conversation-source",
+    });
+  }
+  await admitDoc("canonical-1", canonical, "widget latency spike root cause analysis detail one", 100);
+  await admitDoc("canonical-2", canonical, "widget latency spike root cause analysis detail two", 200);
+  await admitDoc("alias-1", alias, "widget latency spike root cause analysis detail three", 100);
+  await admitDoc("alias-2", alias, "widget latency spike root cause analysis detail four", 200);
+
+  const runtime = await createDaemonOperations(store, {
+    reranker: { enabled: true, client: fakeRerankClientForOperations() },
+  });
+  t.after(() => runtime.close());
+  await runtime.drainIndexUntilIdle();
+
+  const request = {
+    query: "widget latency spike root cause",
+    relation: null,
+    scope: "session",
+    sessionId,
+    limit: 10,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 0,
+  };
+
+  // Sanity: a single-project search through the same reranker really does
+  // mark results reranked, so the merged-search assertion below is testing
+  // the deliberate strip, not an absent rerank invocation.
+  const singleProject = await runtime.search(request, { project: canonical, readProjects: [canonical] });
+  assert.ok(
+    singleProject.results.some((result) => result.reranked === true),
+    "fixture precondition: the single-project leg must be rerank-scored",
+  );
+
+  const merged = await runtime.search(request, { project: canonical, readProjects: [canonical, alias] });
+  assert.ok(merged.results.length > 0);
+  assert.equal(
+    merged.results.every((result) => result.reranked === undefined),
+    true,
+    "a cross-alias merge sorts strictly by score (never touched by rerank), so no candidate's merged position ever " +
+      "reflects a cross-encoder decision informed by the other alias -- the flag must not survive the merge",
+  );
+});
+
+test("cross-project gather strips reranked provenance from pooled multi-alias evidence instead of implying a cross-alias-aware scoring decision", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-gather-alias-rerank-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const canonical = "/workspace/gather-alias-rerank-canonical";
+  const alias = "/workspace/gather-alias-rerank-alias";
+  const marker = "GATHERALIASRERANKANCHOR";
+
+  async function admitMarkerDocument(project, id, createdAt) {
+    const sourceKey = `user:${id}`;
+    await admitDocument(store, {
+      idempotencyKey: `gather-alias-rerank:${id}`,
+      document: {
+        documentId: id,
+        version: 1,
+        sourceKey,
+        sessionId: `session-${id}`,
+        project,
+        kind: "turn",
+        createdAt,
+        text: `${marker} detail for ${id} with distinguishing padding words here.`,
+        metadata: { turnId: `turn-${id}` },
+        sourceMessageKeys: [sourceKey],
+      },
+      structuralMessages: [],
+      retentionClass: "conversation-source",
+    }, {
+      chunking: { maxChunkBytes: 256, minLineSplitBytes: 0 },
+      windows: { windowTokens: 32, overlapTokens: 2 },
+    });
+  }
+
+  await admitMarkerDocument(canonical, "canonical-1", 100);
+  await admitMarkerDocument(canonical, "canonical-2", 200);
+  await admitMarkerDocument(alias, "alias-1", 100);
+  await admitMarkerDocument(alias, "alias-2", 200);
+
+  const worker = new IndexWorker(store, {
+    workerId: "gather-alias-rerank-worker",
+    maxDrainMs: 30_000,
+    handlers: [createExactIndexHandler(), createBm25IndexHandler()],
+  });
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const runtime = await createDaemonOperations(store, {
+    reranker: { enabled: true, client: fakeRerankClientForOperations() },
+  });
+  t.after(() => runtime.close());
+
+  const request = {
+    query: marker,
+    intent: "state",
+    scope: "project",
+    sessionIds: [],
+    limit: 4,
+    before: 0,
+    after: 0,
+    neighborhoodAnchors: 4,
+    maxEvidence: 8,
+    maxTokens: 4_000,
+    excludeVisibleSourceKeys: [],
+  };
+
+  const singleProject = await runtime.gather(request, { project: canonical, readProjects: [canonical] });
+  assert.ok(
+    singleProject.evidence.some((item) => item.reranked === true),
+    "fixture precondition: the single-project leg must be rerank-scored",
+  );
+
+  const merged = await runtime.gather(request, { project: canonical, readProjects: [canonical, alias] });
+  assert.ok(merged.evidence.length > 0);
+  assert.equal(
+    merged.evidence.every((item) => item.reranked === undefined),
+    true,
+    "a cross-alias gather pools by anchorRank/distance (never touched by rerank), so no evidence item's pooled " +
+      "position ever reflects a cross-encoder decision informed by the other alias -- the flag must not survive the pool",
+  );
+});

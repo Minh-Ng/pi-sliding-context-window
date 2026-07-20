@@ -1252,6 +1252,34 @@ test("cross-encoder rerank widens the fused candidate pool to the reranker's win
   assert.equal(reranked.results[0]?.reranked, true);
 });
 
+test("cross-encoder rerank does not widen the candidate pool once the reranker is latched unavailable", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-unavailable-no-widen");
+  const distractorCount = 11;
+  await seedDeepRerankFixture(store, distractorCount);
+  await worker.drain();
+  const query = "widget latency spike root cause";
+
+  // Same fixture and reranker wiring as the widening test above, except this
+  // reranker is already latched unavailable (mirroring a daemon that hit a
+  // load failure on a prior request) before the search ever runs -- the
+  // candidate pool must therefore stay at the small per-request size, not
+  // widen to the reranker's own candidateWindow, since nothing is left that
+  // could ever consume the extra candidates.
+  const client = fakeRerankClient((passage) => (passage.includes("RERANK_TARGET") ? 100 : 0));
+  const reranker = new LocalReranker({ enabled: true, client });
+  reranker.unavailable = true;
+  const result = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 3 })), {
+    now: 1_001,
+    reranker,
+  });
+  assert.equal(
+    result.results.some(({ documentId }) => documentId === "target"),
+    false,
+    "a latched-unavailable reranker must not widen the candidate pool to reach a deep-fused candidate",
+  );
+  assert.equal(client.calls.length, 0, "a latched-unavailable reranker never calls the client");
+});
+
 test("cross-encoder rerank degrades silently to the pre-rerank fused order when the model is unavailable", async (t) => {
   const { store, worker } = await fixture(t, "search-rerank-degraded");
   await seedRerankFixture(store);

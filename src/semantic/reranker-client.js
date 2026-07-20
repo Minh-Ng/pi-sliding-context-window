@@ -3,6 +3,17 @@ import { Worker } from "node:worker_threads";
 const DEFAULT_WORKER_URL = new URL("./reranker-worker.js", import.meta.url);
 
 /**
+ * Thrown by `score()` when a request times out waiting for the worker to
+ * reply. Distinguished from every other rejection (worker crash, malformed
+ * output, an explicit model-load failure surfaced by the worker) so callers
+ * -- see LocalReranker -- can treat a slow-but-possibly-still-loading model
+ * differently from a genuinely broken one: a single timeout is expected
+ * during the worker's lazy first-request model load and must not by itself
+ * be taken as proof the model is unusable.
+ */
+export class RerankerTimeoutError extends Error {}
+
+/**
  * Worker-thread cross-encoder client. Mirrors LocalEmbedder
  * (embedder-client.js): the model loads lazily inside the worker on its
  * first message, never blocking construction or daemon start, and every
@@ -34,6 +45,13 @@ export class RerankerWorkerClient {
     this.worker.on("exit", (code) => {
       if (code !== 0) this.#fail(new Error(`Local reranker worker exited with code ${code}.`));
     });
+    // Observable, idempotent close: LocalReranker terminates a load-failed
+    // worker as soon as it latches unavailable, and a later daemon shutdown
+    // calls close() again on the same client -- terminating an
+    // already-terminated worker a second time is harmless in Node, but the
+    // flag lets callers (and tests) confirm termination actually happened
+    // instead of inferring it from a worker that simply stopped replying.
+    this.terminated = false;
   }
 
   #settle(message) {
@@ -59,7 +77,7 @@ export class RerankerWorkerClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error("Local reranker request timed out."));
+        reject(new RerankerTimeoutError("Local reranker request timed out."));
       }, this.timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
@@ -68,6 +86,8 @@ export class RerankerWorkerClient {
   }
 
   async close() {
+    if (this.terminated) return;
+    this.terminated = true;
     this.#fail(new Error("Local reranker closed."));
     await this.worker.terminate();
   }

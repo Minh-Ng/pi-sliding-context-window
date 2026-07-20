@@ -418,10 +418,15 @@ const searchResult = object({
   superseded: boolean(),
   nearDuplicates: nonNegativeInteger,
   // Cross-encoder rerank provenance (deferred task #2): present only when
-  // this result was actually reordered by the local reranker, mirroring the
-  // expandedTerms provenance pattern above. Absent on every automatic
-  // preflight result and on any explicit result the reranker left untouched
-  // (disabled, unavailable, or outside its candidate window).
+  // this result was scored by the local reranker, mirroring the
+  // expandedTerms provenance pattern above. This means "the reranker scored
+  // this candidate," not "the reranker moved it" -- a tied or near-tied
+  // cross-encoder score can leave a scored candidate exactly where it
+  // started (LocalReranker.rerank's stable-sort tie-break), and a
+  // reorder-only flag would then flicker on/off across otherwise-identical
+  // requests depending on incidental tie patterns. Absent on every
+  // automatic preflight result and on any explicit result the reranker left
+  // untouched (disabled, unavailable, or outside its candidate window).
   reranked: boolean(),
   locator: identifier,
   source: SOURCE_REFERENCE_SCHEMA,
@@ -559,9 +564,10 @@ const gatheredEvidence = object({
   // before/after neighbors are context, not ranked hits, so this stays optional.
   score: normalizedScore,
   retrievalMode: enumeration(["exact", "lexical", "semantic", "structural"]),
-  // Same cross-encoder rerank provenance as store.search's searchResult,
-  // carried onto anchor evidence only (see the score/retrievalMode comment
-  // above; before/after neighbors are never reranked).
+  // Same cross-encoder rerank provenance as store.search's searchResult
+  // ("scored by," not "moved by" -- see that field's comment), carried onto
+  // anchor evidence only (see the score/retrievalMode comment above;
+  // before/after neighbors are never reranked).
   reranked: boolean(),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 

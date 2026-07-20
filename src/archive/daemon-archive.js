@@ -915,9 +915,14 @@ export class DaemonArchive {
           : { expandedTerms: [...candidate.expandedTerms] }),
         // Provenance for `/window recall why`-style explanations, matching
         // the RM3 expandedTerms precedent above: present only when this
-        // specific result was actually reordered by the cross-encoder
-        // reranker (src/retrieval/search.js's rerankTierOne), never a
-        // blanket flag for every explicit search.
+        // specific result was scored by the cross-encoder reranker
+        // (src/retrieval/search.js's rerankTierOne), never a blanket flag
+        // for every explicit search. Deliberately means "the reranker
+        // considered this candidate," not "this candidate's position
+        // changed": a tied or near-tied score can leave a scored candidate
+        // exactly where it started, and flag-on-reorder-only would then
+        // flicker on/off across otherwise-identical requests depending on
+        // incidental tie patterns.
         ...(candidate.reranked === true ? { reranked: true } : {}),
         historical: candidate.historical,
         superseded: candidate.superseded,
@@ -1001,6 +1006,7 @@ export class DaemonArchive {
         document: recalledDocument(item.document, item.locator),
         ...(item.score === undefined ? {} : { score: item.score }),
         ...(item.retrievalMode === undefined ? {} : { retrievalMode: item.retrievalMode }),
+        ...(item.reranked === true ? { reranked: true } : {}),
       };
     });
     return {

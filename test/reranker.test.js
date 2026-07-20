@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { LocalReranker, truncateCenteredTokens } from "../src/semantic/reranker.js";
-import { RerankerWorkerClient } from "../src/semantic/reranker-client.js";
+import { RerankerWorkerClient, RerankerTimeoutError } from "../src/semantic/reranker-client.js";
+import { DEFAULT_RERANKER_MODEL, DEFAULT_RERANKER_MODEL_REVISION } from "../src/semantic/reranker-model.js";
+import { defaultRerankerCacheDir } from "../eval/retrieval/reranker-model.js";
 import { FAKE_RERANKER_MISSING_MODEL } from "../test-support/fake-reranker-worker-constants.js";
 
 const FAKE_WORKER_URL = new URL("../test-support/fake-reranker-worker.js", import.meta.url);
+// The pinned reranker model, downloaded once into this fixed local cache for
+// offline eval and reused read-only by these tests (see repo task notes and
+// eval/retrieval/reranker-model.js). Tests that need it present skip instead
+// of failing when the cache has not been populated in this environment.
+const REAL_RERANKER_CACHE_DIR = defaultRerankerCacheDir();
+const REAL_RERANKER_MODEL_INSTALLED = existsSync(
+  join(REAL_RERANKER_CACHE_DIR, DEFAULT_RERANKER_MODEL, DEFAULT_RERANKER_MODEL_REVISION, "config.json"),
+);
 
 function candidate({ documentId, version = 1, retrievalMode, snippet = "text", normalizedScore = 0.5 }) {
   return {
@@ -169,6 +182,145 @@ test("LocalReranker degrades silently when the client returns a mismatched score
   assert.deepEqual(result.map((entry) => entry.documentId), ["a", "b"]);
   assert.equal(reranker.status().available, false);
 });
+
+test("LocalReranker treats a single score() timeout as transient and does not latch unavailable", async () => {
+  const recorded = [];
+  const client = fakeClient(() => {
+    throw new RerankerTimeoutError("Local reranker request timed out.");
+  });
+  const reranker = new LocalReranker({ enabled: true, client, recordError: (error) => recorded.push(error) });
+  const candidates = [
+    candidate({ documentId: "a", retrievalMode: "lexical" }),
+    candidate({ documentId: "b", retrievalMode: "lexical" }),
+  ];
+  const result = await reranker.rerank("query", candidates);
+  assert.deepEqual(result.map((entry) => entry.documentId), ["a", "b"], "falls back to fused order on a timeout too");
+  assert.equal(reranker.status().available, true, "a lone timeout -- likely mid lazy-load -- must not latch the reranker unavailable");
+  assert.equal(recorded.length, 1);
+  assert.ok(recorded[0] instanceof RerankerTimeoutError);
+});
+
+test("LocalReranker latches unavailable only once maxConsecutiveTimeouts consecutive score() calls all time out", async () => {
+  const client = fakeClient(() => {
+    throw new RerankerTimeoutError("Local reranker request timed out.");
+  });
+  const reranker = new LocalReranker({ enabled: true, client, maxConsecutiveTimeouts: 3 });
+  const candidates = [
+    candidate({ documentId: "a", retrievalMode: "lexical" }),
+    candidate({ documentId: "b", retrievalMode: "lexical" }),
+  ];
+  await reranker.rerank("query", candidates);
+  assert.equal(reranker.status().available, true, "1st consecutive timeout must not latch");
+  await reranker.rerank("query", candidates);
+  assert.equal(reranker.status().available, true, "2nd consecutive timeout must not latch");
+  await reranker.rerank("query", candidates);
+  assert.equal(reranker.status().available, false, "3rd consecutive timeout (the configured max) latches");
+  assert.equal(client.calls.length, 3);
+  await reranker.rerank("query", candidates);
+  assert.equal(client.calls.length, 3, "a latched reranker never retries, timeout or not");
+});
+
+test("LocalReranker resets its consecutive-timeout count on a successful score(), so an isolated timeout never accumulates toward the latch", async () => {
+  let callCount = 0;
+  const client = fakeClient((query, passages) => {
+    callCount += 1;
+    if (callCount === 2) return passages.map(() => 1); // one success in between two timeouts
+    throw new RerankerTimeoutError("Local reranker request timed out.");
+  });
+  const reranker = new LocalReranker({ enabled: true, client, maxConsecutiveTimeouts: 2 });
+  const candidates = [
+    candidate({ documentId: "a", retrievalMode: "lexical" }),
+    candidate({ documentId: "b", retrievalMode: "lexical" }),
+  ];
+  await reranker.rerank("query", candidates); // timeout #1
+  await reranker.rerank("query", candidates); // success -- resets the count
+  await reranker.rerank("query", candidates); // timeout #1 again, not #2
+  assert.equal(reranker.status().available, true, "the intervening success must reset the consecutive-timeout count");
+});
+
+test("LocalReranker never closes a caller-injected client on latch -- only a worker it constructed itself is its own to terminate", async () => {
+  let closeCalls = 0;
+  const client = fakeClient(() => {
+    throw new Error("model not installed");
+  });
+  client.close = async () => { closeCalls += 1; };
+  const reranker = new LocalReranker({ enabled: true, client });
+  const candidates = [
+    candidate({ documentId: "a", retrievalMode: "lexical" }),
+    candidate({ documentId: "b", retrievalMode: "lexical" }),
+  ];
+  await reranker.rerank("query", candidates);
+  assert.equal(reranker.status().available, false);
+  assert.equal(closeCalls, 0, "an injected test-seam client is not this instance's to close");
+});
+
+test("LocalReranker terminates its own worker once a non-timeout failure latches it unavailable", async (t) => {
+  const reranker = new LocalReranker({
+    enabled: true,
+    // The sentinel model id makes the fake worker simulate the pinned model
+    // never having been installed, exactly like production would.
+    model: FAKE_RERANKER_MISSING_MODEL,
+    revision: "fake-revision",
+    cachePath: "/tmp/does-not-matter",
+    workerUrl: FAKE_WORKER_URL,
+  });
+  t.after(() => reranker.close());
+  const candidates = [
+    candidate({ documentId: "a", retrievalMode: "lexical" }),
+    candidate({ documentId: "b", retrievalMode: "lexical" }),
+  ];
+  await reranker.rerank("query", candidates);
+  assert.equal(reranker.status().available, false);
+  assert.equal(
+    reranker.client?.terminated,
+    true,
+    "a load failure must terminate the now-useless worker instead of leaving it running unused until daemon restart",
+  );
+});
+
+test("LocalReranker.isOperational is false when disabled", () => {
+  const reranker = new LocalReranker({ enabled: false });
+  assert.equal(reranker.isOperational(), false);
+});
+
+test("LocalReranker.isOperational treats a caller-injected client as operational whenever enabled and not latched unavailable", () => {
+  const client = fakeClient(() => []);
+  const reranker = new LocalReranker({ enabled: true, client });
+  assert.equal(reranker.isOperational(), true);
+  reranker.unavailable = true;
+  assert.equal(reranker.isOperational(), false, "a latched-unavailable reranker is never operational, injected client or not");
+});
+
+test("LocalReranker.isOperational is false for a self-constructed worker whose pinned model is not installed on disk, without loading anything", () => {
+  const missingCacheDir = mkdtempSync(join(tmpdir(), "context-window-reranker-missing-"));
+  try {
+    const reranker = new LocalReranker({
+      enabled: true,
+      model: "some-org/never-installed-model",
+      revision: "v1",
+      cachePath: missingCacheDir,
+    });
+    assert.equal(reranker.isOperational(), false);
+    assert.equal(reranker.client, undefined, "probing operational status must never construct (let alone load) a worker client");
+  } finally {
+    rmSync(missingCacheDir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "LocalReranker.isOperational is true for a self-constructed worker whose pinned model files exist on disk",
+  { skip: !REAL_RERANKER_MODEL_INSTALLED && "pinned reranker model is not installed in this environment's cache" },
+  () => {
+    const reranker = new LocalReranker({
+      enabled: true,
+      model: DEFAULT_RERANKER_MODEL,
+      revision: DEFAULT_RERANKER_MODEL_REVISION,
+      cachePath: REAL_RERANKER_CACHE_DIR,
+    });
+    assert.equal(reranker.isOperational(), true);
+    assert.equal(reranker.client, undefined, "the operational probe itself must never construct a worker client");
+  },
+);
 
 test("LocalReranker skips rerank for an empty query or fewer than two tier-one candidates", async () => {
   const client = fakeClient(() => {

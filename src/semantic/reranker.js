@@ -1,9 +1,19 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { estimateModelVisibleTokens } from "../session/model-token-budget.js";
-import { RerankerWorkerClient } from "./reranker-client.js";
+import { RerankerWorkerClient, RerankerTimeoutError } from "./reranker-client.js";
 import {
   DEFAULT_RERANKER_CANDIDATE_WINDOW,
   DEFAULT_RERANKER_TEXT_TOKEN_BUDGET,
 } from "./reranker-model.js";
+
+// A single score() timeout is expected while the worker lazily loads the
+// model on its first real request (see LocalReranker's class doc) and must
+// not by itself latch the reranker unavailable. Only this many *consecutive*
+// timeouts -- with no intervening success -- are treated as proof the model
+// is unusably slow or stuck, at which point the reranker degrades exactly
+// like a genuine load failure (latch + terminate the now-useless worker).
+const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS = 3;
 
 // The cross-encoder reorders only the shared lexical/semantic tier (RRF fusion
 // tier one in src/retrieval/search.js); exact and structural candidates keep
@@ -68,6 +78,7 @@ export class LocalReranker {
     // test-support/fake-reranker-worker.js). Production callers never set this.
     workerUrl,
     recordError = () => {},
+    maxConsecutiveTimeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
   } = {}) {
     this.enabled = enabled === true;
     this.model = model;
@@ -83,8 +94,12 @@ export class LocalReranker {
     this.client = client;
     this.ownsClient = client === undefined;
     this.recordError = recordError;
+    this.maxConsecutiveTimeouts = Number.isSafeInteger(maxConsecutiveTimeouts) && maxConsecutiveTimeouts > 0
+      ? maxConsecutiveTimeouts
+      : DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
     this.unavailable = false;
     this.closed = false;
+    this.consecutiveTimeouts = 0;
   }
 
   #getClient() {
@@ -105,6 +120,38 @@ export class LocalReranker {
       revision: this.revision,
       candidateWindow: this.candidateWindow,
     };
+  }
+
+  // Cheap on-disk existence check for the pinned model's cache directory --
+  // no pipeline construction, no tokenizer/model load, so calling this on
+  // every search's candidate-pool sizing decision (resolveCandidateLimit in
+  // src/retrieval/search.js) cannot itself add the load latency it exists to
+  // avoid paying for uselessly. Mirrors the local_files_only cache layout
+  // bin/context-window-semantic.js's install-reranker writes and the real
+  // worker (reranker-worker.js) reads: `<cachePath>/<model>/<revision>/`.
+  #modelFilesPresent() {
+    if (typeof this.model !== "string" || this.model.length === 0) return false;
+    if (typeof this.cachePath !== "string" || this.cachePath.length === 0) return false;
+    const revision = typeof this.revision === "string" && this.revision.length > 0
+      ? this.revision
+      : "main";
+    return existsSync(join(this.cachePath, this.model, revision, "config.json"));
+  }
+
+  /**
+   * True only when reranking would actually run right now: enabled, not
+   * latched unavailable, and (for a real, self-constructed worker client)
+   * the pinned model's files are present in the local cache. A caller-
+   * injected client (the test seam described in the constructor) has no
+   * cache directory of its own to probe -- production never sets it, so its
+   * mere presence already means a test deliberately wired up a working
+   * stand-in -- and is treated as operational whenever the reranker is
+   * enabled and not latched unavailable, same as before this method existed.
+   */
+  isOperational() {
+    if (!this.enabled || this.closed || this.unavailable) return false;
+    if (!this.ownsClient) return true;
+    return this.#modelFilesPresent();
   }
 
   /**
@@ -130,13 +177,33 @@ export class LocalReranker {
     try {
       scores = await this.#getClient().score(query, passages);
     } catch (error) {
-      this.unavailable = true;
       this.recordError(error);
+      if (error instanceof RerankerTimeoutError) {
+        // Transient: likely still mid lazy-load. Only latch (and only then
+        // terminate the worker) once N consecutive requests have all timed
+        // out with no success in between -- a single slow first request
+        // must not permanently disable a reranker that would otherwise have
+        // come up fine.
+        this.consecutiveTimeouts += 1;
+        if (this.consecutiveTimeouts >= this.maxConsecutiveTimeouts) {
+          this.unavailable = true;
+          await this.#terminateClient();
+        }
+        return candidates;
+      }
+      // Any non-timeout rejection (worker crash, exit, or an explicit
+      // model-load failure the worker surfaced) is a load failure, not a
+      // transient hiccup: latch immediately and terminate the now-useless
+      // worker rather than leaving it running unused until daemon restart.
+      this.unavailable = true;
+      await this.#terminateClient();
       return candidates;
     }
+    this.consecutiveTimeouts = 0;
     if (!Array.isArray(scores) || scores.length !== windowIndexes.length) {
       this.unavailable = true;
       this.recordError(new Error("Local reranker returned a mismatched score count."));
+      await this.#terminateClient();
       return candidates;
     }
     const scoreByIndex = new Map(windowIndexes.map((index, position) => [index, scores[position]]));
@@ -161,6 +228,16 @@ export class LocalReranker {
       };
     });
     return next;
+  }
+
+  // Shuts down the worker thread once the reranker has latched unavailable,
+  // so a load failure doesn't leave a model-loading (or already-loaded but
+  // now-known-broken) worker thread alive and consuming memory/CPU for the
+  // rest of the daemon's life with nothing left to use it. Only closes a
+  // client this instance created itself: a caller-injected client (the test
+  // seam) is not ours to terminate.
+  async #terminateClient() {
+    if (this.ownsClient) await this.client?.close();
   }
 
   async close() {

@@ -98,6 +98,17 @@ function readProjectsFor(context) {
     : [context.project];
 }
 
+// Drops cross-encoder rerank provenance (see #searchAcrossProjects and
+// #gatherAcrossProjects) from a single result/evidence entry that survived a
+// cross-project merge, without mutating the original object other callers
+// (relevance feedback, the per-project result the entry came from) still
+// hold a reference to.
+function stripRerankProvenance(entry) {
+  if (entry.reranked === undefined) return entry;
+  const { reranked, ...rest } = entry;
+  return rest;
+}
+
 // Contract cap for a single gather evidence packet (store.gather result schema).
 // A cross-project union pools per-project packets, so it must re-cap here.
 const MAX_GATHER_EVIDENCE = 24;
@@ -679,7 +690,20 @@ export class DaemonOperations {
       .sort((left, right) => right.entry.score - left.entry.score
         || String(left.entry.documentId).localeCompare(String(right.entry.documentId)));
     const kept = limit === undefined ? ranked : ranked.slice(0, limit);
-    const results = kept.map(({ entry }) => entry);
+    // Each leg's own searchArchive call already ran the cross-encoder over
+    // that project's own fused tier before this method ever sees its
+    // results, but the union above re-sorts strictly by `score` -- a field
+    // rerank never changes (src/semantic/reranker.js only ever reorders
+    // array position) -- across every alias at once. So no candidate's
+    // position in *this* merged, multi-alias ranking was ever decided by a
+    // cross-encoder pass that could see its competing aliases: whichever
+    // alias's leg happened to score highest wins purely on that score, the
+    // same as it would with rerank disabled entirely. `reranked: true`
+    // promises the cross-encoder scored this specific candidate (see
+    // store-contract-schema.js's `reranked` field comment); strip it here so
+    // that promise never outlives the single-project search it was actually
+    // true for.
+    const results = kept.map(({ entry }) => stripRerankProvenance(entry));
     // A structurally special status (ambiguous, or a legacy-fallback expansion)
     // is a per-project retrieval signal, not just an overall found/not-found
     // outcome. Surface it whenever a kept result actually carries it, so an
@@ -779,7 +803,17 @@ export class DaemonOperations {
       anchorCount += result.anchorCount;
       candidateCount += result.candidateCount;
       truncated ||= result.truncated;
-      pooled.push(...result.evidence);
+      // Each leg's own gather call already ran the cross-encoder over that
+      // project's own anchors before this method sees them, but the
+      // anchorRank/distance interleave below (and the chronological re-sort
+      // after budget selection) pools evidence across every alias without
+      // any cross-encoder pass ever comparing one alias's anchors against
+      // another's -- the same reasoning as #searchAcrossProjects's
+      // stripRerankProvenance above, just against anchorRank/distance
+      // instead of `score`. Strip the flag so it never implies the
+      // presented cross-alias evidence order reflects a rerank decision
+      // that was never actually made across aliases.
+      pooled.push(...result.evidence.map(stripRerankProvenance));
       expiredCount += result.expiredMatches?.count ?? 0;
       for (const retentionClass of result.expiredMatches?.retentionClasses ?? []) {
         expiredRetentionClasses.add(retentionClass);

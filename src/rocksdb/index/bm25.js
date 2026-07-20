@@ -19,8 +19,13 @@ import {
   tokenizeBm25,
   tokenizeBm25Query,
 } from "./tokenizer.js";
+import { structuralMessageLocations } from "./structural.js";
 
-export const BM25_INDEX_VERSION = 2;
+// Field-weighted postings (weighted term frequency and window length instead
+// of raw counts) change the posting format, so this forks the derived
+// namespace exactly like a tokenizer bump: 2 was the pre-field-weighting
+// format, 3 is field-aware.
+export const BM25_INDEX_VERSION = 3;
 export const DEFAULT_BM25_PARAMETERS = Object.freeze({ k1: 1.2, b: 0.75 });
 export const DEFAULT_BM25_SEARCH_LIMITS = Object.freeze({
   maxQueryTerms: 20,
@@ -47,6 +52,22 @@ const MAX_UNIQUE_TERMS_PER_DOCUMENT = 512;
 const DOCUMENT_WINDOWS_PER_SHARD = 256;
 const DOCUMENT_TERM_ORDINALS_PER_SHARD = 1_024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// BM25F-style role weighting so a long tool result cannot outweigh the short
+// user sentence that named a decision. `neutral` reproduces the pre-field-
+// weighting score exactly (weight 1 on every byte), so any document without
+// resolvable structural messages — every pre-existing fixture and migrated
+// document included — is scored identically to before this change.
+// `structural` is the boosted title-like tier for question/request/
+// correction/answer-scored spans and whole decision-candidate documents;
+// `tool` is the fallback for bytes inside a document that has known message
+// structure but fall outside any located user/assistant span.
+export const BM25_FIELD_WEIGHTS = Object.freeze({
+  structural: 2.5,
+  user: 2.25,
+  assistant: 1.25,
+  tool: 0.4,
+  neutral: 1,
+});
 const BM25_WORD = /[\p{L}\p{M}\p{N}_]+/gu;
 const EMPTY_EXPIRED_MATCHES = Object.freeze({ count: 0, retentionClasses: Object.freeze([]) });
 const MAX_BUFFERED_CROSS_SEGMENT_CODE_POINTS = 1_024;
@@ -79,6 +100,25 @@ function finite(value, label, { minimum = 0, maximum = Number.POSITIVE_INFINITY 
   return value;
 }
 
+// Weighted corpus lengths are running sums/differences of fractional
+// per-token field weights (2.5/2.25/1.25/0.4), so a value that is
+// mathematically exactly zero can land a float epsilon on either side of
+// zero depending purely on the order documents were added versus deleted.
+// The smallest real per-token weight (0.4) is many orders of magnitude
+// larger than any float rounding residue observed on this arithmetic, so a
+// tolerance far below that (and far above IEEE-754 double epsilon) safely
+// distinguishes true corpus corruption from rounding noise.
+const WEIGHTED_LENGTH_ZERO_TOLERANCE = 1e-6;
+
+/** Clamp a weighted-length delta that is negative only by float rounding
+ * noise to exactly zero; a delta beyond the tolerance is a real corpus
+ * statistics inconsistency and still throws. */
+function clampWeightedLengthResidue(value, label) {
+  if (value >= 0) return value;
+  if (value > -WEIGHTED_LENGTH_ZERO_TOLERANCE) return 0;
+  throw new Error(`${label} would become negative.`);
+}
+
 function requireView(view) {
   if (!view || typeof view.get !== "function" || typeof view.scan !== "function") {
     throw new TypeError("A RocksStore-compatible read view is required.");
@@ -88,6 +128,87 @@ function requireView(view) {
 
 function compareStrings(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+// Fallback (non-cue) structural scores are never exactly 0 in production
+// (structuralMessageScores in ../../structural.js gives every non-empty user
+// message question:10+/request:10+, and every non-error assistant message
+// answer:75+), so a `> 0` promotion threshold would promote every located
+// user and assistant span to the structural tier and collapse the intended
+// user > assistant > tool ordering. Only the decisive cue-matched scores
+// (an actual "?"/interrogative, an actual command verb, a correction phrase,
+// or a terminal answer) clear this threshold; plain conversational filler
+// falls through to the ordinary role weight instead.
+const STRUCTURAL_PROMOTION_THRESHOLD = 85;
+
+function isStructuralMessage(message) {
+  return ["questionScore", "requestScore", "correctionScore", "answerScore"].some((field) => {
+    const score = Number(message?.[field]);
+    return Number.isFinite(score) && score >= STRUCTURAL_PROMOTION_THRESHOLD;
+  });
+}
+
+/**
+ * Resolve BM25F field boundaries from the same manifest data structural
+ * indexing already relies on: `structuralMessages` for role-tagged spans
+ * inside a turn, or the whole document for a decision-candidate excerpt.
+ * Resolution is best-effort — an unresolved scan (duplicate text, an
+ * oversized document, or a synchronous caller with no bounded reader) falls
+ * back to no ranges, which weights every byte as `neutral` and reproduces
+ * the pre-field-weighting score exactly.
+ */
+async function resolveFieldRanges(context) {
+  if (context.manifest.kind === "decision-candidate") {
+    return Object.freeze([
+      { startByte: 0, endByte: context.manifest.byteLength, weight: BM25_FIELD_WEIGHTS.structural },
+    ]);
+  }
+  if (typeof context.readSourceRange !== "function") return Object.freeze([]);
+  const structural = Array.isArray(context.manifest.structuralMessages)
+    ? context.manifest.structuralMessages
+    : [];
+  const located = structural.filter((message) =>
+    (message.role === "user" || message.role === "assistant") && (message.text ?? "").length > 0);
+  if (located.length === 0) return Object.freeze([]);
+  let locations;
+  try {
+    locations = await structuralMessageLocations(context, located);
+  } catch {
+    return Object.freeze([]);
+  }
+  return Object.freeze(located.flatMap((message) => {
+    const location = locations.get(message);
+    if (location === undefined) return [];
+    const weight = isStructuralMessage(message)
+      ? BM25_FIELD_WEIGHTS.structural
+      : BM25_FIELD_WEIGHTS[message.role];
+    return [{ startByte: location.startByte, endByte: location.endByte, weight }];
+  }).sort((left, right) => left.startByte - right.startByte));
+}
+
+/** Binary search a byte offset against sorted, non-overlapping field ranges.
+ * An empty range set (no resolvable structural messages) is neutral; a gap
+ * inside a document that does have located ranges is presumed tool output or
+ * message-boundary formatting, so it gets the lowest weight instead. */
+function weightForByte(fieldRanges, startByte) {
+  if (fieldRanges.length === 0) return BM25_FIELD_WEIGHTS.neutral;
+  let low = 0;
+  let high = fieldRanges.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const range = fieldRanges[middle];
+    if (startByte < range.startByte) high = middle - 1;
+    else if (startByte >= range.endByte) low = middle + 1;
+    else return range.weight;
+  }
+  return BM25_FIELD_WEIGHTS.tool;
+}
+
+/** Sum per-occurrence field weight for one term's positions in one window. */
+function weightedFrequency(positions, fieldRanges) {
+  let total = 0;
+  for (const position of positions) total += weightForByte(fieldRanges, position.startByte);
+  return total;
 }
 
 /** Best-effort retention-class label for an honesty count only; the manifest
@@ -280,8 +401,12 @@ export function bm25TermScore({
   k1 = DEFAULT_BM25_PARAMETERS.k1,
   b = DEFAULT_BM25_PARAMETERS.b,
 } = {}) {
-  positiveInteger(termFrequency, "termFrequency");
-  nonNegativeInteger(documentLength, "documentLength");
+  // Field weighting makes both inputs weighted sums rather than raw counts,
+  // so they are finite positive numbers rather than integers; an unweighted
+  // (neutral-weight) caller still passes plain integers, which satisfy the
+  // same bounds and score identically to the pre-field-weighting formula.
+  finite(termFrequency, "termFrequency", { minimum: Number.MIN_VALUE });
+  finite(documentLength, "documentLength");
   finite(averageDocumentLength, "averageDocumentLength");
   const parameters = normalizeParameters({ k1, b });
   const idf = bm25InverseDocumentFrequency(documentCount, documentFrequency);
@@ -343,11 +468,15 @@ export function recomputeBm25Evidence(explanation) {
   });
 }
 
+// This synchronous fallback has no bounded source reader, so it cannot
+// resolve structural-message field boundaries and always scores at neutral
+// weight (weightedLength === length, weightedTermFrequency === termFrequency).
 function analyzeDocument(context) {
   const termPostings = new Map();
   const windows = [];
   const documentBytes = Buffer.from(context.text, "utf8");
   let totalLength = 0;
+  let totalWeightedLength = 0;
   let termWindows = 0;
   for (const window of context.windows) {
     const windowText = UTF8_DECODER.decode(
@@ -362,6 +491,7 @@ function analyzeDocument(context) {
       totalLength + tokens.length,
     );
     totalLength += tokens.length;
+    totalWeightedLength += tokens.length;
     const grouped = new Map();
     for (const token of tokens) {
       let positions = grouped.get(token.term);
@@ -380,6 +510,7 @@ function analyzeDocument(context) {
       startByte: window.startByte,
       endByte: window.endByte,
       length: tokens.length,
+      weightedLength: tokens.length,
     }));
     for (const [term, positions] of grouped) {
       let posting = termPostings.get(term);
@@ -398,7 +529,9 @@ function analyzeDocument(context) {
         startByte: window.startByte,
         endByte: window.endByte,
         length: tokens.length,
+        weightedLength: tokens.length,
         termFrequency: positions.length,
+        weightedTermFrequency: positions.length,
         positions: Object.freeze(positions),
       }));
     }
@@ -416,7 +549,7 @@ function analyzeDocument(context) {
     MAX_UNIQUE_TERMS_PER_DOCUMENT,
     termPostings.size,
   );
-  return Object.freeze({ termPostings, windows: Object.freeze(windows), totalLength });
+  return Object.freeze({ termPostings, windows: Object.freeze(windows), totalLength, totalWeightedLength });
 }
 
 function appendWordFragment(word, fragment) {
@@ -507,9 +640,11 @@ function tokenizeBm25Segment(state, text, baseByte, final, target) {
 }
 
 async function analyzeDocumentFromRanges(context) {
+  const fieldRanges = await resolveFieldRanges(context);
   const termPostings = new Map();
   const windows = [];
   let totalLength = 0;
+  let totalWeightedLength = 0;
   let termWindows = 0;
   for (const window of context.windows) {
     const tokens = [];
@@ -541,8 +676,10 @@ async function analyzeDocumentFromRanges(context) {
       totalLength + tokens.length,
     );
     totalLength += tokens.length;
+    let windowWeightedLength = 0;
     const grouped = new Map();
     for (const token of tokens) {
+      windowWeightedLength += weightForByte(fieldRanges, token.startByte);
       let positions = grouped.get(token.term);
       if (positions === undefined) {
         positions = [];
@@ -554,11 +691,13 @@ async function analyzeDocumentFromRanges(context) {
         endByte: token.endByte,
       }));
     }
+    totalWeightedLength += windowWeightedLength;
     windows.push(Object.freeze({
       ordinal: window.ordinal,
       startByte: window.startByte,
       endByte: window.endByte,
       length: tokens.length,
+      weightedLength: windowWeightedLength,
     }));
     for (const [term, positions] of grouped) {
       let posting = termPostings.get(term);
@@ -577,7 +716,9 @@ async function analyzeDocumentFromRanges(context) {
         startByte: window.startByte,
         endByte: window.endByte,
         length: tokens.length,
+        weightedLength: windowWeightedLength,
         termFrequency: positions.length,
+        weightedTermFrequency: weightedFrequency(positions, fieldRanges),
         positions: Object.freeze(positions),
       }));
     }
@@ -595,7 +736,7 @@ async function analyzeDocumentFromRanges(context) {
       termPostings.size,
     );
   }
-  return Object.freeze({ termPostings, windows: Object.freeze(windows), totalLength });
+  return Object.freeze({ termPostings, windows: Object.freeze(windows), totalLength, totalWeightedLength });
 }
 
 function sourceMetadata(manifest) {
@@ -692,6 +833,7 @@ function documentMetadata(context, analysis, termFrequencies) {
     bucket: Math.floor(context.manifest.createdAt / 3_600_000),
     windowCount: analysis.windows.length,
     totalLength: analysis.totalLength,
+    totalWeightedLength: analysis.totalWeightedLength,
     termCount: termFrequencies.size,
     metadataLayout: "sharded-v2",
   });
@@ -851,6 +993,13 @@ async function prepareDelete(context, project) {
   if (documentCount < 0 || totalDocumentLength < 0) {
     throw new Error("BM25 deletion would make corpus statistics negative.");
   }
+  // An empty corpus has no weighted length by definition; forcing the exact
+  // value here (rather than trusting the running subtraction) stops a tiny
+  // rounding residue from either sign surviving into the next admission.
+  const totalWeightedDocumentLength = documentCount === 0 ? 0 : clampWeightedLengthResidue(
+    priorCorpus.totalWeightedDocumentLength - metadata.totalWeightedLength,
+    "BM25 deletion",
+  );
   const corpus = Object.freeze({
     bm25StatisticsVersion: BM25_INDEX_VERSION,
     tokenizerVersion: BM25_TOKENIZER_VERSION,
@@ -860,6 +1009,8 @@ async function prepareDelete(context, project) {
     documentCount,
     totalDocumentLength,
     averageDocumentLength: documentCount === 0 ? 0 : totalDocumentLength / documentCount,
+    totalWeightedDocumentLength,
+    averageWeightedDocumentLength: documentCount === 0 ? 0 : totalWeightedDocumentLength / documentCount,
   });
   const mutations = [];
   const changedDf = new Map();
@@ -990,6 +1141,7 @@ async function prepareDelete(context, project) {
         changedTermDfHash: termDfHash(changedDf),
         documentCount,
         totalDocumentLength,
+        totalWeightedDocumentLength,
       },
     },
   );
@@ -1054,16 +1206,27 @@ export function createBm25IndexHandler(options = {}) {
         generation: 0,
         documentCount: 0,
         totalDocumentLength: 0,
+        totalWeightedDocumentLength: 0,
       };
       const removedWindowCount = previousMetadata && !sameVersion ? previousMetadata.windowCount : 0;
       const removedLength = previousMetadata && !sameVersion ? previousMetadata.totalLength : 0;
+      const removedWeightedLength = previousMetadata && !sameVersion ? previousMetadata.totalWeightedLength : 0;
       const addedWindowCount = sameVersion ? 0 : analysis.windows.length;
       const addedLength = sameVersion ? 0 : analysis.totalLength;
+      const addedWeightedLength = sameVersion ? 0 : analysis.totalWeightedLength;
       const documentCount = priorCorpus.documentCount - removedWindowCount + addedWindowCount;
       const totalDocumentLength = priorCorpus.totalDocumentLength - removedLength + addedLength;
       if (documentCount < 0 || totalDocumentLength < 0) {
         throw new Error("BM25 corpus statistics would become negative.");
       }
+      // An empty corpus has no weighted length by definition; forcing the
+      // exact value here (rather than trusting the running arithmetic) stops
+      // a tiny rounding residue from either sign surviving into the next
+      // admission.
+      const totalWeightedDocumentLength = documentCount === 0 ? 0 : clampWeightedLengthResidue(
+        priorCorpus.totalWeightedDocumentLength - removedWeightedLength + addedWeightedLength,
+        "BM25 corpus statistics",
+      );
       const corpus = Object.freeze({
         bm25StatisticsVersion: BM25_INDEX_VERSION,
         tokenizerVersion: BM25_TOKENIZER_VERSION,
@@ -1073,6 +1236,8 @@ export function createBm25IndexHandler(options = {}) {
         documentCount,
         totalDocumentLength,
         averageDocumentLength: documentCount === 0 ? 0 : totalDocumentLength / documentCount,
+        totalWeightedDocumentLength,
+        averageWeightedDocumentLength: documentCount === 0 ? 0 : totalWeightedDocumentLength / documentCount,
       });
       const mutations = [];
       const changedDf = new Map();
@@ -1307,6 +1472,7 @@ export function createBm25IndexHandler(options = {}) {
           changedTermDfHash: termDfHash(changedDf),
           documentCount,
           totalDocumentLength,
+          totalWeightedDocumentLength,
         },
       });
       return {
@@ -1588,17 +1754,20 @@ function candidateScore(candidate, statistics, parameters, queryTermCount) {
   for (const [term, evidence] of [...candidate.evidence].sort(([left], [right]) => compareStrings(left, right))) {
     const termStatistics = statistics.terms[term];
     if (!termStatistics || termStatistics.documentFrequency <= 0) continue;
+    // The formula scores BM25F-weighted term frequency and window length
+    // (weight 1 everywhere a document has no resolvable structural
+    // messages), not the raw occurrence counts also carried on evidence.
     const score = bm25TermScore({
-      termFrequency: evidence.termFrequency,
-      documentLength: candidate.length,
-      averageDocumentLength: statistics.corpus.averageDocumentLength,
+      termFrequency: evidence.weightedTermFrequency,
+      documentLength: candidate.weightedLength,
+      averageDocumentLength: statistics.corpus.averageWeightedDocumentLength,
       documentFrequency: termStatistics.documentFrequency,
       documentCount: statistics.corpus.documentCount,
       ...parameters,
     });
     terms.push(Object.freeze({
       term,
-      termFrequency: evidence.termFrequency,
+      termFrequency: evidence.weightedTermFrequency,
       documentFrequency: termStatistics.documentFrequency,
       statisticsGeneration: termStatistics.generation,
       score,
@@ -1612,8 +1781,8 @@ function candidateScore(candidate, statistics, parameters, queryTermCount) {
     statisticsGeneration: statistics.generation,
     corpusStatisticsGeneration: statistics.corpus.generation,
     documentCount: statistics.corpus.documentCount,
-    documentLength: candidate.length,
-    averageDocumentLength: statistics.corpus.averageDocumentLength,
+    documentLength: candidate.weightedLength,
+    averageDocumentLength: statistics.corpus.averageWeightedDocumentLength,
     queryTermCount,
     terms: Object.freeze(terms),
   });
@@ -1759,6 +1928,7 @@ export async function searchBm25(view, request = {}, options = {}) {
           startByte: window.startByte,
           endByte: window.endByte,
           length: window.length,
+          weightedLength: window.weightedLength,
           kind: posting.kind,
           createdAt: posting.createdAt,
           sessionId: posting.sessionId,
@@ -1770,6 +1940,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       }
       candidate.evidence.set(term, {
         termFrequency: window.termFrequency,
+        weightedTermFrequency: window.weightedTermFrequency,
         positions: postingPositions(window),
       });
     }

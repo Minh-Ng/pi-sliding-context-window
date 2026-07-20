@@ -7,6 +7,7 @@ import { MAX_VISIBLE_SOURCE_KEYS } from "../src/store-contract.js";
 import { RETRIEVAL_REGRESSION_FIXTURE } from "../eval/retrieval/fixtures.js";
 import { scoreRetrievalSuite } from "../eval/retrieval/scoring.js";
 import { createSqliteEvaluationBackend } from "../eval/retrieval/sqlite-backend.js";
+import { structuralMessageScores } from "../src/structural.js";
 import {
   bm25InverseDocumentFrequency,
   bm25Keys,
@@ -42,6 +43,7 @@ function request(documentId, text, overrides = {}) {
     idempotencyKey: overrides.idempotencyKey ?? `bm25:${documentId}:${version}`,
     retentionClass: "conversation-source",
     ...(overrides.expiresAt === undefined ? {} : { expiresAt: overrides.expiresAt }),
+    ...(overrides.structuralMessages === undefined ? {} : { structuralMessages: overrides.structuralMessages }),
     document: {
       documentId,
       version,
@@ -315,6 +317,274 @@ test("IndexWorker publishes complete BM25 generations with recomputable scores",
     scope: "project",
   });
   assert.equal(superseded.results.some(({ documentId }) => documentId === "doc-tools"), false);
+});
+
+function windowPayload(store, project, documentId, version, term) {
+  return store.scan(bm25Keys.postingPrefix(project, term))
+    .map(({ payload }) => payload)
+    .find((posting) => posting.documentId === documentId && posting.documentVersion === version)
+    ?.window;
+}
+
+test("BM25F field weighting boosts user text and suppresses tool output relative to neutral", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "field-weighting"));
+  t.after(() => store.close());
+  const filler = "noise ".repeat(10);
+  const userSentence = "Where is REAP_DRAIN handled?";
+  const text = `[user] ${userSentence}\n[tool:bash] ${filler}`;
+  await admit(store, "doc-weighted", text, {
+    createdAt: 100,
+    // No positive question/request/correction/answer score, so this stays on
+    // the plain "user" tier rather than being promoted to "structural".
+    structuralMessages: [{
+      messageKey: "user:weighted",
+      messageIndex: 0,
+      role: "user",
+      createdAt: 100,
+      text: userSentence,
+      questionScore: 0,
+      requestScore: 0,
+      correctionScore: 0,
+      answerScore: 0,
+    }],
+  });
+  // Identical bytes, but with no structuralMessages at all: every token must
+  // fall back to neutral weight and reproduce the pre-field-weighting numbers.
+  await admit(store, "doc-neutral", text, { createdAt: 100 });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:field-weighting",
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain()).processed, 2);
+
+  const userTerm = "handl";
+  const toolTerm = "nois";
+  const weightedUserWindow = windowPayload(store, "/fixture/project", "doc-weighted", 1, userTerm);
+  const weightedToolWindow = windowPayload(store, "/fixture/project", "doc-weighted", 1, toolTerm);
+  const neutralUserWindow = windowPayload(store, "/fixture/project", "doc-neutral", 1, userTerm);
+  const neutralToolWindow = windowPayload(store, "/fixture/project", "doc-neutral", 1, toolTerm);
+
+  // A term inside the located user span is weighted up; a term in the
+  // unlocated remainder (tool output and message-boundary labels) is
+  // weighted down. Both postings see the same raw termFrequency either way.
+  assert.equal(weightedUserWindow.termFrequency, neutralUserWindow.termFrequency);
+  assert.ok(Math.abs(
+    weightedUserWindow.weightedTermFrequency - (weightedUserWindow.termFrequency * 2.25),
+  ) < 1e-9);
+  assert.equal(weightedToolWindow.termFrequency, neutralToolWindow.termFrequency);
+  assert.ok(Math.abs(
+    weightedToolWindow.weightedTermFrequency - (weightedToolWindow.termFrequency * 0.4),
+  ) < 1e-9);
+
+  // Without any structuralMessages, weighting is a no-op: weighted values
+  // equal the raw counts exactly, for both the boosted and the suppressed term.
+  assert.equal(neutralUserWindow.weightedTermFrequency, neutralUserWindow.termFrequency);
+  assert.equal(neutralToolWindow.weightedTermFrequency, neutralToolWindow.termFrequency);
+  assert.equal(neutralUserWindow.weightedLength, neutralUserWindow.length);
+
+  // The tool-heavy filler dominates raw length, so weighting it down pulls
+  // the weighted window length below the raw token count.
+  assert.ok(weightedUserWindow.weightedLength < weightedUserWindow.length);
+
+  // The short user sentence, once boosted, outranks the byte-identical
+  // neutral document for a query naming only its terms.
+  const response = await searchBm25(store, {
+    query: "REAP_DRAIN handled",
+    project: "/fixture/project",
+    scope: "session",
+    sessionIds: ["session-main"],
+    limit: 2,
+  });
+  assert.equal(response.results[0].documentId, "doc-weighted");
+  assert.ok(response.results[0].score > response.results[1].score);
+  assert.equal(response.results[0].score, recomputeBm25Score(response.results[0].explanation));
+});
+
+test("BM25F treats a decision-candidate document as a uniformly boosted title field", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "decision-candidate-weighting"));
+  t.after(() => store.close());
+  await admit(store, "decision-a", "The team selected warm-harbor as the release label.", {
+    kind: "decision-candidate",
+    createdAt: 100,
+  });
+  await admit(store, "turn-a", "The team selected warm-harbor as the release label.", {
+    kind: "turn",
+    createdAt: 100,
+  });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:decision-weighting",
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain()).processed, 2);
+
+  const decisionWindow = windowPayload(store, "/fixture/project", "decision-a", 1, "harbor");
+  const turnWindow = windowPayload(store, "/fixture/project", "turn-a", 1, "harbor");
+  assert.equal(decisionWindow.weightedTermFrequency, decisionWindow.termFrequency * 2.5);
+  assert.equal(decisionWindow.weightedLength, decisionWindow.length * 2.5);
+  assert.equal(turnWindow.weightedTermFrequency, turnWindow.termFrequency);
+});
+
+test("BM25F promotes a question-scored user message to the structural tier instead of plain user weight", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "structural-promotion"));
+  t.after(() => store.close());
+  const questionText = "How will background compaction reclaim tombstoned keys?";
+  const text = `[user] ${questionText}\n[assistant] It compacts affected ranges after leases expire.`;
+  await admit(store, "doc-question", text, {
+    createdAt: 100,
+    structuralMessages: [{
+      messageKey: "user:question",
+      messageIndex: 0,
+      role: "user",
+      createdAt: 100,
+      text: questionText,
+      questionScore: 100,
+      requestScore: 0,
+      correctionScore: 0,
+      answerScore: 0,
+    }],
+  });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:structural-promotion",
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain()).processed, 1);
+
+  const window = windowPayload(store, "/fixture/project", "doc-question", 1, "background");
+  assert.equal(window.weightedTermFrequency, window.termFrequency * 2.5);
+});
+
+test("BM25F keeps write-path fallback scores on the plain role tier and only promotes decisive cues", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "write-path-tiers"));
+  t.after(() => store.close());
+  // structuralMessageScores is the same function epoch-window.js calls to
+  // populate structuralMessages on the write path (not a fabricated
+  // all-zero or all-100 fixture). Its fallback scores for ordinary
+  // conversational text are never exactly 0 (question/request default to
+  // 10, a non-error assistant reply defaults to 75), so this proves the
+  // promotion threshold — not just a `> 0` check — is what keeps those
+  // spans on the plain user/assistant tier instead of collapsing every
+  // located span into the structural tier.
+  const statement = "The daemon writes checkpoints under the archive directory.";
+  const reply = "Understood, checkpoints land in the archive directory.";
+  const statementScores = structuralMessageScores({ role: "user", text: statement });
+  const replyScores = structuralMessageScores({
+    role: "assistant",
+    text: reply,
+    isTerminalAssistant: false,
+    stopReason: "stop",
+  });
+  assert.ok(statementScores.question > 0 && statementScores.question < 85);
+  assert.ok(replyScores.answer > 0 && replyScores.answer < 85);
+  await admit(store, "doc-fallback", `[user] ${statement}\n[assistant] ${reply}`, {
+    createdAt: 100,
+    structuralMessages: [
+      {
+        messageKey: "user:fallback",
+        messageIndex: 0,
+        role: "user",
+        createdAt: 100,
+        text: statement,
+        questionScore: statementScores.question,
+        requestScore: statementScores.request,
+        correctionScore: statementScores.correction,
+        answerScore: statementScores.answer,
+      },
+      {
+        messageKey: "assistant:fallback",
+        messageIndex: 1,
+        role: "assistant",
+        createdAt: 101,
+        text: reply,
+        questionScore: replyScores.question,
+        requestScore: replyScores.request,
+        correctionScore: replyScores.correction,
+        answerScore: replyScores.answer,
+      },
+    ],
+  });
+
+  const question = "How does the daemon avoid losing writes on crash?";
+  const answerScores = structuralMessageScores({
+    role: "assistant",
+    text: "It fsyncs the write-ahead log before acknowledging.",
+    isTerminalAssistant: true,
+    stopReason: "stop",
+  });
+  assert.equal(answerScores.answer, 100);
+  await admit(store, "doc-decisive", `[user] ${question}\n[assistant] It fsyncs the write-ahead log before acknowledging.`, {
+    createdAt: 100,
+    structuralMessages: [
+      {
+        messageKey: "user:decisive",
+        messageIndex: 0,
+        role: "user",
+        createdAt: 100,
+        text: question,
+        questionScore: structuralMessageScores({ role: "user", text: question }).question,
+        requestScore: 0,
+        correctionScore: 0,
+        answerScore: 0,
+      },
+      {
+        messageKey: "assistant:decisive",
+        messageIndex: 1,
+        role: "assistant",
+        createdAt: 101,
+        text: "It fsyncs the write-ahead log before acknowledging.",
+        questionScore: 0,
+        requestScore: 0,
+        correctionScore: 0,
+        answerScore: answerScores.answer,
+      },
+    ],
+  });
+
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:write-path-tiers",
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain()).processed, 2);
+
+  const userWindow = windowPayload(store, "/fixture/project", "doc-fallback", 1, "daemon");
+  assert.equal(userWindow.weightedTermFrequency, userWindow.termFrequency * 2.25);
+  const assistantWindow = windowPayload(store, "/fixture/project", "doc-fallback", 1, "understood");
+  assert.equal(assistantWindow.weightedTermFrequency, assistantWindow.termFrequency * 1.25);
+
+  const promotedUserWindow = windowPayload(store, "/fixture/project", "doc-decisive", 1, "avoid");
+  assert.equal(promotedUserWindow.weightedTermFrequency, promotedUserWindow.termFrequency * 2.5);
+  const promotedAssistantWindow = windowPayload(store, "/fixture/project", "doc-decisive", 1, "fsync");
+  assert.equal(promotedAssistantWindow.weightedTermFrequency, promotedAssistantWindow.termFrequency * 2.5);
+});
+
+test("BM25F field weighting is a no-op when structural messages cannot be located", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "unresolved-field-weighting"));
+  t.after(() => store.close());
+  const text = "The team selected warm-harbor as the release label.";
+  await admit(store, "doc-mismatch", text, {
+    createdAt: 100,
+    // This text never appears in the document, so location resolution fails
+    // and must fall back to neutral weighting rather than failing indexing.
+    structuralMessages: [{
+      messageKey: "user:mismatch",
+      messageIndex: 0,
+      role: "user",
+      createdAt: 100,
+      text: "This sentence is not present in the document.",
+      questionScore: 0,
+      requestScore: 0,
+      correctionScore: 0,
+      answerScore: 0,
+    }],
+  });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:unresolved-field-weighting",
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain({ throwOnError: true })).processed, 1);
+
+  const window = windowPayload(store, "/fixture/project", "doc-mismatch", 1, "harbor");
+  assert.equal(window.weightedTermFrequency, window.termFrequency);
+  assert.equal(window.weightedLength, window.length);
 });
 
 test("BM25 evidence identifies a single common query term without inflating its IDF", async (t) => {
@@ -679,4 +949,55 @@ test("expiring an old version preserves the newer BM25 pointer and final expiry 
   });
   assert.equal(statistics.corpus.documentCount, 0);
   assert.equal(statistics.terms.newterm, undefined);
+});
+
+test("BM25F weighted corpus statistics survive many expiries in a different order than admission", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "weighted-expiry-order"));
+  t.after(() => store.close());
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:weighted-expiry-order",
+    handlers: [createBm25IndexHandler()],
+  });
+  // Fractional field weights (2.5/2.25/1.25/0.4) make each document's
+  // weighted length a running float sum. Expiring documents in a different
+  // order than they were admitted has previously driven the corpus running
+  // total's floating-point residue negative even though the true value is
+  // exactly zero once every document is gone.
+  const fillerCounts = [7, 19, 3, 41, 11, 23];
+  for (const [index, fillerCount] of fillerCounts.entries()) {
+    const documentId = `weighted-${index}`;
+    const userSentence = `Where does document ${index} keep its state?`;
+    const filler = `chatter${index} `.repeat(fillerCount);
+    await admit(store, documentId, `[user] ${userSentence}\n[tool:bash] ${filler}`, {
+      createdAt: 10,
+      // Reverse expiry order relative to admission order: the last document
+      // admitted expires first.
+      expiresAt: 100 + (fillerCounts.length - 1 - index),
+      structuralMessages: [{
+        messageKey: `user:${documentId}`,
+        messageIndex: 0,
+        role: "user",
+        createdAt: 10,
+        text: userSentence,
+        questionScore: 0,
+        requestScore: 0,
+        correctionScore: 0,
+        answerScore: 0,
+      }],
+    });
+  }
+  await worker.drain();
+
+  for (let now = 100; now <= 105; now += 1) {
+    await assert.doesNotReject(
+      runRetention(store, { now, force: false, batchSize: 1 }),
+      `retention at now=${now} must not throw on weighted corpus statistics`,
+    );
+  }
+  const statistics = await readBm25Statistics(store, {
+    project: "/fixture/project",
+    terms: ["chatter0"],
+  });
+  assert.equal(statistics.corpus.documentCount, 0);
+  assert.equal(statistics.corpus.totalWeightedDocumentLength, 0);
 });

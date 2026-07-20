@@ -70,7 +70,7 @@ The normalized score is meaningful only within a retrieval mode until calibratio
 6. Exclude source keys already present in the live epoch.
 7. Return distinct source locations rather than repeated hits from one document.
 
-BM25 postings store term frequency and positions. Segment metadata stores document count, document lengths, and term document frequencies needed for deterministic scoring.
+BM25 postings store term frequency and positions. Segment metadata stores document count, document lengths, and term document frequencies needed for deterministic scoring. Term frequency and document length are BM25F-weighted at index time: user text outweighs assistant prose, which outweighs tool output, and question/request/correction/answer-scored spans plus whole decision-candidate documents get a boosted title-like weight; a document with no resolvable message-role structure scores exactly as the unweighted formula would. Field weighting is deterministic and index-time only, derived solely from each document's own `structuralMessages` and kind.
 
 **Index completeness**
 

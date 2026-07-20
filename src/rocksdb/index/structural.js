@@ -220,7 +220,10 @@ function prefixTable(needle) {
   return table;
 }
 
-async function structuralMessageLocations(context, messages) {
+/** Locate each message's exact byte range by a bounded forward source scan.
+ * Exported so BM25 field weighting can reuse the same resolution instead of
+ * re-implementing substring search over untrusted document text. */
+export async function structuralMessageLocations(context, messages) {
   if (messages.length === 0) return new Map();
   const needles = messages.map((message) => Buffer.from(message.text ?? "", "utf8"));
   if (needles.some((needle) => needle.length === 0)) {

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildTocMarkerText,
   contentToText,
+  deduplicateToolResults,
   ESTIMATED_IMAGE_CHARS,
   estimateMessageTokens,
   estimateTokens,
@@ -335,6 +336,84 @@ test("cumulative tool-result budget is forward-only within an epoch", () => {
   assert.equal(result.messages[1], filler);
   assert.match(result.messages[2].content[0].text, /arc-late/);
   assert.equal(result.overBudget, true);
+});
+
+test("suppresses an exact-duplicate tool result regardless of size and never touches the earlier one", () => {
+  const first = tool("same output", 1, "call-1");
+  const second = tool("same output", 2, "call-2");
+  const stored = [];
+  const result = deduplicateToolResults([first, second], {
+    store(message, text) {
+      stored.push([message.toolCallId, text]);
+      return "tool-dup-id";
+    },
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(stored.length, 1);
+  assert.deepEqual(stored[0], ["call-2", "same output"]);
+  // The earlier occurrence is byte-identical: never rewritten.
+  assert.equal(result.messages[0], first);
+  assert.match(result.messages[1].content[0].text, /identical to earlier result call-1/i);
+  assert.match(result.messages[1].content[0].text, /archived as tool-dup-id/);
+  assert.deepEqual(result.archiveIds, ["tool-dup-id"]);
+});
+
+test("leaves a near-match tool result (changed content) fully in place", () => {
+  const first = tool("output v1", 1, "call-1");
+  const second = tool("output v2", 2, "call-2"); // one byte different
+  const result = deduplicateToolResults([first, second], {
+    store() { throw new Error("must not archive a near-match"); },
+  });
+
+  assert.equal(result.changed, false);
+  assert.equal(result.messages[0], first);
+  assert.equal(result.messages[1], second);
+  assert.equal(result.messages[1].content[0].text, "output v2");
+  assert.deepEqual(result.archiveIds, []);
+});
+
+test("matches on tool name and normalized call arguments, not content alone", () => {
+  const readCall1 = toolCall({ path: "/a" }, 1, "call-1", "read");
+  const readResult1 = tool("shared bytes", 2, "call-1");
+  const readCall2 = toolCall({ path: "/b" }, 3, "call-2", "read"); // different arguments
+  const readResult2 = tool("shared bytes", 4, "call-2");
+
+  const result = deduplicateToolResults(
+    [readCall1, readResult1, readCall2, readResult2],
+    { store() { throw new Error("must not archive: arguments differ"); } },
+  );
+  assert.equal(result.changed, false);
+
+  // Same tool, same arguments (key order swapped), same content: this is a
+  // genuine duplicate even though the argument object's keys are reordered.
+  const writeCall1 = toolCall({ path: "/x", mode: "a" }, 5, "call-3", "write");
+  const writeResult1 = tool("wrote 3 bytes", 6, "call-3");
+  const writeCall2 = toolCall({ mode: "a", path: "/x" }, 7, "call-4", "write");
+  const writeResult2 = tool("wrote 3 bytes", 8, "call-4");
+
+  let archived;
+  const duplicate = deduplicateToolResults(
+    [writeCall1, writeResult1, writeCall2, writeResult2],
+    { store: () => { archived = true; return "tool-write-dup"; } },
+  );
+  assert.equal(archived, true);
+  assert.match(duplicate.messages[3].content[0].text, /archived as tool-write-dup/);
+});
+
+test("chains every later duplicate back to the same never-rewritten first occurrence", () => {
+  const first = tool("same output", 1, "call-1");
+  const second = tool("same output", 2, "call-2");
+  const third = tool("same output", 3, "call-3");
+  let calls = 0;
+  const result = deduplicateToolResults([first, second, third], {
+    store: () => `tool-dup-${(calls += 1)}`,
+  });
+
+  assert.equal(result.messages[0], first);
+  assert.match(result.messages[1].content[0].text, /identical to earlier result call-1.*archived as tool-dup-1/is);
+  assert.match(result.messages[2].content[0].text, /identical to earlier result call-1.*archived as tool-dup-2/is);
+  assert.deepEqual(result.archiveIds, ["tool-dup-1", "tool-dup-2"]);
 });
 
 test("externalizes large tool-call arguments deterministically without disturbing other content", () => {

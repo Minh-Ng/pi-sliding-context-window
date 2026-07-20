@@ -30,6 +30,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   // tightening (rotation triggers before results alone can reach the target).
   toolResultBudgetRatio: 0.3,
   toolResultBudgetFloorTokens: 1_000,
+  // Forward-only: an exact-duplicate tool result (same tool name, normalized
+  // arguments, and content hash as one already admitted this epoch) is
+  // externalized regardless of size instead of re-admitted in full. The
+  // earlier occurrence is never rewritten.
+  dedupToolResults: true,
   maxInlineUserTokens: 16_000,
   searchResults: 3,
   searchResultTokens: 1_500,
@@ -423,6 +428,10 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     maxToolArgumentTokens: numeric("maxToolArgumentTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_TOOL_ARGUMENT_TOKENS),
     toolResultBudgetRatio: numeric("toolResultBudgetRatio", parsePositiveRatio, env.CONTEXT_WINDOW_TOOL_RESULT_BUDGET_RATIO),
     toolResultBudgetFloorTokens: numeric("toolResultBudgetFloorTokens", parsePositiveInteger, env.CONTEXT_WINDOW_TOOL_RESULT_BUDGET_FLOOR_TOKENS),
+    dedupToolResults: booleanValue(
+      env.CONTEXT_WINDOW_DEDUP_TOOL_RESULTS ?? merged.dedupToolResults,
+      DEFAULT_CONFIG.dedupToolResults,
+    ),
     maxInlineUserTokens: numeric("maxInlineUserTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS),
     searchResults: numeric("searchResults", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULTS),
     searchResultTokens: numeric("searchResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULT_TOKENS),

@@ -127,6 +127,7 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(defaults.maxInlineUserTokens, 16_000);
     assert.equal(defaults.toolResultBudgetRatio, 0.3);
     assert.equal(defaults.toolResultBudgetFloorTokens, 1_000);
+    assert.equal(defaults.dedupToolResults, true);
     assert.equal(defaults.ephemeralAutoRetrievalDays, 7);
     assert.equal(defaults.conversationAutoRetrievalDays, 30);
     assert.equal(defaults.derivedAutoRetrievalDays, 30);
@@ -243,6 +244,40 @@ test("tool-result budget knobs resolve from env, settings, and defaults", () => 
     });
     assert.equal(invalid.toolResultBudgetRatio, 0.15);
     assert.equal(invalid.toolResultBudgetFloorTokens, 2_000);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("dedupToolResults defaults on and resolves from settings, then environment", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-dedup-"));
+  try {
+    const defaults = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(defaults.dedupToolResults, true);
+
+    mkdirSync(join(directory, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(directory, ".pi", "agent", "context-window.json"),
+      JSON.stringify({ dedupToolResults: false }),
+    );
+    const fromSettings = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(fromSettings.dedupToolResults, false);
+
+    const fromEnv = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: { CONTEXT_WINDOW_DEDUP_TOOL_RESULTS: "false" },
+      home: directory,
+    });
+    assert.equal(fromEnv.dedupToolResults, false);
+
+    const envOverridesSettings = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: { CONTEXT_WINDOW_DEDUP_TOOL_RESULTS: "true" },
+      home: directory,
+    });
+    assert.equal(envOverridesSettings.dedupToolResults, true);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

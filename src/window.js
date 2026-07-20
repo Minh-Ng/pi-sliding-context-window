@@ -502,6 +502,94 @@ export function externalizeLargeToolArguments(messages, {
   return { messages: changed ? output : messages, changed, archiveIds };
 }
 
+function canonicalJsonValue(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJsonValue).join(",")}]`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJsonValue(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+// Key ordering must never change the dedup decision, so arguments are
+// serialized with sorted object keys rather than reusing the issued-order
+// stringification used for the externalized-argument preview.
+function normalizedToolArguments(value) {
+  if (value === undefined) return "";
+  try {
+    return canonicalJsonValue(value);
+  } catch {
+    return stringifyToolCallArguments(value);
+  }
+}
+
+function toolCallArgumentsIndex(messages) {
+  const byCallId = new Map();
+  for (const message of messages) {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!part || typeof part !== "object") continue;
+      if (part.type !== "toolCall" && part.type !== "tool_call") continue;
+      const id = String(part.id ?? part.toolCallId ?? part.tool_call_id ?? "");
+      if (!id) continue;
+      byCallId.set(id, normalizedToolArguments(part[toolCallArgumentField(part)]));
+    }
+  }
+  return byCallId;
+}
+
+/**
+ * Suppress duplicate tool results within the active epoch: forward-only,
+ * comparing (tool name + normalized call arguments + exact content hash)
+ * against results already admitted earlier in this same pass. On an exact
+ * match, the NEW occurrence is externalized regardless of size — its raw
+ * text is archived via `store` exactly as issued, and a short marker
+ * ("identical to earlier result <ref>, archived as <id>") replaces it. A
+ * near-match (any single byte different) is never touched.
+ *
+ * The earlier occurrence is never rewritten — only later duplicates are
+ * ever replaced — so this stays append-only and preserves the provider
+ * prompt cache exactly like externalizeLargeToolResults.
+ *
+ * The comparison map is local to this call and derived only from the
+ * `messages` passed in; it is not persisted. That makes it reconstruct
+ * deterministically on resume (recomputed from the same boundary-filtered
+ * active slice every pass) and reset naturally at rotation (the active
+ * slice starts over from the new, shorter boundary).
+ */
+export function deduplicateToolResults(messages, { store } = {}) {
+  const callArguments = toolCallArgumentsIndex(messages);
+  const seen = new Map();
+  let changed = false;
+  const archiveIds = [];
+  const output = messages.map((message) => {
+    const isToolResult = message?.role === "toolResult" || message?.role === "tool";
+    if (!isToolResult) return message;
+    const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
+    const toolName = String(message.toolName ?? message.name ?? "");
+    const normalizedArguments = callArguments.get(toolCallId) ?? "";
+    const text = contentToText(message.content);
+    const digest = createHash("sha256").update(text).digest("hex");
+    const key = `${toolName}\0${normalizedArguments}\0${digest}`;
+    const earlier = seen.get(key);
+    if (earlier === undefined) {
+      seen.set(key, { ref: toolCallId || messageKey(message) });
+      return message;
+    }
+
+    const id = store(message, text);
+    if (!id) {
+      // Archival failed; leave the duplicate inline rather than lose content.
+      return message;
+    }
+    archiveIds.push(id);
+    changed = true;
+    const marker = `[Identical to earlier result ${earlier.ref} in this conversation, archived as ${id}; use context_recall on ${id} if needed.]`;
+    return { ...message, content: replaceTextContent(message.content, marker) };
+  });
+  return { messages: changed ? output : messages, changed, archiveIds };
+}
+
 export const TOC_TERMS_PER_ENTRY = 8;
 export const TOC_TOPIC_CHARS = 80;
 export const TOC_TOKEN_BUDGET = 1_000;

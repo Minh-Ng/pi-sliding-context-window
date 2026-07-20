@@ -44,6 +44,7 @@ Default policy:
 - Archive removed interaction groups in `~/.pi/context-window/archive.rocks` through the shared daemon.
 - Record each archived turn/preamble's ordered stable source message keys, explicit first/last keys, source count, session, project, archive kind, and creation time. Keys hash the complete deterministic message serialization. Exact recall shows this provenance in Pi and MCP; Pi also returns it as structured tool-result details for host/UI consumers.
 - Externalize individual tool results above **4K estimated tokens before the provider sees them**, recording the one original source message key while keeping the resulting document distinct from an archived turn. A cumulative companion guards against aggregate creep: once tool results admitted into the active epoch reach **30% of the rotation target** (`toolResultBudgetRatio`), new tool results externalize above the lower **1K-token floor** (`toolResultBudgetFloorTokens`) instead of the 4K gate. The tightening is forward-only — each result's decision depends only on results before it, so the exposed prefix and its provider prompt cache are never rewritten — and the running counter is recomputed deterministically from the boundary-filtered epoch on every pass (including resume) and resets on rotation. Oversized tool-call arguments keep their own separate `maxToolArgumentTokens` gate and do not count toward this budget.
+- Suppress exact-duplicate tool results within the active epoch (`dedupToolResults`, default on): when a new tool result's tool name, normalized call arguments, and content hash exactly match a result already admitted this epoch, the new occurrence is externalized regardless of size and replaced with a short marker naming the earlier result and the new archive id. The earlier occurrence is never rewritten, and a near-match (any changed byte) is left in place untouched. The comparison map is recomputed from the boundary-filtered active slice on every pass, so it rebuilds deterministically on resume and resets when rotation starts a new epoch; a suppressed duplicate does not count toward the cumulative tool-result budget above.
 - Session-scoped search in a fork includes that session's verified parent archive lineage immediately, even if no ancestor has rotated. Ancestor identities come only from structurally valid Pi JSONL session headers; persisted rotation entries retain lineage only as informational state and cannot grant search access. Stable path identity is reserved for the current session when Pi does not provide its ID.
 - Keep exact source session entries unchanged. Archived text is deterministic source-derived message serialization, not stored raw message objects. Pi's `bashExecution`, `compactionSummary`, and `branchSummary` roles are serialized from their native payload fields so token estimates, stable keys, and archived preambles include their actual command/output or summary text.
 - Before accounting or provider dispatch, archive user input above the default 16K-token inline limit exactly. Only the provider-facing text receives a bounded head/tail preview; non-text blocks remain present, automatic retrieval skips that still-visible source, and the Pi transcript stays unchanged. Admission failure aborts the turn without exposing the raw oversized text.
@@ -184,6 +185,7 @@ Use the `context-window` namespace in Pi's shared settings files:
     "maxToolResultTokens": 4000,
     "toolResultBudgetRatio": 0.3,
     "toolResultBudgetFloorTokens": 1000,
+    "dedupToolResults": true,
     "maxInlineUserTokens": 16000,
     "searchResults": 3,
     "searchResultTokens": 1500,
@@ -240,6 +242,7 @@ CONTEXT_WINDOW_HARD_LIMIT_TOKENS
 CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS
 CONTEXT_WINDOW_RETAIN_TURNS
 CONTEXT_WINDOW_MAX_TOOL_RESULT_TOKENS
+CONTEXT_WINDOW_DEDUP_TOOL_RESULTS
 CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS
 CONTEXT_WINDOW_SEARCH_RESULTS
 CONTEXT_WINDOW_SEARCH_RESULT_TOKENS

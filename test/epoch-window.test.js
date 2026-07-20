@@ -872,6 +872,194 @@ test("rotation resets the tool-result budget counter to the retained epoch", () 
   assert.equal(session.status().toolResultOverBudget, false);
 });
 
+test("an exact-duplicate tool result is suppressed and archived regardless of size, leaving the earlier one untouched", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "dedup-session",
+    project: "/project",
+  });
+  const messages = [
+    user("read the file twice", 1),
+    toolResult("shared bytes", 2, "call-1"),
+    toolResult("shared bytes", 3, "call-2"),
+  ];
+
+  const result = session.process(messages, { contextWindow: 200_000 });
+
+  // The earlier occurrence is byte-identical to the source message.
+  assert.equal(result[1].content[0].text, "shared bytes");
+  const [document] = [...archive.documents.values()];
+  assert.equal(document.kind, "tool-result");
+  // Archived regardless of size: "shared bytes" is far below any size gate.
+  assert.equal(document.text, "shared bytes");
+  assert.match(result[2].content[0].text, /identical to earlier result call-1 in this conversation/i);
+  assert.match(result[2].content[0].text, new RegExp(`archived as ${document.id}`));
+  // The marker's own archive ID recalls the exact duplicate content.
+  assert.equal(session.recall(document.id).text, "shared bytes");
+});
+
+test("a near-match tool result (same tool, changed content) is never suppressed", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "near-match-session",
+    project: "/project",
+  });
+  const messages = [
+    user("read the file, then read it again after editing", 1),
+    toolResult("file contents v1", 2, "call-1"),
+    toolResult("file contents v2", 3, "call-2"),
+  ];
+
+  const result = session.process(messages, { contextWindow: 200_000 });
+
+  assert.equal(result[1].content[0].text, "file contents v1");
+  assert.equal(result[2].content[0].text, "file contents v2");
+  assert.equal([...archive.documents.values()].some((document) => document.kind === "tool-result"), false);
+});
+
+test("dedupToolResults: false keeps every duplicate tool result in full", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, dedupToolResults: false },
+    sessionId: "dedup-disabled-session",
+    project: "/project",
+  });
+  const messages = [
+    user("read the file twice", 1),
+    toolResult("shared bytes", 2, "call-1"),
+    toolResult("shared bytes", 3, "call-2"),
+  ];
+
+  const result = session.process(messages, { contextWindow: 200_000 });
+
+  assert.equal(result[1].content[0].text, "shared bytes");
+  assert.equal(result[2].content[0].text, "shared bytes");
+  assert.equal([...archive.documents.values()].some((document) => document.kind === "tool-result"), false);
+});
+
+test("resume rebuilds the per-epoch duplicate map deterministically from the retained slice", () => {
+  const dedupConfig = { ...config, rotationTurns: 3, retainTurns: 2 };
+  const messages = [
+    user("one", 1), assistant("ack one", 2),
+    user("two", 3), toolResult("payload", 4, "call-1"), assistant("ack two", 5),
+    user("three", 6), toolResult("payload", 7, "call-2"), assistant("ack three", 8),
+  ];
+
+  const archive = memoryArchive();
+  const rotations = [];
+  const session = new EpochWindowSession({
+    archive,
+    config: dedupConfig,
+    sessionId: "resume-dedup-session",
+    project: "/project",
+    onRotation: (state) => rotations.push(state),
+  });
+  const first = session.process(messages, { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+
+  const toolMessages = first.filter((message) => message.role === "toolResult");
+  assert.equal(toolMessages.length, 2);
+  assert.equal(toolMessages[0].content[0].text, "payload");
+  assert.match(toolMessages[1].content[0].text, /identical to earlier result call-1/i);
+  const [dupId] = [...archive.documents.values()]
+    .filter((document) => document.kind === "tool-result")
+    .map((document) => document.id);
+  assert.match(toolMessages[1].content[0].text, new RegExp(`archived as ${dupId}`));
+
+  const restored = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: dedupConfig,
+    sessionId: "resume-dedup-session",
+    project: "/project",
+  });
+  restored.restore([{ type: "custom", customType: ROTATION_STATE_ENTRY, data: rotations.at(-1) }]);
+  const resumed = restored.process(messages, { contextWindow: 200_000 });
+
+  // The comparison map is not persisted; it is rebuilt from the same
+  // boundary-filtered active slice and reproduces byte-identical output.
+  assert.deepEqual(resumed, first);
+  const resumedToolMessages = resumed.filter((message) => message.role === "toolResult");
+  assert.equal(resumedToolMessages[0].content[0].text, "payload");
+  assert.match(resumedToolMessages[1].content[0].text, new RegExp(`archived as ${dupId}`));
+});
+
+test("rotation resets the duplicate map: a repeat in a new epoch is not suppressed", () => {
+  // Within the one call that decides to rotate, the pre-rotation active set
+  // (all turns present so far) is what dedup and the size-based gates both
+  // compare against — the same forward-only shape the tool-result budget
+  // already uses. What "resets on rotation" means is the NEXT call: once the
+  // boundary has actually advanced, the rotated-out turn is genuinely absent
+  // from every later call's active slice, so a later repeat of its content
+  // has no earlier occurrence to match.
+  const dedupConfig = { ...config, rotationTurns: 3, retainTurns: 1 };
+  const turnA = [user("one", 1), toolResult("payload", 2, "call-1"), assistant("ack one", 3)];
+  const turnB = [user("two", 4), assistant("ack two", 5)];
+  const turnC = [user("three", 6), assistant("ack three", 7)];
+  const turnD = [user("four", 8), toolResult("payload", 9, "call-2"), assistant("ack four", 10)];
+
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: dedupConfig,
+    sessionId: "reset-dedup-session",
+    project: "/project",
+  });
+
+  // First call: three turns trip rotationTurns=3; retainTurns=1 keeps only
+  // turnC, so turnA's "payload" tool result leaves the active window for
+  // every later call.
+  session.process([...turnA, ...turnB, ...turnC], { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+  assert.equal([...archive.documents.values()].some((document) => document.kind === "tool-result"), false);
+
+  // Second call: turnD repeats turnA's exact tool-result text, but the
+  // active slice (turnC + turnD, below rotationTurns=3) no longer contains
+  // turnA at all, so the map has reset and this is not suppressed.
+  const result = session.process([...turnA, ...turnB, ...turnC, ...turnD], { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+  const toolMessages = result.filter((message) => message.role === "toolResult");
+  assert.equal(toolMessages.length, 1);
+  assert.equal(toolMessages[0].content[0].text, "payload");
+  assert.equal([...archive.documents.values()].some((document) => document.kind === "tool-result"), false);
+});
+
+test("a suppressed duplicate does not count toward the cumulative tool-result budget", () => {
+  const budgetConfig = {
+    ...config,
+    rotationTurns: 50,
+    maxToolResultTokens: 4_000, // base gate 16,000 chars; one 6,000-char payload clears it
+    toolResultBudgetRatio: 0.02, // budget = 2,000 tokens = 8,000 chars
+    toolResultBudgetFloorTokens: 500,
+  };
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "dedup-budget-session",
+    project: "/project",
+  });
+  const payload = "x".repeat(6_000); // 1,500 tokens; two raw copies would be 3,000 (over budget)
+  const messages = [
+    user("run tools", 1),
+    toolResult(payload, 2, "call-1"),
+    toolResult(payload, 3, "call-2"), // exact duplicate; must collapse to a short marker
+  ];
+
+  session.process(messages, { contextWindow: 200_000 });
+  const status = session.status();
+  // If the duplicate were admitted in full, two 6,000-char copies (3,000
+  // tokens) would exceed the 2,000-token budget. Collapsed to a marker, only
+  // one real copy plus a short marker is admitted, staying well under it.
+  assert.equal(status.toolResultOverBudget, false);
+  assert.ok(status.toolResultTokens < 1_700);
+  assert.ok(status.toolResultTokens < Math.ceil((payload.length * 2) / 4));
+});
+
 test("multi-turn rotation protects every new TOC target before cleanup", () => {
   const archive = pressureArchive(1);
   const session = new EpochWindowSession({

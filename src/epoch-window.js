@@ -11,6 +11,7 @@ import { estimateModelVisibleTokens } from "./model-token-budget.js";
 import {
   buildTocMarkerText,
   contentToText,
+  deduplicateToolResults,
   estimateTokens,
   extractDecisionCandidates,
   extractSalientTerms,
@@ -631,6 +632,14 @@ export class EpochWindowSession {
     active = oversized.messages;
     const suppressedHintMessageKeys = oversized.providerMessageKeys;
     this.activeArchiveIds = new Set(oversized.archiveIds);
+    const dedupEnabled = this.config.dedupToolResults !== false;
+    const deduplicated = dedupEnabled
+      ? deduplicateToolResults(active, {
+        store: (message, text) => this.storeToolResult(message, text),
+      })
+      : { messages: active, archiveIds: [] };
+    active = deduplicated.messages;
+    for (const id of deduplicated.archiveIds) this.activeArchiveIds.add(id);
     const budgetPolicy = resolveToolResultBudget(
       this.config,
       this.contextLimits.rotationTokens,

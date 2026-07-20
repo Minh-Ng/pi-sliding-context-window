@@ -676,6 +676,25 @@ const migrationStatus = object({
   checkpoint: jsonValue,
 }, ["phase", "migratedCount", "failedCount", "comparisonFailures", "rollbackEligible"]);
 
+const shownRecalledStats = object({ shown: nonNegativeInteger, recalled: nonNegativeInteger });
+const feedbackStatsResponse = object({
+  events: nonNegativeInteger,
+  shownTotal: nonNegativeInteger,
+  recalledTotal: nonNegativeInteger,
+  byMode: { type: "object", additionalProperties: shownRecalledStats },
+  byRank: array(object({
+    rank: nonNegativeInteger,
+    shown: nonNegativeInteger,
+    recalled: nonNegativeInteger,
+  })),
+  queries: array(object({
+    query: string({ maxLength: 65_536 }),
+    searches: nonNegativeInteger,
+    shown: nonNegativeInteger,
+    recalled: nonNegativeInteger,
+  })),
+});
+
 /**
  * Runtime schemas for every store and daemon operation. Operation names are
  * stable protocol identifiers, not JavaScript method names.
@@ -904,6 +923,12 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
   "retention.status": {
     request: object({}),
     result: retentionStats,
+  },
+  "feedback.stats": {
+    request: object({
+      queryLimit: integer({ minimum: 1, maximum: 1_000 }),
+    }, []),
+    result: feedbackStatsResponse,
   },
   "store.compact": {
     request: object({

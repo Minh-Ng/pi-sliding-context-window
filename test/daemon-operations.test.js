@@ -35,6 +35,7 @@ async function runningRuntime(t, runtimeOptions = {}, daemonOptions = {}) {
     "store.redact",
     "retention.run",
     "retention.status",
+    "feedback.stats",
     "store.compact",
   ];
   const operationHandlers = Object.fromEntries(names.map((name) => [
@@ -860,6 +861,62 @@ test("store.get reports ledger-retired exact versions without exposing them acro
     documentId: "turn-1",
     version: 1,
   })).status, "missing");
+});
+
+test("feedback.stats reports shown-vs-recalled usage over the daemon wire", async (t) => {
+  const { socketPath } = await runningRuntime(t);
+  const project = "/workspace/feedback-wire";
+  const client = new StoreClient({ socketPath, project });
+  const foreign = new StoreClient({ socketPath, project: "/workspace/feedback-foreign" });
+  t.after(() => {
+    client.close();
+    foreign.close();
+  });
+
+  await client.request("store.put", {
+    idempotencyKey: "feedback-wire-put",
+    document: document(project, Date.now()),
+    retentionClass: "conversation-source",
+  }, { retry: false });
+
+  const found = await client.request("store.search", {
+    query: "REAP_DRAIN",
+    relation: null,
+    scope: "session",
+    sessionIds: ["session-1"],
+    project,
+    limit: 3,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 160,
+  });
+  assert.equal(found.status, "resolved");
+
+  const recalled = await client.request("store.recall", {
+    locator: found.results[0].locator,
+    neighbors: 0,
+    maxTokens: 100,
+    sessionIds: ["session-1"],
+  });
+  assert.equal(recalled.status, "resolved");
+
+  const stats = await client.request("feedback.stats", {});
+  assert.equal(stats.events, 1);
+  assert.equal(stats.shownTotal, found.results.length);
+  assert.equal(stats.recalledTotal, 1);
+  assert.equal(stats.byRank[0].recalled, 1);
+  assert.equal(stats.queries[0].query, "REAP_DRAIN");
+  assert.equal(stats.queries[0].recalled, 1);
+
+  // The click log is project-scoped: a foreign connection never sees it.
+  const foreignStats = await foreign.request("feedback.stats", {});
+  assert.deepEqual(foreignStats, {
+    events: 0,
+    shownTotal: 0,
+    recalledTotal: 0,
+    byMode: {},
+    byRank: [],
+    queries: [],
+  });
 });
 
 test("automatic maintenance schedules background compaction while operator requests stay explicit", async (t) => {

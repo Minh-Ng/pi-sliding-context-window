@@ -551,11 +551,25 @@ export async function searchArchive(store, request, options = {}) {
     && ["ambiguous", "legacy-fallback"].includes(collected.structuralStatus)) {
     status = collected.structuralStatus;
   }
-  return assertStoreResult("store.search", {
+  const result = assertStoreResult("store.search", {
     mode: collected.mode,
     status,
     indexGeneration: collected.generation,
     results,
     expiredMatches: collected.expiredMatches,
   });
+  // Implicit relevance feedback: hand the presented results (query, ranks,
+  // modes, scores, locators) to an optional local recorder. The daemon supplies
+  // a recorder that never throws; search behavior is otherwise unchanged.
+  if (typeof options.recordShownResults === "function") {
+    await options.recordShownResults({
+      project: normalized.project,
+      query: normalized.query,
+      mode: result.mode,
+      status: result.status,
+      results: result.results,
+      now: options.now ?? Date.now(),
+    });
+  }
+  return result;
 }

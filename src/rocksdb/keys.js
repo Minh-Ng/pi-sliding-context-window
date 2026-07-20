@@ -22,6 +22,7 @@ export const KEYSPACE = Object.freeze({
   EVENT_REFERENCE: "event-reference",
   EXACT: "exact",
   EXPIRY: "expiry",
+  FEEDBACK: "feedback",
   IDEMPOTENCY: "idempotency",
   LEASE: "lease",
   META: "meta",

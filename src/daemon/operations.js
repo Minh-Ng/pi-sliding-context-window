@@ -34,10 +34,16 @@ import { cleanupExpiredLeases } from "../retrieval/leases.js";
 import { gatherArchive } from "../retrieval/gather.js";
 import { clearScopedHints, removeFrozenHint } from "../retrieval/hints.js";
 import { recallArchive } from "../retrieval/recall.js";
+import { normalizeRenderFormat } from "../retrieval/render.js";
 import { preflightArchive } from "../retrieval/preflight.js";
 import { searchArchive } from "../retrieval/search.js";
 import { traverseArchive } from "../retrieval/traverse.js";
 import { LocalSemanticIndex } from "../semantic/index.js";
+import {
+  recordRecalledLocator,
+  recordShownResults,
+  relevanceFeedbackStats,
+} from "../retrieval/relevance-feedback.js";
 import {
   MAX_DIRECT_CHUNK_TABLE_ENTRIES,
   MAX_DIRECT_DOCUMENT_RESPONSE_BYTES,
@@ -251,6 +257,10 @@ export class DaemonOperations {
       ...(options.semantic ?? {}),
       recordError: (error) => this.recordBackgroundError(error),
     });
+    // Experimental recall packet format; "json-v1" unless explicitly opted in.
+    this.renderFormat = normalizeRenderFormat(
+      options.renderFormat ?? process.env.CONTEXT_WINDOW_RECALL_FORMAT,
+    );
     this.maintenance = new DaemonMaintenance(store, {
       ...(options.maintenance ?? {}),
       runRetention: (payload) => this.runRetentionWave(payload, {
@@ -555,6 +565,7 @@ export class DaemonOperations {
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
     return searchArchive(this.store, { ...payload, project: context.project }, {
       semantic: this.semantic,
+      recordShownResults: (event) => this.recordRelevanceFeedback(event),
     });
   }
 
@@ -566,6 +577,7 @@ export class DaemonOperations {
     return gatherArchive(this.store, payload, {
       project: context.project,
       semantic: this.semantic,
+      renderFormat: this.renderFormat,
     });
   }
 
@@ -573,10 +585,39 @@ export class DaemonOperations {
     return traverseArchive(this.store, payload, { project: context.project });
   }
 
-  recall(payload, context) {
-    return recallArchive(this.store, payload, {
+  // Implicit relevance feedback is a local, replayable-from-nothing side log:
+  // never let a feedback write turn a served search or recall into a failure.
+  async recordRelevanceFeedback(event) {
+    try {
+      await recordShownResults(this.store, event);
+    } catch (error) {
+      this.recordBackgroundError(error);
+    }
+  }
+
+  async recall(payload, context) {
+    const result = await recallArchive(this.store, payload, {
       project: context.project,
       sessionIds: payload.sessionIds ?? [],
+      renderFormat: this.renderFormat,
+    });
+    try {
+      await recordRecalledLocator(this.store, {
+        project: context.project,
+        locator: payload.locator,
+        status: result.status,
+        now: Date.now(),
+      });
+    } catch (error) {
+      this.recordBackgroundError(error);
+    }
+    return result;
+  }
+
+  feedbackStats(payload, context) {
+    return relevanceFeedbackStats(this.store, {
+      project: context.project,
+      queryLimit: payload.queryLimit,
     });
   }
 
@@ -916,6 +957,7 @@ export class DaemonOperations {
       "store.redact": (payload, context) => this.redact(payload, context),
       "retention.run": (payload, context) => this.retention(payload, context),
       "retention.status": (_payload, context) => retentionStatus(this.store, { project: context.project }),
+      "feedback.stats": (payload, context) => this.feedbackStats(payload, context),
       "store.compact": (payload) => this.compact(payload),
     };
   }

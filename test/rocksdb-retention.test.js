@@ -42,12 +42,18 @@ import {
   RocksStore,
   StoreKeySizeError,
 } from "../src/rocksdb/store.js";
-import { KEYSPACE } from "../src/rocksdb/keys.js";
+import { keyFor, KEYSPACE } from "../src/rocksdb/keys.js";
 import {
   createRetrievalLease,
   hasActiveDocumentLease,
   leaseKeys,
 } from "../src/retrieval/leases.js";
+import {
+  documentRecallCount,
+  recallCounterName,
+  recordRecalledLocator,
+  recordShownResults,
+} from "../src/retrieval/relevance-feedback.js";
 import { MAX_PROTECTED_DOCUMENT_VERSIONS } from "../src/store-contract.js";
 
 const protectMemoryFixture = new URL("../test-support/protect-memory-child.js", import.meta.url);
@@ -155,6 +161,50 @@ test("expiry tombstones first and removes canonical plus derived records", async
     deletedKeys: 0,
     protected: 0,
   });
+});
+
+test("retention deletes the durable recall counter alongside the canonical document", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "retention-recall-counter"));
+  t.after(() => store.close());
+  const candidate = document("recalled");
+  await admit(store, candidate, 100);
+  await indexAll(store);
+
+  // Reproduce the durable per-document recall tally the way relevance
+  // feedback's join records it (see relevance-feedback.test.js): a shown
+  // result, then a resolved recall of that shown locator.
+  const locator = "cw1.retention-recall-counter.fixture";
+  await recordShownResults(store, {
+    project: candidate.project,
+    query: "RETAIN_RECALLED",
+    mode: "lexical",
+    status: "resolved",
+    results: [{
+      documentId: candidate.documentId,
+      version: 1,
+      locator,
+      retrievalMode: "lexical",
+      score: 1,
+      rawScore: 1,
+    }],
+    now: 50,
+  });
+  await recordRecalledLocator(store, { project: candidate.project, locator, status: "resolved", now: 60 });
+
+  const counterKey = keyFor.counter(recallCounterName(candidate.project, candidate.documentId, 1));
+  assert.equal(
+    await documentRecallCount(store, { project: candidate.project, documentId: candidate.documentId, version: 1 }),
+    1,
+  );
+  assert.notEqual(await store.get(counterKey), undefined);
+
+  await runRetention(store, retentionRequest(200));
+  assert.equal(await readCanonicalDocument(store, candidate.documentId, 1), undefined);
+  // The durable recall counter is a plain local counter, not a registered
+  // derived reference, so it must be deleted explicitly alongside the
+  // canonical document — otherwise dead per-document counter keys
+  // accumulate unboundedly across retention cycles.
+  assert.equal(await store.get(counterKey), undefined);
 });
 
 test("retention defers canonical deletion when bounded index publication is incomplete", async (t) => {

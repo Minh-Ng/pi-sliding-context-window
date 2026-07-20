@@ -7,9 +7,11 @@ import {
   cleanupExpiredLeases,
   hasActiveDocumentLease,
 } from "../retrieval/leases.js";
+import { recallCounterName } from "../retrieval/relevance-feedback.js";
 import { createBm25IndexHandler } from "./index/bm25.js";
 import { createExactIndexHandler } from "./index/exact.js";
 import { createStructuralIndexHandler } from "./index/structural.js";
+import { createImportanceIndexHandler } from "./index/importance.js";
 import { IndexWorker } from "./indexer.js";
 import { derivedKeys } from "./derived.js";
 import { KEYSPACE, keyFor } from "./keys.js";
@@ -902,6 +904,7 @@ function createRetentionIndexWorker(store) {
       createExactIndexHandler(),
       createBm25IndexHandler(),
       createStructuralIndexHandler(),
+      createImportanceIndexHandler(),
     ],
   });
 }
@@ -1200,13 +1203,15 @@ async function cleanupPointPhase(
   nextPhase,
   guard,
   workLimit,
-  { removeGuard = false } = {},
+  { removeGuard = false, extraKeys = [] } = {},
 ) {
-  const requiredWork = Number(key !== undefined) + Number(guard !== undefined && removeGuard);
+  const requiredWork = Number(key !== undefined) + Number(guard !== undefined && removeGuard)
+    + extraKeys.length;
   if (workLimit < Math.max(1, requiredWork)) {
     return { work: 0, deleted: 0, progressed: false };
   }
   const exists = key !== undefined && await store.has(key);
+  const extraExists = await Promise.all(extraKeys.map((extraKey) => store.has(extraKey)));
   if (guard !== undefined) await warmGuard(store, guard);
   await store.get(cleanupKey);
   return store.transaction(async (transaction) => {
@@ -1217,6 +1222,11 @@ async function cleanupPointPhase(
     if (guard !== undefined) await bumpGuard(transaction, guard);
     if (exists) await transaction.remove(key);
     let deleted = Number(exists);
+    for (const [index, extraKey] of extraKeys.entries()) {
+      if (!extraExists[index]) continue;
+      await transaction.remove(extraKey);
+      deleted += 1;
+    }
     if (guard !== undefined && removeGuard) {
       await transaction.remove(guard);
       deleted += 1;
@@ -1540,7 +1550,18 @@ async function cleanupCanonicalDocument(store, candidate, manifest, workLimit, n
         "session-reference",
         guardKeys.document(candidate.documentId, candidate.version),
         remaining,
-        { removeGuard: true },
+        {
+          removeGuard: true,
+          // The durable per-document recall counter (relevance-feedback.js)
+          // is a plain local counter, not a registered derived reference, so
+          // it is not reachable from the "derived" phase's scan; delete it
+          // here instead, alongside the canonical record it is keyed to.
+          extraKeys: [keyFor.counter(recallCounterName(
+            manifest.project,
+            candidate.documentId,
+            candidate.version,
+          ))],
+        },
       );
     } else if (progress.phase === "session-reference") {
       step = await cleanupSessionReferencePhase(store, cleanupKey, manifest, progress, remaining);

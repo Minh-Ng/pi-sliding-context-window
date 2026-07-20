@@ -5,6 +5,7 @@ import {
 import { lookupExact, planExactQuery } from "../rocksdb/index/exact.js";
 import { searchBm25 } from "../rocksdb/index/bm25.js";
 import { lookupStructuralAsync } from "../rocksdb/index/structural.js";
+import { documentImportancePrior } from "../rocksdb/index/importance.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { semanticIdentifier } from "../semantic-identifiers.js";
@@ -321,13 +322,50 @@ function fuseCandidates(candidates, limit) {
   return [...best.values()].sort(compareCandidates).slice(0, limit);
 }
 
+function compareRankedCandidates(left, right) {
+  return MODE_PRIORITY[right.retrievalMode] - MODE_PRIORITY[left.retrievalMode]
+    || right.rankingScore - left.rankingScore
+    || String(left.documentId).localeCompare(String(right.documentId))
+    || left.version - right.version;
+}
+
+/**
+ * Re-rank fused candidates by a bounded query-independent importance prior. The
+ * prior only multiplies the normalized relevance score, so it can reorder
+ * near-ties but never overrule a strong relevance gap. Applied to explicit
+ * search ranking only; the automatic preflight path never sets this flag, so
+ * frozen-hint scoring stays byte-identical.
+ */
+async function applyImportancePriors(view, candidates, project) {
+  const ranked = [];
+  for (const candidate of candidates) {
+    const prior = await documentImportancePrior(view, {
+      documentId: candidate.documentId,
+      version: candidate.version,
+      project,
+    });
+    ranked.push({
+      ...candidate,
+      importancePrior: prior,
+      rankingScore: candidate.normalizedScore * prior,
+    });
+  }
+  return ranked.sort(compareRankedCandidates);
+}
+
 function preserveCandidateMargins(candidates) {
   return candidates.map((candidate, index) => {
     const sameModeNext = candidates.slice(index + 1)
       .find(({ retrievalMode }) => retrievalMode === candidate.retrievalMode);
+    // The list may be ordered by rankingScore (importance-prior reordering)
+    // rather than normalizedScore, so the next same-mode candidate is not
+    // guaranteed to have a lower normalizedScore than this one. The contract
+    // requires a non-negative margin, so a prior-driven reorder reports a
+    // margin of 0 (no clear lead) instead of a negative confidence gap.
+    const margin = candidate.normalizedScore - (sameModeNext?.normalizedScore ?? 0);
     return {
       ...candidate,
-      margin: Number((candidate.normalizedScore - (sameModeNext?.normalizedScore ?? 0)).toFixed(6)),
+      margin: Number(Math.max(0, margin).toFixed(6)),
     };
   });
 }
@@ -451,6 +489,21 @@ async function broadenWithSemantic(collected, request, options) {
   });
 }
 
+/**
+ * Apply the importance prior to the final candidate set, after semantic
+ * broadening. Semantic broadening re-fuses candidates by normalizedScore
+ * (broadenWithSemantic), which would otherwise discard any prior-driven
+ * reorder from an earlier pass — applying the prior once, last, keeps it
+ * consistent regardless of whether semantic search engaged.
+ */
+async function rankByImportance(store, collected, project) {
+  const ranked = await store.snapshot((view) => applyImportancePriors(view, collected.candidates, project));
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(preserveCandidateMargins(ranked)),
+  });
+}
+
 async function candidateStillLive(store, candidate, request) {
   return store.snapshot(async (view) => {
     if (view.scan([KEYSPACE.SUPERSESSION, candidate.documentId, candidate.version], { limit: 1 }).length > 0) {
@@ -544,7 +597,10 @@ export async function searchArchive(store, request, options = {}) {
     now: options.now,
   });
   const lexical = await store.snapshot((view) => collectCandidates(view, normalized, options));
-  const collected = await broadenWithSemantic(lexical, normalized, options);
+  const broadened = await broadenWithSemantic(lexical, normalized, options);
+  const collected = options.applyImportancePrior === true
+    ? await rankByImportance(store, broadened, normalized.project)
+    : broadened;
   const results = await locateCandidates(store, collected, normalized, options, secret);
   let status = results.length === 0 ? "not-found" : "resolved";
   if (results.length > 0 && collected.mode === "structural"

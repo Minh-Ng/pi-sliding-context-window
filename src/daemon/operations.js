@@ -13,6 +13,7 @@ import { encodeKey, KEYSPACE } from "../rocksdb/keys.js";
 import { createExactIndexHandler } from "../rocksdb/index/exact.js";
 import { createBm25IndexHandler } from "../rocksdb/index/bm25.js";
 import { createStructuralIndexHandler } from "../rocksdb/index/structural.js";
+import { createImportanceIndexHandler } from "../rocksdb/index/importance.js";
 import { IndexWorker } from "../rocksdb/indexer.js";
 import { outboxKeys, outboxMetrics } from "../rocksdb/outbox.js";
 import { scanStatusPrefix } from "../rocksdb/status-scan.js";
@@ -266,6 +267,7 @@ export class DaemonOperations {
         createExactIndexHandler(options.exact),
         createBm25IndexHandler(options.bm25),
         createStructuralIndexHandler(),
+        createImportanceIndexHandler(),
       ],
     });
     this.semantic = new LocalSemanticIndex(store, {
@@ -583,6 +585,7 @@ export class DaemonOperations {
       return searchArchive(this.store, { ...payload, project: context.project }, {
         semantic: this.semantic,
         recordShownResults: (event) => this.recordRelevanceFeedback(event),
+        applyImportancePrior: true,
       });
     }
     return this.#searchAcrossProjects(payload, readProjects, context);
@@ -603,6 +606,7 @@ export class DaemonOperations {
     for (const project of readProjects) {
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
+        applyImportancePrior: true,
       });
       modes.add(result.mode);
       indexGeneration = Math.max(indexGeneration, result.indexGeneration);
@@ -670,6 +674,7 @@ export class DaemonOperations {
         project: context.project,
         semantic: this.semantic,
         renderFormat: this.renderFormat,
+        applyImportancePrior: true,
       });
     }
     return this.#gatherAcrossProjects(payload, readProjects);
@@ -694,6 +699,7 @@ export class DaemonOperations {
         project,
         semantic: this.semantic,
         renderFormat: this.renderFormat,
+        applyImportancePrior: true,
       });
       modes.add(result.mode);
       intent ??= result.intent;

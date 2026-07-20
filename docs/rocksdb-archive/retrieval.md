@@ -86,8 +86,11 @@ Canonical admission and derived publication have separate success boundaries. A 
 - Already-visible and recently-surfaced suppression.
 - Supersession exclusion.
 - Evidence-kind policy.
+- Document importance prior (explicit search only).
 
 No hidden model call participates in automatic preflight ranking; the embedding semantic mode above is an explicit, disclosed opt-out fallback, not a hidden call.
+
+The document importance prior is a query-independent multiplier derived per document by the `importance-v1` index handler and stored in the versioned `importance` namespace. Three of its four signals are intrinsic to canonical, immutable state and so replay deterministically from canonical records alone: decision-candidate presence, admission pin, and a referenced-by count combining provenance breadth (source message count) with explicit supersession-chain depth (walked through `manifest.supersedes` lineage). The fourth, a recalled-after-search tally sourced from the local relevance-feedback log, is a deliberate exception: a document is indexed exactly once, at admission, before any recall of it could have happened, so the value the index handler stores for this signal is always 0. Ranking never reads that stale stored value — at query time it re-reads the durable per-document recall counter live instead, so the signal reflects local search usage as of the moment of the query rather than as of admission. That live read is computationally deterministic (no randomness or model calls) but not a pure function of the document's manifest alone. It multiplies the normalized relevance score, capped at 1.15x, so it can reorder near-ties but never overrule a strong relevance gap. It is applied to explicit search and gather ranking only; the automatic preflight path does not apply it, keeping frozen-hint decisions byte-identical.
 
 **Automatic preflight gate**
 

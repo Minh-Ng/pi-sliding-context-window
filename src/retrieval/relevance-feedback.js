@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { KEYSPACE } from "../rocksdb/keys.js";
+import { keyFor, KEYSPACE } from "../rocksdb/keys.js";
 import { assertStoreResult } from "../store-contract.js";
 
 /**
@@ -7,9 +7,18 @@ import { assertStoreResult } from "../store-contract.js";
  * search records which results were shown (rank, retrieval mode, calibrated and
  * raw scores, and an opaque locator fingerprint); each later recall of a shown
  * locator joins back to that search event by fingerprint. Only ids, scores, and
- * the query string are stored — never archived content. The log never leaves the
- * machine and is not an index: retrieval never reads it, so it does not
- * participate in derived-index generation or replay.
+ * the query string are stored — never archived content. The log never leaves
+ * the machine and the raw event ring is not itself an index: retrieval never
+ * reads shown/recalls events, so they do not participate in derived-index
+ * generation or replay.
+ *
+ * The one exception is a per-document recall counter (see
+ * recallCounterName/documentRecallCount below), incremented on each resolved
+ * recall of a shown locator. Unlike the bounded event ring it evicts, it never
+ * does, so the importance batch job (src/rocksdb/index/importance.js) can read
+ * a document's all-time recalled-after-search tally in O(1) instead of
+ * rescanning history. It is a plain local counter, not a model or network
+ * call, so it stays within the write-path's no-model-calls constraint.
  *
  * A schema change gets a fresh namespace so old-format records age out through
  * the bounded ring instead of being misread under the new format.
@@ -63,6 +72,11 @@ export const feedbackKeys = Object.freeze({
     return [...ROOT, requireProject(project), "locator", fingerprint];
   },
 });
+
+/** Durable (non-evicting) per-document recall tally name; see documentRecallCount. */
+export function recallCounterName(project, documentId, version) {
+  return `relevance-feedback-recall:v${RELEVANCE_FEEDBACK_VERSION}:${requireProject(project)}:${documentId}:${version}`;
+}
 
 /** Opaque, content-free join key. Each shown locator is unique (fresh lease). */
 export function locatorFingerprint(locator) {
@@ -192,8 +206,39 @@ export async function recordRecalledLocator(store, {
         },
       ],
     }, { kind: "relevance-feedback-event" });
+    // Only a "resolved" recall is positive relevance signal (see
+    // relevanceFeedbackStats); tally it against the shown document so the
+    // importance batch job can read a per-document recall count in O(1).
+    if (status === "resolved") {
+      const shownEntry = (event.shown ?? []).find(
+        (entry) => entry.locatorFingerprint === fingerprint,
+      );
+      if (shownEntry !== undefined) {
+        await tx.increment(recallCounterName(project, shownEntry.documentId, shownEntry.version));
+      }
+    }
     return { joined: true };
   });
+}
+
+/**
+ * Read the durable recalled-after-search tally for one document version.
+ * Returns 0 when no recall has ever been recorded. This is the only feedback
+ * signal retrieval-adjacent code reads; the raw event ring stays write-only.
+ */
+export async function documentRecallCount(view, { project, documentId, version } = {}) {
+  if (!view || typeof view.get !== "function") {
+    throw new TypeError("documentRecallCount requires a store or snapshot view.");
+  }
+  requireProject(project);
+  if (typeof documentId !== "string" || documentId.length === 0) {
+    throw new TypeError("documentRecallCount requires a documentId.");
+  }
+  if (!Number.isSafeInteger(version) || version <= 0) {
+    throw new TypeError("documentRecallCount requires a positive version.");
+  }
+  const value = await view.get(keyFor.counter(recallCounterName(project, documentId, version)));
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 function accumulate(map, key, recalled) {

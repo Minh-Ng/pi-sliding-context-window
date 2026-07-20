@@ -13,6 +13,7 @@ import { searchArchive } from "../src/retrieval/search.js";
 import { recallArchive } from "../src/retrieval/recall.js";
 import { createDaemonOperations } from "../src/daemon/operations.js";
 import {
+  documentRecallCount,
   feedbackKeys,
   locatorFingerprint,
   recordRecalledLocator,
@@ -148,6 +149,19 @@ test("search logs shown results and a later recall joins by locator fingerprint"
     now: 2_000,
   });
   assert.deepEqual(join, { joined: true });
+  // The durable per-document recall tally (read by the importance batch job)
+  // increments on the resolved join, keyed by the recalled document/version,
+  // and stays 0 for a document that was shown but never recalled.
+  const recalledDocumentId = lexical.results[0].documentId;
+  const shownOnlyDocumentId = exact.results[0].documentId;
+  assert.equal(
+    await documentRecallCount(store, { project: PROJECT, documentId: recalledDocumentId, version: 1 }),
+    1,
+  );
+  assert.equal(
+    await documentRecallCount(store, { project: PROJECT, documentId: shownOnlyDocumentId, version: 1 }),
+    0,
+  );
 
   const stats = await relevanceFeedbackStats(store, { project: PROJECT });
   assert.equal(stats.events, 2);
@@ -169,6 +183,11 @@ test("search logs shown results and a later recall joins by locator fingerprint"
   });
   assert.deepEqual(again, { joined: true, alreadyRecorded: true });
   assert.equal((await relevanceFeedbackStats(store, { project: PROJECT })).recalledTotal, 1);
+  // The idempotent re-join must not double-count the durable recall tally.
+  assert.equal(
+    await documentRecallCount(store, { project: PROJECT, documentId: recalledDocumentId, version: 1 }),
+    1,
+  );
 });
 
 test("recall of a locator never shown, or shown under another project, does not join", async (t) => {

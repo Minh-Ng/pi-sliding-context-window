@@ -1,13 +1,12 @@
 import { spawn } from "node:child_process";
 import {
-  closeSync,
-  constants,
-  openSync,
+  linkSync,
   readFileSync,
   realpathSync,
   rmSync,
-  writeSync,
+  writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { workerData } from "node:worker_threads";
@@ -74,31 +73,35 @@ function clearUpgradeMarker() {
 function claimUpgrade(processId, incompatibility) {
   const path = upgradeMarkerPath();
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    let descriptor;
+    // Write the full marker to a private temp file first, then publish it
+    // with linkSync(), which atomically fails with EEXIST if another worker
+    // already published a marker. openSync(O_EXCL) followed by a separate
+    // writeSync() would leave a window where a concurrent claimant can see
+    // an empty file, misread it as malformed, delete it, and win a second
+    // claim -- double-signaling the same stale daemon.
+    const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      descriptor = openSync(
-        path,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
-        0o600,
-      );
-      writeSync(descriptor, JSON.stringify({
+      writeFileSync(temporaryPath, JSON.stringify({
         processId,
         createdAt: Date.now(),
         expectedRuntime: incompatibility.expectedRuntime,
-      }));
-      closeSync(descriptor);
-      return true;
-    } catch (error) {
-      if (descriptor !== undefined) closeSync(descriptor);
-      if (error?.code !== "EEXIST") throw error;
+      }), { flag: "wx", mode: 0o600 });
       try {
-        const marker = JSON.parse(readFileSync(path, "utf8"));
-        const fresh = marker.processId === processId
-          && Number.isSafeInteger(marker.createdAt)
-          && Date.now() - marker.createdAt < options.daemonStartTimeoutMs;
-        if (fresh) return false;
-      } catch { /* malformed markers are replaced below */ }
-      try { rmSync(path, { force: true }); } catch {}
+        linkSync(temporaryPath, path);
+        return true;
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        try {
+          const marker = JSON.parse(readFileSync(path, "utf8"));
+          const fresh = marker.processId === processId
+            && Number.isSafeInteger(marker.createdAt)
+            && Date.now() - marker.createdAt < options.daemonStartTimeoutMs;
+          if (fresh) return false;
+        } catch { /* malformed markers are replaced below */ }
+        try { rmSync(path, { force: true }); } catch {}
+      }
+    } finally {
+      try { rmSync(temporaryPath, { force: true }); } catch {}
     }
   }
   return false;

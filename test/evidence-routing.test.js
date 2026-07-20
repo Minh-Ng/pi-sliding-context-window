@@ -18,6 +18,7 @@ import {
 import {
   EFFECTIVE_PRODUCTION_GUIDANCE,
   EFFECTIVE_PRODUCTION_GUIDANCE_HASH,
+  EFFECTIVE_PRODUCTION_GUIDANCE_VERSION,
   EVIDENCE_ROUTING_HELD_OUT_SUITE,
   EVIDENCE_ROUTING_REFERENCE_SUITE,
   canonicalEffectiveProductionGuidance,
@@ -100,6 +101,13 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(SEARCH_TOOL_DESCRIPTION, /newest relevant candidate.*snippet is truncated or omits the requested value.*older explicit value/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /event dates or old→new values.*preserve uncertainty/i);
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /Source timestamps order messages, not necessarily events/i.test(guideline)));
+  // Fact-shaped archiving: settled facts get a stable subjectKey at write time,
+  // superseded on correction so one live document per subject stays retrievable.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /durable project fact or decision is settled.*stable subjectKey.*one live document per subject/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /on a later correction.*supersede or re-archive with supersedes targeting the live document/i.test(guideline)));
+  // Third destination: cross-project user facts go to host memory, not the
+  // project-partitioned archive and not the repository.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /user-scoped fact that holds across projects.*host's own memory mechanism.*not this project-partitioned archive and not the repository/i.test(guideline)));
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -109,6 +117,9 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   });
   const digest = createHash("sha256").update(JSON.stringify(EFFECTIVE_PRODUCTION_GUIDANCE)).digest("hex");
   assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_HASH, `sha256:${digest}`);
+  // The subjectKey/host-memory guidance additions invalidate the prior
+  // fingerprint, so the version identifier must be bumped past it.
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "11");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

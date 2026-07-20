@@ -355,6 +355,79 @@ test("MCP defaults to project-bound RocksDB search and locator recall", async ()
   }
 });
 
+test("MCP archive tool admits a subjectKey and requires supersedes to replace its live document", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-subject-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const project = join(directory, "project");
+  const child = startRocksServer({ directory, storePath, socketPath, project });
+  const rpc = rpcClient(child);
+  let daemonProcessId;
+
+  try {
+    const first = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "decision",
+        text: "The team settled on port 8443 for the admin console.",
+        subjectKey: "decision:admin-console-port",
+      },
+    });
+    assert.equal(first.error, undefined);
+    assert.equal(first.result.isError, false);
+    const firstId = first.result.content[0].text.match(/^Archived as (\S+)\.$/u)?.[1];
+    assert.ok(firstId, "first archive call must report a document id");
+
+    // Re-archiving the same live subjectKey without supersedes must fail closed.
+    const conflicting = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "decision",
+        text: "The team settled on port 9443 for the admin console.",
+        subjectKey: "decision:admin-console-port",
+      },
+    });
+    assert.equal(conflicting.result, undefined);
+    assert.match(conflicting.error.message, /subjectKey.*is live at/u);
+
+    const superseding = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "decision",
+        text: "The team settled on port 9443 for the admin console.",
+        subjectKey: "decision:admin-console-port",
+        supersedes: { documentId: firstId, version: 1 },
+      },
+    });
+    assert.equal(superseding.error, undefined);
+    assert.equal(superseding.result.isError, false);
+
+    const searched = await rpc.request("tools/call", {
+      name: "context_window_search",
+      arguments: { query: "admin console port", scope: "project", limit: 3 },
+    });
+    assert.equal(searched.error, undefined);
+    assert.match(searched.result.content[0].text, /9443/u);
+    assert.doesNotMatch(searched.result.content[0].text, /8443/u);
+
+    child.stdin.end();
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 0);
+  } finally {
+    rpc.close();
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    if (!daemonProcessId) {
+      try { daemonProcessId = (await daemonStatus(socketPath, project)).processId; } catch {}
+    }
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP recall renders archive, source-message, and tool-result provenance", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-provenance-"));
   const databasePath = join(directory, "archive.db");

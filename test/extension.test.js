@@ -418,7 +418,7 @@ test("custom archive factories can replace the SQLite backend", async () => {
   assert.equal(closed, true);
 });
 
-test("/context-window persists and applies turn and token caps from its TUI", async (t) => {
+test("/window settings persists and applies turn and token caps from its TUI", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-settings-tui-"));
   const previousHome = process.env.HOME;
   process.env.HOME = directory;
@@ -482,7 +482,10 @@ test("/context-window persists and applies turn and token caps from its TUI", as
   };
 
   handlers.get("session_start")({}, ctx);
-  await commands.get("context-window").handler("", ctx);
+  assert.equal(commands.has("context-window"), false);
+  assert.ok(commands.get("window").getArgumentCompletions("set")
+    .some(({ value }) => value === "settings"));
+  await commands.get("window").handler("settings", ctx);
   const initialLines = panel.render(100).map(stripVTControlCharacters);
   assert.equal(initialLines[0], "─".repeat(100));
   assert.equal(initialLines.at(-1), "─".repeat(100));
@@ -614,6 +617,102 @@ test("Pi defaults to project-bound RocksDB search, locator recall, and protectio
       rightProject.close();
       wrongProject.close();
     }
+  } finally {
+    if (!daemonProcessId) {
+      const client = new StoreClient({ socketPath, project: directory, requestTimeoutMs: 2_000 });
+      try { daemonProcessId = (await client.request("daemon.status", {})).processId; } catch {}
+      finally { client.close(); }
+    }
+    if (started) handlers.get("session_shutdown")({}, ctx);
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Pi context_window_archive tool admits a subjectKey and requires supersedes to replace its live document", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-extension-subject-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const handlers = new Map();
+  const tools = new Map();
+  let daemonProcessId;
+  let started = false;
+  const extension = createContextEpochWindow({
+    configLoader: () => loadConfig({
+      cwd: directory,
+      home: directory,
+      projectTrusted: false,
+      env: {
+        CONTEXT_WINDOW_ROCKSDB: storePath,
+        CONTEXT_WINDOW_SOCKET: socketPath,
+        CONTEXT_WINDOW_ROTATION_TOKENS: "100000",
+        CONTEXT_WINDOW_ROTATION_TURNS: "3",
+        CONTEXT_WINDOW_HARD_LIMIT_TOKENS: "120000",
+        CONTEXT_WINDOW_RETAIN_TURNS: "1",
+        CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL: "false",
+        CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS: "0",
+        CONTEXT_WINDOW_MINIMUM_TURNS_PER_SESSION: "0",
+      },
+    }),
+  });
+  await extension({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool(tool) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: directory,
+    hasUI: false,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "rocks-extension-subject-session",
+      getBranch: () => [],
+    },
+    ui: { setStatus() {} },
+  };
+
+  try {
+    handlers.get("session_start")({}, ctx);
+    started = true;
+
+    const archiveTool = tools.get("context_window_archive");
+    assert.ok(archiveTool);
+    assert.deepEqual(archiveTool.promptGuidelines, EVIDENCE_ROUTING_GUIDELINES);
+
+    const first = await archiveTool.execute("call", {
+      text: "The team settled on port 8443 for the admin console.",
+      kind: "decision",
+      subjectKey: "decision:admin-console-port",
+    });
+    assert.ok(first.details.id);
+
+    await assert.rejects(
+      archiveTool.execute("call", {
+        text: "The team settled on port 9443 for the admin console.",
+        kind: "decision",
+        subjectKey: "decision:admin-console-port",
+      }),
+      /subjectKey.*is live at/u,
+    );
+
+    const superseding = await archiveTool.execute("call", {
+      text: "The team settled on port 9443 for the admin console.",
+      kind: "decision",
+      subjectKey: "decision:admin-console-port",
+      supersedes: { documentId: first.details.id, version: 1 },
+    });
+    assert.ok(superseding.details.id);
+
+    const search = await tools.get("context_window_search").execute("call", {
+      query: "admin console port",
+      scope: "project",
+      limit: 3,
+    });
+    assert.match(search.content[0].text, /9443/u);
+    assert.doesNotMatch(search.content[0].text, /8443/u);
   } finally {
     if (!daemonProcessId) {
       const client = new StoreClient({ socketPath, project: directory, requestTimeoutMs: 2_000 });
@@ -847,9 +946,12 @@ function memoryCheckpointArchive() {
     documents,
     puts,
     put(document) {
-      puts.push(document);
-      documents.set(document.id, document);
-      return document.id;
+      const stored = document.id
+        ? document
+        : { ...document, id: `memory-document-${puts.length + 1}` };
+      puts.push(stored);
+      documents.set(stored.id, stored);
+      return stored.id;
     },
     search() { return []; },
     get(id) { return documents.get(id); },
@@ -870,6 +972,7 @@ function compactionPreparation({
   turnPrefixMessages = [],
   isSplitTurn = false,
   tokensBefore = 70_000,
+  reserveTokens = 16_384,
   previousSummary,
 } = {}) {
   return {
@@ -880,7 +983,7 @@ function compactionPreparation({
     tokensBefore,
     ...(previousSummary === undefined ? {} : { previousSummary }),
     fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-    settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+    settings: { enabled: true, reserveTokens, keepRecentTokens: 20_000 },
   };
 }
 
@@ -1244,8 +1347,9 @@ test("a post-archive processing failure also aborts oversized provider input", a
   handlers.get("session_shutdown")({}, ctx);
 });
 
-test("safe threshold cancellation requires finite provider usage and precedes every archive write", async () => {
+test("threshold hook commits reserve-aware rotation before cancellation", async () => {
   const handlers = new Map();
+  const appended = [];
   const archive = memoryCheckpointArchive();
   await createContextEpochWindow({
     configLoader: () => compactionConfig(),
@@ -1254,10 +1358,10 @@ test("safe threshold cancellation requires finite provider usage and precedes ev
     on(name, handler) { handlers.set(name, handler); },
     registerTool() {},
     registerCommand() {},
-    appendEntry() {},
+    appendEntry(...args) { appended.push(args); },
   });
 
-  let providerTokens = 240_000;
+  let providerTokens = 250_404;
   const ctx = {
     cwd: "/project",
     hasUI: false,
@@ -1268,11 +1372,14 @@ test("safe threshold cancellation requires finite provider usage and precedes ev
     ui: { setStatus() {} },
   };
   handlers.get("session_start")({ reason: "new" }, ctx);
-  handlers.get("context")({
-    messages: [{ role: "user", content: [{ type: "text", text: "small visible epoch" }], timestamp: 1 }],
-  }, ctx);
+  const visibleEpoch = Array.from({ length: 12 }, (_, index) => ({
+    role: "user",
+    content: [{ type: "text", text: `${index + 1}:${"x".repeat(15_000)}` }],
+    timestamp: index + 1,
+  }));
+  handlers.get("context")({ messages: visibleEpoch }, ctx);
 
-  const preparation = compactionPreparation({ tokensBefore: 240_000 });
+  const preparation = compactionPreparation({ tokensBefore: 250_404 });
   assert.deepEqual(
     handlers.get("session_before_compact")(
       compactionEvent("threshold", preparation),
@@ -1280,7 +1387,27 @@ test("safe threshold cancellation requires finite provider usage and precedes ev
     ),
     { cancel: true },
   );
-  assert.equal(archive.puts.length, 0);
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0][1].reason, "forced");
+  assert.equal(appended[0][1].rotations, 1);
+  const putsAfterRotation = archive.puts.length;
+  assert.ok(putsAfterRotation > 0);
+
+  // Pi checks once after the completed response and again before the next
+  // prompt. A stricter reserve may reuse the committed rotation only when its
+  // provider-aware projection still fits the changed threshold.
+  assert.deepEqual(
+    handlers.get("session_before_compact")(
+      compactionEvent("threshold", compactionPreparation({
+        tokensBefore: 250_404,
+        reserveTokens: 128_000,
+      })),
+      ctx,
+    ),
+    { cancel: true },
+  );
+  assert.equal(archive.puts.length, putsAfterRotation);
+  assert.equal(appended.length, 1);
 
   for (const getContextUsage of [
     () => ({ tokens: null, contextWindow: 372_000, percent: null }),
@@ -1295,16 +1422,76 @@ test("safe threshold cancellation requires finite provider usage and precedes ev
   }
   assert.ok(archive.puts.length > 0);
 
-  // This provider measurement is above the effective rotation threshold even
-  // though the epoch estimate remains tiny, so checkpointing is mandatory.
-  providerTokens = 295_345;
+  // A materially larger repeated provider measurement invalidates the prior
+  // projection and must fall back to archive-first compaction.
+  providerTokens = 300_000;
   const unsafe = handlers.get("session_before_compact")(
-    compactionEvent("threshold", preparation),
+    compactionEvent("threshold", compactionPreparation({
+      tokensBefore: 250_404,
+      reserveTokens: 128_000,
+    })),
     ctx,
   );
   assert.ok(unsafe.compaction);
   assert.ok(archive.puts.length > 0);
   handlers.get("session_shutdown")({}, ctx);
+});
+
+test("rotation admission and persistence failures immediately use custom compaction", async () => {
+  for (const failure of ["archive", "persist"]) {
+    const handlers = new Map();
+    const archive = memoryCheckpointArchive();
+    let armed = false;
+    const put = archive.put.bind(archive);
+    archive.put = (document, options) => {
+      if (armed && failure === "archive" && document.kind === "turn") {
+        throw new Error("injected turn admission failure");
+      }
+      return put(document, options);
+    };
+    await createContextEpochWindow({
+      configLoader: () => compactionConfig(),
+      archiveFactory: () => archive,
+    })({
+      on(name, handler) { handlers.set(name, handler); },
+      registerTool() {},
+      registerCommand() {},
+      appendEntry(_type, state) {
+        if (armed && failure === "persist" && state.reason === "forced") {
+          throw new Error("injected rotation persistence failure");
+        }
+      },
+    });
+    const ctx = {
+      cwd: "/project",
+      hasUI: false,
+      model: { provider: "provider", id: "model", contextWindow: 372_000 },
+      isProjectTrusted: () => false,
+      getContextUsage: () => ({ tokens: 250_404, contextWindow: 372_000, percent: 67.3 }),
+      sessionManager: { getSessionId: () => `rotation-${failure}`, getBranch: () => [] },
+      ui: { setStatus() {} },
+    };
+    handlers.get("session_start")({ reason: "new" }, ctx);
+    handlers.get("context")({
+      messages: Array.from({ length: 12 }, (_, index) => ({
+        role: "user",
+        content: [{ type: "text", text: `${index + 1}:${"x".repeat(15_000)}` }],
+        timestamp: index + 1,
+      })),
+    }, ctx);
+    armed = true;
+
+    const result = handlers.get("session_before_compact")(
+      compactionEvent("threshold", compactionPreparation({
+        tokensBefore: 250_404,
+        reserveTokens: 128_000,
+      })),
+      ctx,
+    );
+    assert.ok(result.compaction, failure);
+    assert.equal(result.cancel, undefined, failure);
+    handlers.get("session_shutdown")({}, ctx);
+  }
 });
 
 test("unsafe threshold, overflow, and manual compaction return the same bounded archive catalog", async () => {

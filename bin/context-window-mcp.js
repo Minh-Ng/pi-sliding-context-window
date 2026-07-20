@@ -155,13 +155,23 @@ const tools = [
   },
   {
     name: "context_window_archive",
-    description: "Store text outside the active model context so it can later be found with BM25 search.",
+    description: "Store text outside the active model context so it can later be found with BM25 search. Pass subjectKey for a durable fact or decision so one live document per subject stays retrievable; on a correction, pass supersedes to retire the prior live document for that same subjectKey in the same write.",
     inputSchema: {
       type: "object",
       properties: {
         text: { type: "string", maxLength: MAX_DOCUMENT_TEXT_BYTES },
         kind: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH, default: "manual" },
         metadata: { type: "object" },
+        subjectKey: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+        supersedes: {
+          type: "object",
+          properties: {
+            documentId: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+            version: { type: "integer", minimum: 1 },
+          },
+          required: ["documentId", "version"],
+          additionalProperties: false,
+        },
       },
       required: ["text"],
       additionalProperties: false,
@@ -261,12 +271,18 @@ function callTool(name, args = {}) {
       );
     }
     case "context_window_archive": {
+      if ((args.subjectKey !== undefined || args.supersedes !== undefined)
+        && typeof archive.resolveSubject !== "function") {
+        return textResult("subjectKey and supersedes require the RocksDB archive backend.", true);
+      }
       const id = archive.put({
         sessionId,
         project,
         kind: String(args.kind ?? "manual"),
         text: String(args.text ?? ""),
         metadata: args.metadata ?? {},
+        ...(args.subjectKey === undefined ? {} : { subjectKey: String(args.subjectKey) }),
+        ...(args.supersedes === undefined ? {} : { supersedes: args.supersedes }),
       });
       return id ? textResult(`Archived as ${id}.`) : textResult("Nothing to archive.", true);
     }

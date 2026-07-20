@@ -457,6 +457,10 @@ export class EpochWindowSession {
     this.boundaryKey = undefined;
     this.activeTokens = undefined;
     this.activeTurns = undefined;
+    this.contextGeneration = 0;
+    this.compactionRotationSnapshot = undefined;
+    this.compactionRotationCommit = undefined;
+    this.reserveAwareRotationGuard = undefined;
     this.rotations = 0;
     this.forceRotation = false;
     this.lastRotationReason = undefined;
@@ -484,6 +488,10 @@ export class EpochWindowSession {
     this.boundaryKey = undefined;
     this.rotations = 0;
     this.forceRotation = false;
+    this.contextGeneration = 0;
+    this.compactionRotationSnapshot = undefined;
+    this.compactionRotationCommit = undefined;
+    this.reserveAwareRotationGuard = undefined;
     this.lastRotationReason = undefined;
     this.lastRotationMode = undefined;
     this.effectiveRetainTurns = undefined;
@@ -555,6 +563,8 @@ export class EpochWindowSession {
 
   process(messages, model) {
     this.contextLimits = resolveContextLimits(this.config, model);
+    this.contextGeneration += 1;
+    this.compactionRotationSnapshot = undefined;
     const contextMessages = removeEmptyAssistantErrors(messages);
     let sliced = sliceFromBoundary(contextMessages, this.boundaryKey);
     let boundaryPrefix = [];
@@ -567,7 +577,8 @@ export class EpochWindowSession {
       boundaryPrefix = contextMessages.slice(0, sliced.start);
     }
 
-    let active = sliced.messages;
+    let activeSource = sliced.messages;
+    let active = activeSource;
     if (active.length === 0) {
       this.reconcileHintLifecycle([], boundaryPrefix);
       this.activeArchiveIds = new Set();
@@ -602,11 +613,20 @@ export class EpochWindowSession {
       return active;
     }
 
+    const hintReserve = Math.max(0, Number(
+      this.config.activeHintBudgetTokens ?? this.config.epochHintBudgetTokens ?? 0,
+    ) || 0);
+    const guardedRotationTokens = this.reserveAwareRotationGuard
+      ? this.reserveAwareRotationGuard.activeBudget - hintReserve
+      : this.contextLimits.rotationTokens;
+    if (guardedRotationTokens <= 0) {
+      throw new Error("Reserve-aware epoch budget cannot fit model-visible hints.");
+    }
     const plan = planEpochRotation(active, {
       force: this.forceRotation,
       tokens: this.activeTokens,
       turns: this.activeTurns,
-      rotationTokens: this.contextLimits.rotationTokens,
+      rotationTokens: Math.min(this.contextLimits.rotationTokens, guardedRotationTokens),
       rotationTurns: this.contextLimits.rotationTurns,
       retainTurns: this.config.retainTurns,
       markerTokenReserve: TOC_TOKEN_BUDGET,
@@ -615,9 +635,9 @@ export class EpochWindowSession {
     if (plan.action === "rotate") {
       // Indices are stable because externalization replaces messages in place.
       // Archive the exact source messages, not their provider-facing previews.
-      const rotatedMessages = sliced.messages.slice(0, plan.start);
+      const rotatedMessages = activeSource.slice(0, plan.start);
       this.archiveTurns(rotatedMessages);
-      this.boundaryKey = messageKey(sliced.messages[plan.start]);
+      this.boundaryKey = messageKey(activeSource[plan.start]);
       this.rotations += 1;
       this.lastRotationReason = plan.trigger;
       this.lastRotationMode = plan.mode;
@@ -625,6 +645,7 @@ export class EpochWindowSession {
       this.compactionFallbackReason = undefined;
       this.refreshArchiveProtection();
       this.onRotation(this.rotationState());
+      activeSource = activeSource.slice(plan.start);
       active = active.slice(plan.start);
       visibleSourceKeys = visibleSourceKeys.slice(plan.start);
       boundaryPrefix = [...boundaryPrefix, ...rotatedMessages];
@@ -634,12 +655,24 @@ export class EpochWindowSession {
       // A forced rotation can be impossible simply because there is not yet a
       // second user boundary; that is not token pressure requiring compaction.
       this.compactionFallbackReason = plan.trigger === "forced" ? undefined : plan.reason;
+      if (this.reserveAwareRotationGuard) {
+        throw new Error(`Reserve-aware epoch rotation failed: ${plan.reason}.`);
+      }
     } else {
       this.compactionFallbackReason = undefined;
     }
     this.forceRotation = false;
 
     this.reconcileHintLifecycle(active, boundaryPrefix);
+    const rotationActive = active;
+    const rotationActiveTokens = estimateTokens(marker ? [marker, ...rotationActive] : rotationActive);
+    this.compactionRotationSnapshot = {
+      generation: this.contextGeneration,
+      sourceMessages: activeSource,
+      providerMessages: rotationActive,
+      activeTokens: rotationActiveTokens,
+      activeTurns: this.countUserTurns(rotationActive),
+    };
     active = this.withAutomaticArchiveHint(
       active,
       visibleSourceKeys,
@@ -647,6 +680,10 @@ export class EpochWindowSession {
     );
     this.activeTurns = this.countUserTurns(active);
     this.activeTokens = estimateTokens(marker ? [marker, ...active] : active);
+    if (this.reserveAwareRotationGuard
+      && this.activeTokens > this.reserveAwareRotationGuard.activeBudget) {
+      throw new Error("Reserve-aware epoch projection exceeded Pi's compaction threshold.");
+    }
     return marker ? [marker, ...active] : active;
   }
 
@@ -663,6 +700,9 @@ export class EpochWindowSession {
 
   updateModel(model) {
     this.contextLimits = resolveContextLimits(this.config, model);
+    this.compactionRotationSnapshot = undefined;
+    this.compactionRotationCommit = undefined;
+    this.reserveAwareRotationGuard = undefined;
   }
 
   updateWindowPolicy(config, model) {
@@ -720,6 +760,25 @@ export class EpochWindowSession {
 
   resolveSubject(subjectKey) {
     return this.archive.resolveSubject?.(subjectKey);
+  }
+
+  /**
+   * @param {{text: string, kind?: string, metadata?: object, subjectKey?: string, supersedes?: {documentId: string, version: number}}} options
+   */
+  archiveManual({ text, kind = "manual", metadata = {}, subjectKey, supersedes } = {}) {
+    if ((subjectKey !== undefined || supersedes !== undefined)
+      && typeof this.archive.resolveSubject !== "function") {
+      throw new Error("subjectKey and supersedes require the RocksDB archive backend.");
+    }
+    return this.archive.put({
+      sessionId: this.sessionId,
+      project: this.project,
+      kind,
+      text,
+      metadata,
+      ...(subjectKey === undefined ? {} : { subjectKey }),
+      ...(supersedes === undefined ? {} : { supersedes }),
+    });
   }
 
   supersedeArchive(request) {
@@ -902,6 +961,9 @@ export class EpochWindowSession {
     this.lastRotationMode = undefined;
     this.effectiveRetainTurns = undefined;
     this.compactionFallbackReason = undefined;
+    this.compactionRotationSnapshot = undefined;
+    this.compactionRotationCommit = undefined;
+    this.reserveAwareRotationGuard = undefined;
     this.toc = [];
     this.activeArchiveIds = new Set();
     this.hintReconciledBoundaryKey = undefined;
@@ -913,22 +975,155 @@ export class EpochWindowSession {
   clearMeasurement() {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
+    this.compactionRotationSnapshot = undefined;
+    this.compactionRotationCommit = undefined;
+    this.reserveAwareRotationGuard = undefined;
   }
 
-  shouldCancelCompaction(reason, observedContextTokens) {
-    const observed = Number(observedContextTokens);
-    return this.config.preventAutoCompaction
-      && reason === "threshold"
-      && this.activeTokens != null
-      && this.activeTokens < this.contextLimits.hardLimitTokens
-      && this.compactionFallbackReason == null
-      // The character estimate excludes the system prompt, tool schemas, and
-      // provider framing. Once the provider-aware measurement reaches the
-      // rotation limit, yielding to Pi is safer than waiting for the hard limit:
-      // the provider may reserve output tokens or enforce a lower input cap.
+  clearReserveAwareRotation(providerTokens) {
+    const observed = Number(providerTokens);
+    if (this.reserveAwareRotationGuard
       && Number.isFinite(observed)
       && observed >= 0
-      && observed < this.contextLimits.rotationTokens;
+      && observed <= this.reserveAwareRotationGuard.threshold) {
+      this.reserveAwareRotationGuard = undefined;
+      this.compactionRotationCommit = undefined;
+    }
+  }
+
+  rotateBeforeCompaction({
+    reason,
+    observedContextTokens,
+    contextWindow,
+    reserveTokens,
+  } = {}) {
+    const observed = Number(observedContextTokens);
+    const windowTokens = Number(contextWindow);
+    const reserved = Number(reserveTokens);
+    const threshold = windowTokens - reserved;
+    const fallback = (fallbackReason) => ({ status: "fallback", reason: fallbackReason });
+    if (!this.config.preventAutoCompaction || reason !== "threshold") {
+      return fallback("unsupported-reason");
+    }
+    if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0
+      || !Number.isSafeInteger(reserved) || reserved < 0
+      || !Number.isFinite(observed) || observed < 0
+      || !Number.isFinite(threshold) || threshold <= 0) {
+      return fallback("invalid-measurement");
+    }
+
+    const committed = this.compactionRotationCommit;
+    if (committed?.generation === this.contextGeneration) {
+      const adjustedProjection = committed.projectedTokens
+        + Math.max(0, observed - committed.observedTokens);
+      if (adjustedProjection <= threshold) {
+        const activeBudget = Math.floor(
+          threshold - committed.unexplainedOverhead
+            - Math.max(0, observed - committed.observedTokens),
+        );
+        this.reserveAwareRotationGuard = { activeBudget, threshold };
+        return {
+          status: "already-rotated",
+          ...committed,
+          activeBudget,
+          projectedTokens: adjustedProjection,
+          threshold,
+        };
+      }
+      return fallback("changed-threshold-or-usage");
+    }
+
+    const snapshot = this.compactionRotationSnapshot;
+    if (!snapshot || snapshot.generation !== this.contextGeneration
+      || !Array.isArray(snapshot.sourceMessages)
+      || !Array.isArray(snapshot.providerMessages)
+      || !Number.isFinite(snapshot.activeTokens)
+      || snapshot.activeTokens < 0) {
+      return fallback("missing-context-snapshot");
+    }
+
+    // Carry every token not explained by the provider-visible epoch estimate as
+    // fixed/trailing overhead. The retained complete-turn suffix must fit in the
+    // remainder of Pi's actual contextWindow-reserveTokens threshold.
+    const unexplainedOverhead = Math.max(0, observed - snapshot.activeTokens);
+    const retainedBudget = Math.floor(threshold - unexplainedOverhead);
+    if (retainedBudget <= TOC_TOKEN_BUDGET) return fallback("no-retained-budget");
+    const target = Math.min(this.contextLimits.rotationTokens, retainedBudget);
+    const plan = planEpochRotation(snapshot.providerMessages, {
+      force: true,
+      tokens: snapshot.activeTokens,
+      turns: snapshot.activeTurns,
+      rotationTokens: target,
+      rotationTurns: this.contextLimits.rotationTurns,
+      retainTurns: this.config.retainTurns,
+      markerTokenReserve: TOC_TOKEN_BUDGET,
+    });
+    if (plan.action !== "rotate") return fallback(plan.reason ?? "unrotatable");
+    const projectedTokens = unexplainedOverhead + plan.estimatedTokens;
+    if (projectedTokens > threshold) return fallback("projection-over-threshold");
+
+    const previous = {
+      boundaryKey: this.boundaryKey,
+      activeTokens: this.activeTokens,
+      activeTurns: this.activeTurns,
+      rotations: this.rotations,
+      forceRotation: this.forceRotation,
+      lastRotationReason: this.lastRotationReason,
+      lastRotationMode: this.lastRotationMode,
+      effectiveRetainTurns: this.effectiveRetainTurns,
+      compactionFallbackReason: this.compactionFallbackReason,
+      toc: this.toc,
+      activeArchiveIds: this.activeArchiveIds,
+      compactionRotationSnapshot: this.compactionRotationSnapshot,
+      compactionRotationCommit: this.compactionRotationCommit,
+      reserveAwareRotationGuard: this.reserveAwareRotationGuard,
+    };
+    try {
+      const rotatedMessages = snapshot.sourceMessages.slice(0, plan.start);
+      const retainedBoundary = snapshot.sourceMessages[plan.start];
+      if (!retainedBoundary) return fallback("missing-retained-boundary");
+      this.archiveTurns(rotatedMessages);
+      this.boundaryKey = messageKey(retainedBoundary);
+      this.rotations += 1;
+      this.forceRotation = false;
+      this.lastRotationReason = "forced";
+      this.lastRotationMode = plan.mode;
+      this.effectiveRetainTurns = plan.retainedTurns;
+      this.compactionFallbackReason = undefined;
+      this.activeTokens = plan.estimatedTokens;
+      this.activeTurns = plan.retainedTurns;
+      this.refreshArchiveProtection();
+      this.onRotation(this.rotationState());
+      const commit = {
+        generation: this.contextGeneration,
+        boundaryKey: this.boundaryKey,
+        observedTokens: observed,
+        unexplainedOverhead,
+        activeBudget: target,
+        projectedTokens,
+        threshold,
+      };
+      this.compactionRotationCommit = commit;
+      this.reserveAwareRotationGuard = { activeBudget: target, threshold };
+      return { status: "rotated", ...commit };
+    } catch {
+      this.boundaryKey = previous.boundaryKey;
+      this.activeTokens = previous.activeTokens;
+      this.activeTurns = previous.activeTurns;
+      this.rotations = previous.rotations;
+      this.forceRotation = previous.forceRotation;
+      this.lastRotationReason = previous.lastRotationReason;
+      this.lastRotationMode = previous.lastRotationMode;
+      this.effectiveRetainTurns = previous.effectiveRetainTurns;
+      this.compactionFallbackReason = previous.compactionFallbackReason;
+      this.toc = previous.toc;
+      this.activeArchiveIds = previous.activeArchiveIds;
+      this.compactionRotationSnapshot = previous.compactionRotationSnapshot;
+      this.compactionRotationCommit = previous.compactionRotationCommit;
+      this.reserveAwareRotationGuard = previous.reserveAwareRotationGuard;
+      try { this.refreshArchiveProtection(); } catch {}
+      return fallback("rotation-failed");
+    }
   }
 
   search(query, options = {}) {

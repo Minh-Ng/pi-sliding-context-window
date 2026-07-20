@@ -40,6 +40,7 @@ const TURN_CAP_VALUES = Object.freeze([10, 20, 30, 40, 50, 75, 100]);
 const CONTEXT_CAP_VALUES = Object.freeze([64_000, 96_000, 128_000, 160_000, 192_000, 256_000]);
 const WINDOW_ARGUMENTS = Object.freeze([
   { value: "status", label: "status", description: "Show context-window status" },
+  { value: "settings", label: "settings", description: "Configure persistent turn and context caps" },
   { value: "rotate", label: "rotate", description: "Queue rotation before the next provider request" },
   { value: "search ", label: "search <query>", description: "Search archived evidence" },
   { value: "recall why", label: "recall why", description: "Explain the last automatic retrieval decision" },
@@ -404,7 +405,7 @@ export function createContextEpochWindow({
     async function openSettings(ctx: ExtensionContext) {
       const active = requireSession();
       if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
-        ctx.ui.notify("/context-window settings require TUI mode.", "error");
+        ctx.ui.notify("/window settings requires TUI mode.", "error");
         return;
       }
       await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
@@ -642,6 +643,9 @@ export function createContextEpochWindow({
     // The provider-context event may run without an active TUI context. Refresh
     // after each complete run so the footer reflects the latest measurement.
     pi.on("agent_settled", (_event, ctx) => {
+      let providerTokens: number | null | undefined;
+      try { providerTokens = ctx.getContextUsage?.()?.tokens; } catch { providerTokens = undefined; }
+      session?.clearReserveAwareRotation(providerTokens);
       session?.refreshArchiveProtection();
       updateStatus(ctx);
     });
@@ -681,11 +685,22 @@ export function createContextEpochWindow({
           .filter((tokens): tokens is number => typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0)
           .reduce((maximum, tokens) => Math.max(maximum, Number(tokens)), Number.NEGATIVE_INFINITY);
 
-        // A proven-safe threshold is the only path that may skip checkpointing.
-        if (hasPreparationMeasurement
-          && hasProviderMeasurement
-          && session.shouldCancelCompaction(event.reason, observedTokens)) {
-          return { cancel: true };
+        // Cancel only after the complete-turn rotation has been archived and
+        // its boundary state persisted. Any planning/admission/cleanup/persist
+        // failure falls through to archive-first custom compaction in this same
+        // awaited hook, before Pi can issue another provider request.
+        if (hasPreparationMeasurement && hasProviderMeasurement) {
+          try {
+            const rotation = session.rotateBeforeCompaction({
+              reason: event.reason,
+              observedContextTokens: observedTokens,
+              contextWindow: Number(ctx.model?.contextWindow ?? contextUsage?.contextWindow),
+              reserveTokens: Number(event.preparation.settings?.reserveTokens),
+            });
+            if (rotation.status === "rotated" || rotation.status === "already-rotated") {
+              return { cancel: true };
+            }
+          } catch { /* checkpoint fallback below remains authoritative */ }
         }
 
         const result = session.checkpointCompaction(event.preparation, {
@@ -928,6 +943,37 @@ export function createContextEpochWindow({
     });
 
     pi.registerTool({
+      name: "context_window_archive",
+      label: "context_window_archive",
+      description: "Store text outside the active model context so it can later be found with BM25 search. Pass subjectKey for a durable fact or decision so one live document per subject stays retrievable; on a correction, pass supersedes to retire the prior live document for that same subjectKey in the same write.",
+      promptGuidelines: [...EVIDENCE_ROUTING_GUIDELINES],
+      parameters: Type.Object({
+        text: Type.String({ minLength: 1, description: "Text to archive" }),
+        kind: Type.Optional(Type.String({ minLength: 1, default: "manual" })),
+        metadata: Type.Optional(Type.Object({}, { additionalProperties: true })),
+        subjectKey: Type.Optional(Type.String({ minLength: 1, description: "Stable subject id for a durable fact or decision" })),
+        supersedes: Type.Optional(Type.Object({
+          documentId: Type.String({ minLength: 1 }),
+          version: Type.Integer({ minimum: 1 }),
+        }, { additionalProperties: false })),
+      }, { additionalProperties: false }),
+      async execute(_toolCallId, params) {
+        const active = requireSession();
+        const id = active.archiveManual({
+          text: params.text,
+          kind: params.kind ?? "manual",
+          metadata: params.metadata ?? {},
+          subjectKey: params.subjectKey,
+          supersedes: params.supersedes,
+        });
+        return {
+          content: [{ type: "text", text: id ? `Archived as ${id}.` : "Nothing to archive." }],
+          details: { id: id ?? null },
+        };
+      },
+    });
+
+    pi.registerTool({
       name: "context_window_supersede",
       label: "context_window_supersede",
       description: SUPERSEDE_TOOL_DESCRIPTION,
@@ -950,11 +996,6 @@ export function createContextEpochWindow({
       },
     });
 
-    pi.registerCommand("context-window", {
-      description: "Configure persistent turn and context caps",
-      handler: async (_args, ctx) => openSettings(ctx),
-    });
-
     pi.registerCommand("window", {
       description: `Context epoch controls: /window [${WINDOW_COMMAND_USAGE}]`,
       getArgumentCompletions: (prefix) => windowArgumentCompletions(prefix, session),
@@ -962,6 +1003,10 @@ export function createContextEpochWindow({
         const active = requireSession();
         updateStatus(ctx);
         const input = args.trim();
+        if (input === "settings") {
+          await openSettings(ctx);
+          return;
+        }
         if (input === "rotate") {
           active.requestRotation();
           updateStatus(ctx);

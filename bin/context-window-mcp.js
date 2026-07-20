@@ -124,6 +124,11 @@ const tools = [
           items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
           maxItems: 16,
         },
+        workingSet: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
         scope: {
           type: "string",
           enum: ["session", "project", "all"],
@@ -144,6 +149,11 @@ const tools = [
       properties: {
         query: { type: "string", maxLength: 65_536 },
         expansionTerms: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
+        workingSet: {
           type: "array",
           items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
           maxItems: 16,
@@ -258,6 +268,7 @@ function callTool(name, args = {}) {
         scope: args.scope ?? "project",
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
+        workingSet: args.workingSet,
         maxEvidence: 12,
         maxTokens: Math.max(39, totalBudget - 640),
       });
@@ -275,6 +286,7 @@ function callTool(name, args = {}) {
         scope: args.scope ?? "project",
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
+        workingSet: args.workingSet,
         // The render step below already commits to config.searchResultTokens
         // as the total output budget; hand that same headroom to render-time
         // excerpt widening instead of leaving it unused behind a small fixed

@@ -19,6 +19,29 @@ export const DEFAULT_EXACT_BUCKET_LIMIT = 32;
 export const DEFAULT_EXACT_ANCHOR_LIMIT = 50_000;
 export const DEFAULT_EXACT_SNIPPET_BYTES = 320;
 export const MAX_EXACT_SNIPPET_BYTES = 16_384;
+// Ranking-only boost applied when an agent-supplied workingSet entry's exact
+// anchor postings intersect a candidate document (see classifyWorkingSetAnchors
+// and lookupExactAnchorDocuments below). Calibrated the same way as
+// IMPORTANCE_PRIOR_MAX_MULTIPLIER (importance.js): capping at 1.12 means a
+// lower-ranked candidate must already be within ~11% of the one above it for
+// this signal alone to promote it past it, so a genuinely stronger relevance
+// gap always survives. Two independently bounded boosts (this one and the
+// importance prior) can compose on a single candidate; each still bounds its
+// own contribution, and MODE_PRIORITY's exact-tier precedence in search.js's
+// compareRankedCandidates is checked ahead of either.
+export const WORKING_SET_BOOST_MULTIPLIER = 1.12;
+const MAX_WORKING_SET_ENTRIES = 16;
+// Bounded work budget for the working-set posting scan: a supplementary
+// ranking signal over a small caller-supplied anchor set, not the primary
+// exact-tier query, so its own budget stays well under DEFAULT_EXACT_WORK_LIMIT.
+export const DEFAULT_WORKING_SET_WORK_LIMIT = 512;
+// The store-contract schema's workingSetAnchors field caps at 8 items (well
+// below MAX_WORKING_SET_ENTRIES' 16) even though a single document's exact
+// postings can intersect every classified anchor: matched provenance is
+// truncated to this bound wherever it is produced (applyWorkingSetBoost in
+// search.js), so a workingSet whose anchors all land on one document can
+// never make a searchResult/gatheredEvidence entry fail schema validation.
+export const MAX_WORKING_SET_ANCHORS_PER_RESULT = 8;
 
 const MAX_SCAN_LIMIT = 100_000;
 const MAX_ANCHOR_BYTES = 512;
@@ -400,6 +423,40 @@ export function planExactQuery(query, options = {}) {
     broadeningAllowed: unique.length === 0,
     anchors: Object.freeze(unique),
   });
+}
+
+/**
+ * Classify an agent-supplied working set (files/symbols/identifiers it is
+ * actively acting on) into the same exact-anchor shape planExactQuery derives
+ * for a query, so a later posting lookup can reuse the exact tier's own
+ * matching machinery for a ranking boost instead of a new index. Each entry is
+ * classified as one whole value via classifyExactValue -- the same path
+ * planExactQuery takes for an exact-looking whole query -- never through the
+ * free-text extractExactAnchors scan, since a working-set entry is already a
+ * discrete anchor an agent named explicitly, not prose to mine anchors out of.
+ * An entry that does not classify (a free-text phrase, or anything with
+ * internal structure not itself a recognized exact form) contributes no
+ * anchor and is silently skipped: this feeds a bounded ranking signal, not a
+ * validation surface, so a caller's non-anchor-shaped entry never throws.
+ */
+export function classifyWorkingSetAnchors(entries, options = {}) {
+  if (!Array.isArray(entries)) return Object.freeze([]);
+  const maxEntries = positiveInteger(options.maxEntries ?? MAX_WORKING_SET_ENTRIES, "maxEntries", 1_024);
+  const anchors = [];
+  const seen = new Set();
+  for (const entry of entries.slice(0, maxEntries)) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (trimmed.length === 0) continue;
+    const classified = classifyExactValue(trimmed);
+    if (!classified) continue;
+    const anchor = queryAnchor(classified);
+    const identity = `${anchor.type}\u0000${anchor.normalized}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    anchors.push(anchor);
+  }
+  return Object.freeze(anchors);
 }
 
 function bucketFor(createdAt, bucketMs) {
@@ -1011,4 +1068,87 @@ export async function lookupExact(store, request) {
       }),
     }),
   });
+}
+
+// Shared by lookupExactAnchorDocuments' two-pass scan below, mirroring
+// scanCaseMode's own per-anchor work-budget accounting above.
+function scanAnchorCaseMode(store, options, anchors, caseMode, matchesByDocument, work) {
+  for (const anchor of anchors) {
+    if (caseMode === "folded" && !anchor.caseSensitive) continue;
+    const remaining = options.workLimit - work.postingsRead;
+    if (remaining <= 0) {
+      work.truncated = true;
+      break;
+    }
+    const term = caseMode === "exact" ? anchor.normalized : anchor.folded;
+    const records = store.scan(exactKeys.termPrefix(options.project, caseMode, term), {
+      reverse: true,
+      limit: Math.min(MAX_SCAN_LIMIT, remaining + 1),
+    });
+    const usable = records.slice(0, remaining);
+    if (records.length > usable.length) work.truncated = true;
+    for (const record of usable) {
+      work.postingsRead += 1;
+      const posting = validatePosting(record);
+      if (!postingVisible(posting, options)) continue;
+      let values = matchesByDocument.get(posting.documentId);
+      if (!values) {
+        values = new Set();
+        matchesByDocument.set(posting.documentId, values);
+      }
+      values.add(anchor.value);
+    }
+  }
+}
+
+/**
+ * Bounded posting scan for a caller-classified anchor set (see
+ * classifyWorkingSetAnchors), independent of any query string. This reuses
+ * the exact tier's own postings (exactKeys.termPrefix) -- no new index -- so
+ * a ranking boost can reference exactly the same exact-match evidence the
+ * exact tier itself would surface for one of these anchors as a query.
+ * Returns only documentId -> the matched anchor value(s), never positions or
+ * snippets: this feeds a ranking signal, not a result surface. The scan's own
+ * workLimit defaults far below the primary exact lookup's (see
+ * DEFAULT_WORKING_SET_WORK_LIMIT), since this augments ranking rather than
+ * resolving the request.
+ */
+export async function lookupExactAnchorDocuments(store, request) {
+  if (store && typeof store.snapshot === "function") {
+    return store.snapshot((snapshot) => lookupExactAnchorDocuments(snapshot, request));
+  }
+  if (!store || typeof store.scan !== "function") {
+    throw new TypeError("Exact anchor lookup requires a RocksStore-compatible store.");
+  }
+  const anchors = Array.isArray(request?.anchors) ? request.anchors : [];
+  const matchesByDocument = new Map();
+  if (anchors.length === 0) {
+    return Object.freeze({ matchesByDocument: Object.freeze(matchesByDocument), truncated: false });
+  }
+  const requestedGeneration = request?.generation;
+  if (!Number.isSafeInteger(requestedGeneration) || requestedGeneration < 0) {
+    throw new TypeError("generation must be a non-negative safe integer.");
+  }
+  const options = {
+    ...normalizedLookupOptions({ ...request, query: undefined }),
+    generation: requestedGeneration,
+    workLimit: positiveInteger(
+      request.workLimit ?? DEFAULT_WORKING_SET_WORK_LIMIT,
+      "workLimit",
+      MAX_SCAN_LIMIT,
+    ),
+  };
+  // Same case-fallback shape as lookupExact/scanCaseMode above: scan
+  // exact-case postings for every anchor first, and only fall back to the
+  // folded (case-insensitive) keyspace if that pass found nothing at all.
+  // Scanning folded unconditionally would spend this signal's small work
+  // budget on a keyspace it usually never needs, and would let a
+  // case-mismatched match fire the boost even when an exact-case posting
+  // for the same anchor exists elsewhere in the result set.
+  const work = { postingsRead: 0, truncated: false };
+  scanAnchorCaseMode(store, options, anchors, "exact", matchesByDocument, work);
+  if (matchesByDocument.size === 0 && options.allowCaseFold && work.postingsRead < options.workLimit) {
+    scanAnchorCaseMode(store, options, anchors, "folded", matchesByDocument, work);
+  }
+  return Object.freeze({ matchesByDocument, truncated: work.truncated });
 }

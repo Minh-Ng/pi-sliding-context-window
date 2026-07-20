@@ -13,10 +13,12 @@ import {
   DEFAULT_EXACT_SNIPPET_BYTES,
   buildExactIndexMutations,
   classifyExactValue,
+  classifyWorkingSetAnchors,
   createExactIndexHandler,
   exactSnippet,
   extractExactAnchors,
   lookupExact,
+  lookupExactAnchorDocuments,
   normalizeExactValue,
   planExactQuery,
 } from "../src/rocksdb/index/exact.js";
@@ -300,6 +302,140 @@ test("lookup honors scope, visibility, newest buckets, work caps, and case fallb
   assert.equal(bounded.work.bucketsVisited, 1);
   assert.equal(bounded.work.truncated, true);
   assert.deepEqual(bounded.results.map(({ documentId }) => documentId), ["other-session"]);
+});
+
+test("classifyWorkingSetAnchors reuses classifyExactValue on each whole entry and dedups by identity", () => {
+  const anchors = classifyWorkingSetAnchors([
+    "src/rocksdb/index/exact.js",
+    "REAP_DRAIN",
+    "  REAP_DRAIN  ",
+    "this is free-text prose, not an anchor",
+    "",
+    "warm-harbor",
+  ]);
+  assert.deepEqual(
+    anchors.map(({ type, value }) => ({ type, value })),
+    [
+      { type: "path", value: "src/rocksdb/index/exact.js" },
+      { type: "symbol", value: "REAP_DRAIN" },
+      { type: "value", value: "warm-harbor" },
+    ],
+  );
+  assert.equal(classifyWorkingSetAnchors(undefined).length, 0);
+  assert.equal(classifyWorkingSetAnchors([]).length, 0);
+  assert.equal(classifyWorkingSetAnchors([42, null, "   "]).length, 0);
+  // Bounded: only the first maxEntries survive, mirroring the request
+  // schema's own maxItems cap upstream.
+  const many = Array.from({ length: 20 }, (_, index) => `ANCHOR_${index}`);
+  assert.equal(classifyWorkingSetAnchors(many).length, 16);
+  assert.equal(classifyWorkingSetAnchors(many, { maxEntries: 3 }).length, 3);
+});
+
+test("lookupExactAnchorDocuments finds documents whose postings intersect classified working-set anchors", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-working-set"));
+  t.after(() => store.close());
+  await admit(store, document("has-anchor", "Discusses REAP_DRAIN behavior at length.", {
+    sessionId: "session-main",
+    createdAt: 1_000,
+  }));
+  await admit(store, document("other", "An unrelated document about something else.", {
+    sessionId: "session-main",
+    createdAt: 2_000,
+  }));
+  await admit(store, document("other-session-anchor", "REAP_DRAIN also appears here.", {
+    sessionId: "session-other",
+    createdAt: 3_000,
+  }));
+  await indexPending(store);
+  const published = await store.get([KEYSPACE.META, "published-index-generation"]);
+  const generation = published?.generation ?? 0;
+
+  const anchors = classifyWorkingSetAnchors(["REAP_DRAIN", "no-match-anchor-xyz"]);
+  assert.equal(anchors.length, 2);
+
+  const scoped = await lookupExactAnchorDocuments(store, {
+    anchors,
+    project: "/workspace/exact",
+    scope: "session",
+    sessionId: "session-main",
+    generation,
+  });
+  assert.deepEqual([...scoped.matchesByDocument.keys()], ["has-anchor"]);
+  assert.deepEqual([...scoped.matchesByDocument.get("has-anchor")], ["REAP_DRAIN"]);
+  assert.equal(scoped.truncated, false);
+
+  const projectScoped = await lookupExactAnchorDocuments(store, {
+    anchors,
+    project: "/workspace/exact",
+    scope: "project",
+    generation,
+  });
+  assert.deepEqual(
+    [...projectScoped.matchesByDocument.keys()].sort(),
+    ["has-anchor", "other-session-anchor"],
+  );
+
+  const noAnchors = await lookupExactAnchorDocuments(store, {
+    anchors: [],
+    project: "/workspace/exact",
+    scope: "project",
+    generation,
+  });
+  assert.equal(noAnchors.matchesByDocument.size, 0);
+  assert.equal(noAnchors.truncated, false);
+
+  const bounded = await lookupExactAnchorDocuments(store, {
+    anchors,
+    project: "/workspace/exact",
+    scope: "project",
+    generation,
+    workLimit: 1,
+  });
+  assert.equal(bounded.truncated, true);
+
+  await assert.rejects(
+    lookupExactAnchorDocuments(store, { anchors, project: "/workspace/exact", scope: "project" }),
+    /generation must be a non-negative safe integer/,
+  );
+});
+
+test("lookupExactAnchorDocuments falls back to the folded keyspace only when the exact-case pass found nothing at all, mirroring lookupExact's own global case fallback", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-working-set-case-fallback"));
+  t.after(() => store.close());
+  await admit(store, document("exact-hit", "REAP_DRAIN appears exactly as written.", {
+    sessionId: "session-main",
+    createdAt: 1_000,
+  }));
+  await admit(store, document("folded-only", "warm-harbor only ever appears lowercase.", {
+    sessionId: "session-main",
+    createdAt: 2_000,
+  }));
+  await indexPending(store);
+  const published = await store.get([KEYSPACE.META, "published-index-generation"]);
+  const generation = published?.generation ?? 0;
+
+  // WARM-HARBOR never appears in exact case anywhere in the store; scanned
+  // alone, it must still be found via the folded fallback.
+  const foldedOnly = await lookupExactAnchorDocuments(store, {
+    anchors: classifyWorkingSetAnchors(["WARM-HARBOR"]),
+    project: "/workspace/exact",
+    scope: "project",
+    generation,
+  });
+  assert.deepEqual([...foldedOnly.matchesByDocument.keys()], ["folded-only"]);
+
+  // Once a different anchor in the same request already resolves an
+  // exact-case match, the request has "found something" overall, so the
+  // folded fallback (a global gate, exactly like lookupExact/scanCaseMode's
+  // own candidates.size === 0 condition, not a per-anchor one) never runs --
+  // WARM-HARBOR's case-mismatched document is not found this time.
+  const withExactHit = await lookupExactAnchorDocuments(store, {
+    anchors: classifyWorkingSetAnchors(["REAP_DRAIN", "WARM-HARBOR"]),
+    project: "/workspace/exact",
+    scope: "project",
+    generation,
+  });
+  assert.deepEqual([...withExactHit.matchesByDocument.keys()], ["exact-hit"]);
 });
 
 test("exact lookup counts a tombstoned document with no live replacement as expired without exposing its content", async (t) => {

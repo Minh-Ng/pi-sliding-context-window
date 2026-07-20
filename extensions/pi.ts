@@ -874,6 +874,10 @@ export function createContextEpochWindow({
           maxItems: 16,
           description: "Likely synonyms or domain terms for hybrid broadening",
         })),
+        workingSet: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+          maxItems: 16,
+          description: "Files/symbols/identifiers you are currently acting on, for a ranking boost only",
+        })),
         scope: Type.Optional(Type.Union([
           Type.Literal("session"),
           Type.Literal("project"),
@@ -890,6 +894,7 @@ export function createContextEpochWindow({
           scope: params.scope ?? "session",
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
+          workingSet: params.workingSet,
           maxEvidence: 12,
           maxTokens: Math.max(39, totalBudget - 640),
         }));
@@ -921,6 +926,10 @@ export function createContextEpochWindow({
           maxItems: 16,
           description: "Likely synonyms or domain terms for lexical expansion; keep query as the original request",
         })),
+        workingSet: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+          maxItems: 16,
+          description: "Files/symbols/identifiers you are currently acting on, for a ranking boost only",
+        })),
         relation: Type.Optional(Type.Union(
           STRUCTURAL_RELATIONS.map((relation) => Type.Literal(relation)),
           { description: "Structural archived-message relation for anchorless references" },
@@ -947,6 +956,7 @@ export function createContextEpochWindow({
           scope: params.scope ?? "session",
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
+          workingSet: params.workingSet,
           // Hand render-time excerpt widening the same budget this call
           // already commits to below via formatSearchResults; its own cap
           // still bounds the total.

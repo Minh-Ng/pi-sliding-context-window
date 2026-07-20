@@ -128,6 +128,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
   const search = await searchArchive(store, {
     query: request.query,
     ...(request.expansionTerms === undefined ? {} : { expansionTerms: request.expansionTerms }),
+    ...(request.workingSet === undefined ? {} : { workingSet: request.workingSet }),
     relation: null,
     semanticPolicy: "always",
     scope: request.scope,
@@ -248,6 +249,9 @@ export async function gatherArchive(store, rawRequest, options = {}) {
           score: item.candidate.score,
           retrievalMode: item.candidate.retrievalMode,
           ...(item.candidate.reranked === true ? { reranked: true } : {}),
+          ...(item.candidate.workingSetAnchors?.length > 0
+            ? { workingSetAnchors: [...item.candidate.workingSetAnchors] }
+            : {}),
         }
         : {}),
     });

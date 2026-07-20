@@ -850,6 +850,9 @@ export class DaemonArchive {
       ...(Array.isArray(options.expansionTerms)
         ? { expansionTerms: [...new Set(options.expansionTerms.map(String).filter(Boolean))].slice(0, 16) }
         : {}),
+      ...(Array.isArray(options.workingSet)
+        ? { workingSet: [...new Set(options.workingSet.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
       relation: options.relation ?? null,
       semanticPolicy: options.semanticPolicy ?? "auto",
       expansionPolicy: options.expansionPolicy ?? "auto",
@@ -924,6 +927,14 @@ export class DaemonArchive {
         // flicker on/off across otherwise-identical requests depending on
         // incidental tie patterns.
         ...(candidate.reranked === true ? { reranked: true } : {}),
+        // Same expandedTerms provenance pattern above, for the request's
+        // workingSet ranking boost (src/retrieval/search.js's
+        // applyWorkingSetBoost): the working-set anchor value(s) whose exact
+        // postings intersected this specific document, present only when
+        // this result was actually boosted.
+        ...(candidate.workingSetAnchors === undefined || candidate.workingSetAnchors.length === 0
+          ? {}
+          : { workingSetAnchors: [...candidate.workingSetAnchors] }),
         historical: candidate.historical,
         superseded: candidate.superseded,
         source: structuredClone(candidate.source),
@@ -978,6 +989,9 @@ export class DaemonArchive {
       ...(Array.isArray(options.expansionTerms)
         ? { expansionTerms: [...new Set(options.expansionTerms.map(String).filter(Boolean))].slice(0, 16) }
         : {}),
+      ...(Array.isArray(options.workingSet)
+        ? { workingSet: [...new Set(options.workingSet.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
       intent,
       scope: options.scope ?? "session",
       ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
@@ -1007,6 +1021,9 @@ export class DaemonArchive {
         ...(item.score === undefined ? {} : { score: item.score }),
         ...(item.retrievalMode === undefined ? {} : { retrievalMode: item.retrievalMode }),
         ...(item.reranked === true ? { reranked: true } : {}),
+        ...(item.workingSetAnchors === undefined || item.workingSetAnchors.length === 0
+          ? {}
+          : { workingSetAnchors: [...item.workingSetAnchors] }),
       };
     });
     return {

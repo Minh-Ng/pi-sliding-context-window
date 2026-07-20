@@ -203,6 +203,14 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
     assert.equal(search.inputSchema.properties.query.maxLength, 65_536);
     assert.equal(recall.inputSchema.properties.id.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
     assert.equal(archiveTool.inputSchema.properties.text.maxLength, MAX_DOCUMENT_TEXT_BYTES);
+    // workingSet is a ranking-boost input only, mirrored on both explicit
+    // tools with the same bound as expansionTerms, never widening what
+    // additionalProperties: false otherwise rejects.
+    for (const tool of [search, gather]) {
+      assert.equal(tool.inputSchema.additionalProperties, false);
+      assert.equal(tool.inputSchema.properties.workingSet.maxItems, 16);
+      assert.equal(tool.inputSchema.properties.workingSet.items.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
+    }
     assert.match(search.description, /historical evidence candidates/);
     assert.match(search.description, /context_recall.*exact original wording or source evidence/);
     assert.match(search.description, /live tools—not the archive—for current mutable state/);

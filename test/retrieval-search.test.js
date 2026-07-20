@@ -20,6 +20,7 @@ import { readLease } from "../src/retrieval/leases.js";
 import { recallArchive } from "../src/retrieval/recall.js";
 import { preflightArchive } from "../src/retrieval/preflight.js";
 import {
+  applyWorkingSetBoost,
   findStoredWindowForByteRange,
   fuseCandidates,
   normalizeModeScore,
@@ -28,7 +29,11 @@ import {
 import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
 import { LocalReranker } from "../src/semantic/reranker.js";
 import { perEvidenceSnippetBudget } from "../src/presentation.js";
-import { DEFAULT_EXACT_SNIPPET_BYTES, MAX_EXACT_SNIPPET_BYTES } from "../src/rocksdb/index/exact.js";
+import {
+  DEFAULT_EXACT_SNIPPET_BYTES,
+  MAX_EXACT_SNIPPET_BYTES,
+  WORKING_SET_BOOST_MULTIPLIER,
+} from "../src/rocksdb/index/exact.js";
 import { DEFAULT_BM25_SEARCH_LIMITS, MAX_BM25_SNIPPET_CHARACTERS } from "../src/rocksdb/index/bm25.js";
 
 function temporaryStorePath(t, name) {
@@ -258,6 +263,7 @@ function searchRequest(query, overrides = {}) {
     excludeVisibleSourceKeys: overrides.excludeVisibleSourceKeys ?? [],
     hintBudgetTokens: overrides.hintBudgetTokens ?? 160,
     expansionPolicy: overrides.expansionPolicy,
+    workingSet: overrides.workingSet,
   };
 }
 
@@ -324,6 +330,222 @@ test("exact-first search returns a signed leased locator that recalls exact sour
   });
   assert.equal(recalled.status, "resolved");
   assert.match(recalled.text, /REAP_DRAIN/u);
+});
+
+async function publishedGenerationOf(store) {
+  const published = await store.get([KEYSPACE.META, "published-index-generation"]);
+  return published?.generation ?? 0;
+}
+
+// applyWorkingSetBoost is exercised here against a hand-built candidate pool
+// (like fuseCandidates' own tierOneCandidate tests above) rather than a real
+// BM25 fixture, but -- unlike a boost that multiplied a bounded multiplier
+// directly onto RRF fusion-space rankingScore -- the expected outcome below
+// is derived by independently re-running the same real fuseCandidates the
+// implementation itself must use, not a hand-picked rankingScore literal.
+// This is deliberate: a direct-multiply implementation and a real-refusion
+// implementation land on different numbers for the very scenarios these
+// tests target, so hardcoding either one's numbers would only prove the
+// implementation matches itself.
+test("workingSet boost promotes a near-tied candidate via real RRF re-fusion in normalizedScore space", async (t) => {
+  const { store, worker } = await fixture(t, "search-working-set-promote");
+  await admit(store, "target", "Discusses PALLET_ROUTE_PLANNER coordination at length.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+
+  const rawCandidates = [
+    tierOneCandidate("rank1", "lexical", 0.95, { version: 1 }),
+    tierOneCandidate("rank2", "lexical", 0.85, { version: 1 }),
+    tierOneCandidate("rank3", "lexical", 0.55, { version: 1 }),
+    // Pre-boost normalizedScore close enough below rank3's that the bounded
+    // 1.12x multiplier alone (0.50 * 1.12 = 0.56) closes the gap.
+    tierOneCandidate("target", "lexical", 0.50, { version: 1 }),
+    tierOneCandidate("rank5", "lexical", 0.30, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    workingSet: ["PALLET_ROUTE_PLANNER"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  const boosted = await applyWorkingSetBoost(store, collected, request);
+  assert.deepEqual(
+    boosted.candidates.map(({ documentId }) => documentId),
+    ["rank1", "rank2", "target", "rank3", "rank5"],
+  );
+  const boostedTarget = boosted.candidates.find(({ documentId }) => documentId === "target");
+  assert.deepEqual(boostedTarget.workingSetAnchors, ["PALLET_ROUTE_PLANNER"]);
+
+  // Ground truth: the same real fuseCandidates, re-run over a shadow pool
+  // with only "target"'s normalizedScore boosted -- exactly what
+  // applyWorkingSetBoost must do internally.
+  const boostedRawCandidates = rawCandidates.map((candidate) => (
+    candidate.documentId === "target"
+      ? { ...candidate, normalizedScore: candidate.normalizedScore * WORKING_SET_BOOST_MULTIPLIER }
+      : candidate
+  ));
+  const expected = fuseCandidates(boostedRawCandidates, boostedRawCandidates.length);
+  for (const documentId of ["rank1", "rank2", "rank3", "target", "rank5"]) {
+    const actual = boosted.candidates.find((candidate) => candidate.documentId === documentId);
+    const reference = expected.find((candidate) => candidate.documentId === documentId);
+    assert.equal(actual.rankingScore, reference.fusionScore);
+  }
+  // rank1/rank2/rank5 never trade rank position with target (only rank3
+  // does), so real RRF re-fusion leaves their score byte-identical to the
+  // pre-boost fusion and they carry no workingSetAnchors provenance --
+  // unlike rank3, whose own score DOES move because target displaced its
+  // rank position, which a correct implementation must allow.
+  const original = fuseCandidates(rawCandidates, rawCandidates.length);
+  for (const documentId of ["rank1", "rank2", "rank5"]) {
+    const before = original.find((candidate) => candidate.documentId === documentId);
+    const after = boosted.candidates.find((candidate) => candidate.documentId === documentId);
+    assert.equal(after.rankingScore, before.fusionScore);
+    assert.equal(after.workingSetAnchors, undefined);
+  }
+});
+
+// This scenario is the one the boost's own bound is supposed to protect: a
+// document ("winner") corroborated by two retrieval modes has its maxRrf
+// inflated by that corroboration, which compresses the adjacent rankingScore
+// gap between "strong" and "weak" (0.90 vs 0.68 raw, but 0.594 vs 0.533
+// fused -- a 1.114x gap) below WORKING_SET_BOOST_MULTIPLIER's 1.12x bound. A
+// boost that multiplied 1.12x directly onto that compressed rankingScore
+// would promote "weak" past "strong"; this is exactly the failure mode a
+// hand-built rankingScore-space test (which controls the gap directly)
+// cannot reproduce.
+test("workingSet boost never overrules a strong relevance gap compressed by cross-mode RRF corroboration", async (t) => {
+  const { store, worker } = await fixture(t, "search-working-set-counter-case");
+  await admit(store, "weak", "Mentions WEAK_ANCHOR_SYMBOL only in passing.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+
+  const rawCandidates = [
+    tierOneCandidate("winner", "lexical", 0.99, { version: 1 }),
+    tierOneCandidate("winner", "semantic", 0.99, { version: 1 }),
+    tierOneCandidate("strong", "lexical", 0.90, { version: 1 }),
+    tierOneCandidate("weak", "lexical", 0.68, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    workingSet: ["WEAK_ANCHOR_SYMBOL"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  const boosted = await applyWorkingSetBoost(store, collected, request);
+  // The boosted candidate is still the one with the working-set anchor, but
+  // the winner/strong order the RRF blend already established survives.
+  assert.deepEqual(
+    boosted.candidates.map(({ documentId }) => documentId),
+    ["winner", "strong", "weak"],
+  );
+  const boostedWeak = boosted.candidates.find(({ documentId }) => documentId === "weak");
+  assert.deepEqual(boostedWeak.workingSetAnchors, ["WEAK_ANCHOR_SYMBOL"]);
+  const original = fuseCandidates(rawCandidates, rawCandidates.length);
+  const winner = boosted.candidates.find(({ documentId }) => documentId === "winner");
+  const strong = boosted.candidates.find(({ documentId }) => documentId === "strong");
+  assert.equal(winner.rankingScore, original.find(({ documentId }) => documentId === "winner").fusionScore);
+  assert.equal(strong.rankingScore, original.find(({ documentId }) => documentId === "strong").fusionScore);
+  assert.equal(winner.workingSetAnchors, undefined);
+  assert.equal(strong.workingSetAnchors, undefined);
+  // The boost still moves weak's own score upward, just not past strong's.
+  assert.ok(boostedWeak.rankingScore > original.find(({ documentId }) => documentId === "weak").fusionScore);
+  assert.ok(boostedWeak.rankingScore < strong.rankingScore);
+});
+
+test("workingSet boost is a no-op when the field is absent, unclassifiable, or matches no candidate document", async (t) => {
+  const { store, worker } = await fixture(t, "search-working-set-noop");
+  await admit(store, "target", "Discusses PALLET_ROUTE_PLANNER coordination at length.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+  const collected = {
+    generation,
+    candidates: [tierOneCandidate("target", "lexical", 0.19, { version: 1, rankingScore: 0.68 })],
+  };
+  const baseRequest = {
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  assert.equal(await applyWorkingSetBoost(store, collected, baseRequest), collected);
+  assert.equal(
+    await applyWorkingSetBoost(store, collected, { ...baseRequest, workingSet: ["free text, not an anchor"] }),
+    collected,
+  );
+  assert.equal(
+    await applyWorkingSetBoost(store, collected, { ...baseRequest, workingSet: ["NO_SUCH_DOCUMENT_ANCHOR"] }),
+    collected,
+  );
+});
+
+test("end-to-end explicit search accepts workingSet and surfaces boosted-result provenance", async (t) => {
+  const { store, worker } = await fixture(t, "search-working-set-e2e");
+  await admit(store, "on-topic", "General gateway routing overview mentions batching briefly.", { createdAt: 100 });
+  await admit(
+    store,
+    "on-topic-anchor",
+    "General gateway routing overview mentions batching briefly. PALLET_ROUTE_PLANNER lives here.",
+    { createdAt: 200 },
+  );
+  await worker.drain();
+  const response = await searchArchive(store, withoutUndefined(searchRequest("gateway routing batching overview", {
+    limit: 5,
+    workingSet: ["PALLET_ROUTE_PLANNER"],
+  })), { now: 1_000, applyImportancePrior: true, recencyDecay: true });
+  assert.equal(response.status, "resolved");
+  const boosted = response.results.find(({ documentId }) => documentId === "on-topic-anchor");
+  assert.ok(boosted, "the anchor-carrying document must still be a returned result");
+  assert.deepEqual(boosted.workingSetAnchors, ["PALLET_ROUTE_PLANNER"]);
+  for (const result of response.results) {
+    if (result.documentId !== "on-topic-anchor") {
+      assert.deepEqual(result.workingSetAnchors, []);
+    }
+  }
+});
+
+// Regression for workingSetAnchors provenance exceeding the
+// searchResult/gatheredEvidence schema's maxItems: 8 bound. workingSet
+// itself accepts up to 16 entries, and a single document's exact postings
+// can intersect every one of them, so without truncating this provenance at
+// the point it is produced, a request whose working set concentrates on one
+// document throws ContractError instead of returning results.
+test("end-to-end explicit search caps workingSetAnchors provenance at the schema's maxItems bound", async (t) => {
+  const { store, worker } = await fixture(t, "search-working-set-cap");
+  const anchors = Array.from({ length: 10 }, (_, index) => `NINE_PLUS_ANCHOR_${index}`);
+  await admit(store, "on-topic", "General gateway routing overview mentions batching briefly.", { createdAt: 100 });
+  await admit(
+    store,
+    "many-anchors",
+    `General gateway routing overview mentions batching briefly. ${anchors.join(" ")} all live here.`,
+    { createdAt: 200 },
+  );
+  await worker.drain();
+  const response = await searchArchive(store, withoutUndefined(searchRequest("gateway routing batching overview", {
+    limit: 5,
+    workingSet: anchors,
+  })), { now: 1_000, applyImportancePrior: true });
+  assert.equal(response.status, "resolved");
+  const boosted = response.results.find(({ documentId }) => documentId === "many-anchors");
+  assert.ok(boosted, "the multi-anchor document must still be a returned result");
+  // All 10 anchors' exact postings intersect this one document, so the
+  // provenance array is genuinely truncated (not merely under a small
+  // natural count) to the schema's maxItems: 8 bound.
+  assert.equal(boosted.workingSetAnchors.length, 8);
 });
 
 test("render-time excerpt widening expands an exact match symmetrically within its evidence budget", async (t) => {

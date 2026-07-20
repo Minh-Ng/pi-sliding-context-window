@@ -391,6 +391,12 @@ const searchRequest = object({
   // noise reduction should ask for it. Absent entirely on the automatic
   // preflight path.
   dedupe: boolean(),
+  // Optional (not in the required list): explicit paths/symbols/identifiers
+  // the agent is actively acting on. Ranking-boost input only (see
+  // classifyWorkingSetAnchors/lookupExactAnchorDocuments in
+  // src/rocksdb/index/exact.js) -- never a filter, never widens what a
+  // request can retrieve. Absent entirely on the automatic preflight path.
+  workingSet: array(identifier, { maxItems: 16 }),
 }, ["query", "relation", "scope", "limit", "excludeVisibleSourceKeys", "hintBudgetTokens"]);
 
 const searchResult = object({
@@ -428,6 +434,19 @@ const searchResult = object({
   // automatic preflight result and on any explicit result the reranker left
   // untouched (disabled, unavailable, or outside its candidate window).
   reranked: boolean(),
+  // Provenance for the request's workingSet ranking boost (see
+  // classifyWorkingSetAnchors/lookupExactAnchorDocuments in
+  // src/rocksdb/index/exact.js), matching the expandedTerms provenance
+  // pattern above: the working-set anchor value(s) whose exact postings
+  // intersected this document, so `/window recall why` can explain a boost
+  // (e.g. "boosted by working-set anchor <x>"). Like expandedTerms, this
+  // field is always present but only non-empty when this specific result was
+  // actually boosted -- empty whenever workingSet is omitted, matched no
+  // anchor, or matched a different document. Bounded independently of the
+  // request's workingSet maxItems (16): every classified anchor can
+  // independently intersect one document, so this is truncated to 8 wherever
+  // it is produced (MAX_WORKING_SET_ANCHORS_PER_RESULT, exact.js).
+  workingSetAnchors: array(identifier, { maxItems: 8 }),
   locator: identifier,
   source: SOURCE_REFERENCE_SCHEMA,
 }, [
@@ -569,6 +588,10 @@ const gatheredEvidence = object({
   // anchor evidence only (see the score/retrievalMode comment above;
   // before/after neighbors are never reranked).
   reranked: boolean(),
+  // Same workingSet ranking-boost provenance as store.search's searchResult
+  // (see that field's comment), carried onto anchor evidence only -- the same
+  // restriction as score/retrievalMode/reranked above.
+  workingSetAnchors: array(identifier, { maxItems: 8 }),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({
@@ -783,6 +806,10 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       // store.search's dedupe, for the same reason -- collapsing near-dup
       // clusters is never a safe default.
       dedupe: boolean(),
+      // Same working-set ranking-boost input as store.search's workingSet
+      // above (optional, not required): forwarded into gather's internal
+      // search call so its anchor evidence gets the same boost.
+      workingSet: array(identifier, { maxItems: 16 }),
     }, [
       "query",
       "intent",

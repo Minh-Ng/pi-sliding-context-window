@@ -205,6 +205,37 @@ test("gather carries a search-ranked score only on anchor evidence, never on tra
   assert.equal(Object.hasOwn(after, "retrievalMode"), false);
 });
 
+test("gather forwards workingSet through to its internal search call and surfaces boosted-anchor provenance", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("anchor", "Reusable migration procedure PALLET_ROUTE_PLANNER anchor.", 100);
+  await admit("step-1", "First continuation detail.", 110);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "Reusable migration procedure anchor",
+    workingSet: ["PALLET_ROUTE_PLANNER"],
+    intent: "workflow",
+    limit: 1,
+    before: 0,
+    after: 1,
+    neighborhoodAnchors: 1,
+    maxEvidence: 2,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.deepEqual(gather.evidence.map(({ relation }) => relation), ["anchor", "after"]);
+  const [anchor, after] = gather.evidence;
+  // The anchor's own document carries the working-set anchor's exact
+  // posting, so the boost's provenance survives gather's own evidence
+  // shaping; the chronological "after" neighbor is never a ranked hit (see
+  // the score/retrievalMode test above) and never carries it either.
+  assert.deepEqual(anchor.workingSetAnchors, ["PALLET_ROUTE_PLANNER"]);
+  assert.equal(Object.hasOwn(after, "workingSetAnchors"), false);
+});
+
 test("gather surfaces a tombstoned document with no live replacement as an expired-match count, never its content", async (t) => {
   const { store, worker, admit } = await fixture(t);
   await admit("expired-doc", "GATHER_EXPIRED_ANCHOR sensitive prior detail.", 100);

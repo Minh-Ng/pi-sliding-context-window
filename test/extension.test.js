@@ -79,6 +79,13 @@ test("archive tools advertise evidence-source routing", async () => {
 
   assert.equal(gather.description, GATHER_TOOL_DESCRIPTION);
   assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);
+  // workingSet is a ranking-boost input only, on both explicit tools, with
+  // the same additionalProperties: false contract as every other parameter.
+  for (const tool of [search, gather]) {
+    assert.equal(tool.parameters.additionalProperties, false);
+    assert.equal(tool.parameters.properties.workingSet.items.minLength, 1);
+    assert.equal(tool.parameters.properties.workingSet.maxItems, 16);
+  }
   assert.equal(search.parameters.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
   assert.match(search.parameters.properties.scope.description, /all.*does not bypass project authorization/i);
   assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);

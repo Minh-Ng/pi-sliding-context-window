@@ -100,6 +100,8 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(SEARCH_TOOL_DESCRIPTION, /preserve temporal qualifiers.*inspect every returned candidate.*do not default to rank 1/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /newest relevant candidate.*snippet is truncated or omits the requested value.*older explicit value/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /event dates or old→new values.*preserve uncertainty/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /acting on specific files, symbols, or identifiers.*workingSet.*never overrides a clearly stronger match/i);
+  assert.match(GATHER_TOOL_DESCRIPTION, /acting on specific files, symbols, or identifiers.*workingSet.*without overriding a clearly stronger match/i);
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /Source timestamps order messages, not necessarily events/i.test(guideline)));
   // Fact-shaped archiving: settled facts get a stable subjectKey at write time,
   // superseded on correction so one live document per subject stays retrievable.
@@ -117,9 +119,10 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   });
   const digest = createHash("sha256").update(JSON.stringify(EFFECTIVE_PRODUCTION_GUIDANCE)).digest("hex");
   assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_HASH, `sha256:${digest}`);
-  // The subjectKey/host-memory guidance additions invalidate the prior
-  // fingerprint, so the version identifier must be bumped past it.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "11");
+  // The workingSet ranking-boost mention in SEARCH_TOOL_DESCRIPTION
+  // invalidates the prior fingerprint, so the version identifier must be
+  // bumped past it.
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "12");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

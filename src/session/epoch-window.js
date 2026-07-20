@@ -636,6 +636,7 @@ export class EpochWindowSession {
       limit: options.limit ?? this.config.searchResults,
       relation: options.relation,
       expansionTerms: options.expansionTerms,
+      workingSet: options.workingSet,
       ...(Number.isSafeInteger(options.hintBudgetTokens) ? { hintBudgetTokens: options.hintBudgetTokens } : {}),
     };
     if (this.archive.searchDetailed) {
@@ -660,6 +661,7 @@ export class EpochWindowSession {
       intent: options.intent ?? "auto",
       limit: options.limit ?? this.config.searchResults,
       expansionTerms: options.expansionTerms,
+      workingSet: options.workingSet,
       before: options.before,
       after: options.after,
       neighborhoodAnchors: options.neighborhoodAnchors,

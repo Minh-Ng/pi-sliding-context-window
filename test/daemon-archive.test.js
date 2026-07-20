@@ -1033,6 +1033,89 @@ test("searchDetailed surfaces cross-encoder rerank provenance instead of droppin
   }
 });
 
+test("searchDetailed forwards the workingSet ranking boost's anchor provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-working-set-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/working-set-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // The daemon's own store.search response can carry `workingSetAnchors`
+    // on a result applyWorkingSetBoost promoted (proven end-to-end in
+    // retrieval-search.test.js); this test isolates the facade's own
+    // reshaping of that response, which builds its result objects from a
+    // fixed key set (matching the expandedTerms/reranked provenance fields,
+    // kept alongside them) -- the exact place a provenance field can be
+    // silently dropped even though the daemon itself already returned it.
+    let forwardedWorkingSet;
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.search") return realRequest(operation, payload, options);
+      forwardedWorkingSet = payload.workingSet;
+      return {
+        mode: "lexical",
+        status: "resolved",
+        indexGeneration: 0,
+        expiredMatches: { count: 0, retentionClasses: [] },
+        results: [
+          {
+            documentId: "boosted-doc",
+            version: 1,
+            kind: "note",
+            score: 0.9,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            workingSetAnchors: ["PALLET_ROUTE_PLANNER"],
+            snippet: "boosted candidate",
+            locator: "cw1.boosted-doc",
+            source: { sessionId: "session-a" },
+          },
+          {
+            documentId: "untouched-doc",
+            version: 1,
+            kind: "note",
+            score: 0.5,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            snippet: "untouched candidate",
+            locator: "cw1.untouched-doc",
+            source: { sessionId: "session-a" },
+          },
+        ],
+      };
+    };
+    const detailed = archive.searchDetailed("anything", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/working-set-wiring",
+      scope: "session",
+      workingSet: ["PALLET_ROUTE_PLANNER"],
+    });
+    assert.deepEqual(forwardedWorkingSet, ["PALLET_ROUTE_PLANNER"]);
+    assert.deepEqual(detailed.results[0].workingSetAnchors, ["PALLET_ROUTE_PLANNER"]);
+    assert.equal(
+      Object.hasOwn(detailed.results[1], "workingSetAnchors"),
+      false,
+      "workingSetAnchors is present only on the specific result the boost actually matched",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("gatherDetailed forwards the store's expired-match summary instead of dropping it", async () => {
   const paths = fixture("context-window-daemon-gather-expired-wiring-");
   let archive;
@@ -1166,6 +1249,95 @@ test("gatherDetailed forwards cross-encoder rerank provenance instead of droppin
       Object.hasOwn(gathered.evidence[1], "reranked"),
       false,
       "reranked is present only on evidence the cross-encoder scored, matching searchDetailed's forwarding",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("gatherDetailed forwards the workingSet ranking boost's anchor provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-gather-working-set-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/gather-working-set-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // gather.js already puts `workingSetAnchors` on anchor evidence the
+    // boost matched (proven end-to-end in retrieval-search.test.js); this
+    // test isolates the facade's own reshaping of that response, matching
+    // the reranked-forwarding regression test above for the same field.
+    const document = {
+      documentId: "boosted-doc",
+      version: 1,
+      sessionId: "session-a",
+      project: "/project/gather-working-set-wiring",
+      kind: "note",
+      createdAt: Date.now(),
+      renderedText: "rendered anchor text",
+      text: "raw anchor text",
+      stalenessLabel: "current",
+      chunks: [{ chunkId: "c1", ordinal: 0, startByte: 0, endByte: 4, text: "text" }],
+      continuationLocators: [],
+      sourceMessages: { status: "available", keys: [], totalKeys: 0, truncated: false },
+    };
+    let forwardedWorkingSet;
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.gather") return realRequest(operation, payload, options);
+      forwardedWorkingSet = payload.workingSet;
+      return {
+        status: "resolved",
+        mode: "lexical",
+        intent: payload.intent ?? "auto",
+        anchorCount: 1,
+        candidateCount: 1,
+        returnedTokens: 0,
+        truncated: false,
+        hasMore: false,
+        evidence: [
+          {
+            relation: "anchor",
+            anchorRank: 1,
+            distance: 0,
+            locator: "cw1.boosted-doc",
+            document,
+            score: 0.9,
+            retrievalMode: "lexical",
+            workingSetAnchors: ["PALLET_ROUTE_PLANNER"],
+          },
+          {
+            relation: "before",
+            anchorRank: 1,
+            distance: 1,
+            locator: "cw1.untouched-doc",
+            document: { ...document, documentId: "untouched-doc" },
+          },
+        ],
+        expiredMatches: { count: 0, retentionClasses: [] },
+      };
+    };
+    const gathered = archive.gatherDetailed("WORKING_SET_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/gather-working-set-wiring",
+      scope: "session",
+      workingSet: ["PALLET_ROUTE_PLANNER"],
+    });
+    assert.deepEqual(forwardedWorkingSet, ["PALLET_ROUTE_PLANNER"]);
+    assert.deepEqual(gathered.evidence[0].workingSetAnchors, ["PALLET_ROUTE_PLANNER"]);
+    assert.equal(
+      Object.hasOwn(gathered.evidence[1], "workingSetAnchors"),
+      false,
+      "workingSetAnchors is present only on evidence the boost actually matched, matching searchDetailed's forwarding",
     );
   } finally {
     try { archive?.close(); } catch {}

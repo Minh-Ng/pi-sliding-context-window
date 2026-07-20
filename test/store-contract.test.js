@@ -831,6 +831,46 @@ test("gathered anchor evidence may carry an optional relevance score and mode, s
   }
 });
 
+test("workingSet is an optional ranking-boost field on store.search/store.gather requests and results", () => {
+  const searchWithWorkingSet = assertStoreRequest("store.search", {
+    ...requests["store.search"],
+    workingSet: ["src/rocksdb/index/exact.js", "REAP_DRAIN"],
+  });
+  assert.deepEqual(searchWithWorkingSet.workingSet, ["src/rocksdb/index/exact.js", "REAP_DRAIN"]);
+  // Absent entirely remains valid: workingSet is optional, not required.
+  assertStoreRequest("store.search", requests["store.search"]);
+
+  const gatherWithWorkingSet = assertStoreRequest("store.gather", {
+    ...requests["store.gather"],
+    workingSet: ["src/rocksdb/index/exact.js"],
+  });
+  assert.deepEqual(gatherWithWorkingSet.workingSet, ["src/rocksdb/index/exact.js"]);
+
+  for (const operation of ["store.search", "store.gather"]) {
+    expectContractError(
+      () => assertStoreRequest(operation, {
+        ...requests[operation],
+        workingSet: Array.from({ length: 17 }, (_, index) => `anchor-${index}`),
+      }),
+      { code: "INVALID_REQUEST", path: "$.payload.workingSet" },
+    );
+  }
+
+  const boostedResult = assertStoreResult("store.search", {
+    ...results["store.search"],
+    results: [{ ...results["store.search"].results[0], workingSetAnchors: ["REAP_DRAIN"] }],
+  });
+  assert.deepEqual(boostedResult.results[0].workingSetAnchors, ["REAP_DRAIN"]);
+  // Absent entirely remains valid: most results are never boosted.
+  assertStoreResult("store.search", results["store.search"]);
+
+  const boostedAnchorEvidence = assertStoreResult("store.gather", {
+    ...results["store.gather"],
+    evidence: [{ ...results["store.gather"].evidence[0], workingSetAnchors: ["REAP_DRAIN"] }],
+  });
+  assert.deepEqual(boostedAnchorEvidence.evidence[0].workingSetAnchors, ["REAP_DRAIN"]);
+});
+
 test("unknown operations and fields fail with stable codes and paths", () => {
   expectContractError(
     () => assertStoreRequest("store.destroy", {}),

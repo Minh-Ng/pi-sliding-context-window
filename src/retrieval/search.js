@@ -3,10 +3,14 @@ import {
   assertStoreResult,
 } from "../store/store-contract.js";
 import {
+  classifyWorkingSetAnchors,
   DEFAULT_EXACT_SNIPPET_BYTES,
   lookupExact,
+  lookupExactAnchorDocuments,
   MAX_EXACT_SNIPPET_BYTES,
+  MAX_WORKING_SET_ANCHORS_PER_RESULT,
   planExactQuery,
+  WORKING_SET_BOOST_MULTIPLIER,
 } from "../rocksdb/index/exact.js";
 import {
   bm25InverseDocumentFrequency,
@@ -526,7 +530,13 @@ function compareRankedCandidates(left, right) {
  * unconditionally, so this ranking is what actually reaches results, not
  * just an intermediate candidate-truncation step. Applied to explicit search
  * ranking only; the automatic preflight path never sets this flag, so
- * frozen-hint scoring stays byte-identical.
+ * frozen-hint scoring stays byte-identical. Also returns the prior-adjusted
+ * shadow pool itself (as `rawCandidates`) so rankByImportance can persist it:
+ * applyWorkingSetBoost below re-fuses over the same pre-fusion pool for its
+ * own bounded multiplier, and it must start from these prior-adjusted
+ * normalizedScore values (not the pre-prior originals) for the two bounded
+ * boosts to genuinely compose instead of the second silently discarding the
+ * first's effect.
  */
 async function applyImportancePriors(view, collected, project) {
   const priorByIdentity = new Map();
@@ -556,7 +566,7 @@ async function applyImportancePriors(view, collected, project) {
       rankingScore: rankingScoreByIdentity.get(identity),
     };
   });
-  return ranked.sort(compareRankedCandidates);
+  return { ranked: ranked.sort(compareRankedCandidates), rawCandidates: shadowCandidates };
 }
 
 function preserveCandidateMargins(candidates) {
@@ -927,10 +937,101 @@ function applyRecencyDecay(collected, decay, candidateLimit) {
  * ranking the already-deduped `candidates` view directly.
  */
 async function rankByImportance(store, collected, project) {
-  const ranked = await store.snapshot((view) => applyImportancePriors(view, collected, project));
+  const { ranked, rawCandidates } = await store.snapshot((view) => applyImportancePriors(view, collected, project));
   return Object.freeze({
     ...collected,
     candidates: Object.freeze(preserveCandidateMargins(ranked)),
+    // Persist the prior-adjusted shadow pool as the new rawCandidates: see
+    // applyImportancePriors' docblock for why applyWorkingSetBoost's own
+    // re-fusion needs to start from these values, not the pre-prior ones.
+    rawCandidates: Object.freeze(rawCandidates),
+  });
+}
+
+/**
+ * Boost candidates whose exact-anchor postings intersect the request's
+ * workingSet (files/symbols/identifiers the agent is actively acting on).
+ * Query-independent, action-anchored ranking signal alongside the importance
+ * prior above: same bounded-multiplier shape (WORKING_SET_BOOST_MULTIPLIER,
+ * exact.js) and the same fix for the same hazard applyImportancePriors'
+ * docblock documents -- multiplying the bounded multiplier directly onto
+ * `rankingScore` (RRF fusion space, where adjacent-rank gaps are already
+ * compressed) would let it overrule a relevance gap RRF's own blend had
+ * already narrowed. Instead this applies the multiplier to a shadow copy of
+ * the pre-fusion pool's `normalizedScore` (never the presented
+ * `score`/normalizedScore itself) and re-runs the same cross-mode RRF fusion
+ * over that shadow pool, exactly like applyImportancePriors. Runs after the
+ * importance prior and re-fuses over `collected.rawCandidates`, which
+ * rankByImportance persists as the prior's own shadow-adjusted pool, so the
+ * two independently-bounded boosts genuinely compose instead of the second
+ * discarding the first's effect. The same MODE_PRIORITY exact-tier
+ * precedence in compareRankedCandidates is checked ahead of rankingScore
+ * either way. Runs before the cross-encoder rerank, so the reranker, when
+ * active, sees the same boosted order explicit search would otherwise
+ * present. workingSet reuses the exact tier's own already-published postings
+ * (lookupExactAnchorDocuments) -- no new index and no new candidates: it can
+ * only reorder documents the lexical/semantic/exact passes already fetched
+ * into `collected.candidates`, never retrieve new ones. Exported for direct
+ * testing against a hand-built candidate pool, the same way fuseCandidates is
+ * (see test/retrieval-search.test.js).
+ */
+export async function applyWorkingSetBoost(store, collected, request) {
+  const anchors = classifyWorkingSetAnchors(request.workingSet);
+  if (anchors.length === 0) return collected;
+  const { matchesByDocument } = await lookupExactAnchorDocuments(store, {
+    anchors,
+    project: request.project,
+    scope: request.effectiveScope,
+    sessionIds: request.sessionIds,
+    excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
+    generation: collected.generation,
+  });
+  if (matchesByDocument.size === 0) return collected;
+  // Fall back to the already-deduped `candidates` view when no pre-fusion
+  // pool is available (a hand-built test fixture that skips straight to a
+  // single-mode candidate list): re-fusing that view against itself is
+  // exactly equivalent to re-fusing a genuine rawCandidates pool whenever
+  // there is only one mode's copy per document to begin with.
+  const rawPool = collected.rawCandidates ?? collected.candidates;
+  let boostedAny = false;
+  const shadowCandidates = rawPool.map((candidate) => {
+    const matchedAnchorValues = matchesByDocument.get(candidate.documentId);
+    if (!matchedAnchorValues || matchedAnchorValues.size === 0) return candidate;
+    boostedAny = true;
+    return { ...candidate, normalizedScore: candidate.normalizedScore * WORKING_SET_BOOST_MULTIPLIER };
+  });
+  if (!boostedAny) return collected;
+  const refused = fuseCandidates(shadowCandidates, shadowCandidates.length);
+  const rankingScoreByIdentity = new Map(
+    refused.map((candidate) => [candidateIdentity(candidate), candidate.fusionScore]),
+  );
+  const anchorsByIdentity = new Map();
+  for (const candidate of rawPool) {
+    const identity = candidateIdentity(candidate);
+    if (anchorsByIdentity.has(identity)) continue;
+    const matchedAnchorValues = matchesByDocument.get(candidate.documentId);
+    if (matchedAnchorValues && matchedAnchorValues.size > 0) {
+      // Bounded to the searchResult/gatheredEvidence schema's
+      // workingSetAnchors maxItems (8): a workingSet entry accepts up to 16
+      // classified anchors, and every one of them can independently
+      // intersect a single document's postings, so this provenance array
+      // must be capped independently of that request-side bound.
+      anchorsByIdentity.set(identity, [...matchedAnchorValues].slice(0, MAX_WORKING_SET_ANCHORS_PER_RESULT));
+    }
+  }
+  const boosted = collected.candidates.map((candidate) => {
+    const identity = candidateIdentity(candidate);
+    const rankingScore = rankingScoreByIdentity.get(identity);
+    const workingSetAnchors = anchorsByIdentity.get(identity);
+    return {
+      ...candidate,
+      ...(rankingScore === undefined ? {} : { rankingScore }),
+      ...(workingSetAnchors === undefined ? {} : { workingSetAnchors }),
+    };
+  });
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(preserveCandidateMargins(boosted.sort(compareRankedCandidates))),
   });
 }
 
@@ -1072,6 +1173,10 @@ async function locateCandidates(store, collected, request, options, secret) {
       // the matching comment on store-contract-schema.js's `reranked` field
       // for why reorder-only would flicker with tie patterns.
       ...(candidate.reranked === true ? { reranked: true } : {}),
+      // Same RM3 expandedTerms provenance pattern, for applyWorkingSetBoost's
+      // ranking boost above: present only when this specific result's own
+      // exact-anchor postings actually intersected the request's workingSet.
+      workingSetAnchors: candidate.workingSetAnchors ?? [],
       locator,
       source: {
         sessionId: candidate.source.sessionId,
@@ -1109,11 +1214,17 @@ export async function searchArchive(store, request, options = {}) {
   const ranked = resolvedOptions.applyImportancePrior === true
     ? await rankByImportance(store, decayed, normalized.project)
     : decayed;
+  // Action-anchored ranking boost, explicit search/gather only: workingSet is
+  // an optional field on the store.search/store.gather request schema that
+  // automatic preflight's store.preflight request never carries, so this is a
+  // no-op (single classification check, no store access) whenever it is
+  // absent -- frozen hints stay byte-identical.
+  const workingSetRanked = await applyWorkingSetBoost(store, ranked, normalized);
   // Cross-encoder rerank of the lexical/semantic tier, explicit search/gather
   // only (resolvedOptions.reranker, set by the daemon's store.search/gather
   // operations -- see rerankTierOne above). Automatic preflight never sets
   // this option, so frozen hints stay byte-identical.
-  const reranked = await rerankTierOne(resolvedOptions.reranker, ranked, normalized);
+  const reranked = await rerankTierOne(resolvedOptions.reranker, workingSetRanked, normalized);
   // Dedup is an explicit-search affordance only (options.dedupe, set by the
   // daemon's store.search operation). The automatic preflight path never opts
   // in, so frozen hints stay byte-identical. Runs last, over the fully ranked

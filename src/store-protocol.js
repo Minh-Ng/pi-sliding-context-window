@@ -83,13 +83,22 @@ function anyOf(...schemas) {
   return { anyOf: schemas };
 }
 
+// A handful is ample: a client contributes at most the single literal cwd
+// spelling that differs from its canonical project identity.
+export const MAX_PROJECT_ALIASES = 8;
+
 export const HANDSHAKE_REQUEST_SCHEMA = Object.freeze(object({
   protocolVersion,
   type: { const: "handshake" },
   client: identifier,
   clientVersion: identifier,
   project: identifier,
-}));
+  // Optional read-compatibility aliases for pre-canonical project spellings.
+  // Never authoritative for writes; the daemon re-verifies each against the real
+  // filesystem before honoring it, so an alias can only widen reads over another
+  // spelling of the same directory.
+  aliasProjects: { type: "array", items: identifier, maxItems: MAX_PROJECT_ALIASES },
+}, ["protocolVersion", "type", "client", "clientVersion", "project"]));
 
 const acceptedHandshake = object({
   protocolVersion,

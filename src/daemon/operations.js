@@ -31,13 +31,14 @@ import {
   unpinDocument,
 } from "../rocksdb/retention.js";
 import { cleanupExpiredLeases } from "../retrieval/leases.js";
-import { gatherArchive } from "../retrieval/gather.js";
+import { chronological, gatherArchive } from "../retrieval/gather.js";
 import { clearScopedHints, removeFrozenHint } from "../retrieval/hints.js";
 import { recallArchive } from "../retrieval/recall.js";
 import { normalizeRenderFormat } from "../retrieval/render.js";
 import { preflightArchive } from "../retrieval/preflight.js";
 import { searchArchive } from "../retrieval/search.js";
 import { traverseArchive } from "../retrieval/traverse.js";
+import { LocatorError } from "../retrieval/locator.js";
 import { LocalSemanticIndex } from "../semantic/index.js";
 import {
   recordRecalledLocator,
@@ -50,6 +51,7 @@ import {
   MAX_DIRECT_DOCUMENT_SOURCE_BYTES,
   MAX_DIRECT_SOURCE_MESSAGE_KEYS,
   STORE_ERROR_CODES,
+  assertStoreResult,
   boundedStoreErrorMessage,
 } from "../store-contract.js";
 import { DaemonMaintenance } from "./maintenance.js";
@@ -83,6 +85,19 @@ function scopedIdentity(project, value) {
   const digest = createHash("sha256").update(project).digest("hex").slice(0, 24);
   return `project:${digest}:${value}`;
 }
+
+// The projects a connection may read from: its authenticated project plus any
+// filesystem-verified pre-canonical aliases. Writes and every mutation ignore
+// this widening and use context.project alone.
+function readProjectsFor(context) {
+  return Array.isArray(context.readProjects) && context.readProjects.length > 0
+    ? context.readProjects
+    : [context.project];
+}
+
+// Contract cap for a single gather evidence packet (store.gather result schema).
+// A cross-project union pools per-project packets, so it must re-cap here.
+const MAX_GATHER_EVIDENCE = 24;
 
 function* scanPages(store, prefix) {
   let after;
@@ -563,10 +578,85 @@ export class DaemonOperations {
     const now = Date.now();
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
-    return searchArchive(this.store, { ...payload, project: context.project }, {
-      semantic: this.semantic,
-      recordShownResults: (event) => this.recordRelevanceFeedback(event),
+    const readProjects = readProjectsFor(context);
+    if (readProjects.length <= 1) {
+      return searchArchive(this.store, { ...payload, project: context.project }, {
+        semantic: this.semantic,
+        recordShownResults: (event) => this.recordRelevanceFeedback(event),
+      });
+    }
+    return this.#searchAcrossProjects(payload, readProjects, context);
+  }
+
+  // Read-compatibility union over the authenticated project and its verified
+  // aliases. Each per-project search authorizes and signs its own locators, so a
+  // legacy-alias result stays authorized only for that alias on recall.
+  async #searchAcrossProjects(payload, readProjects, context) {
+    const limit = Number.isSafeInteger(payload.limit) && payload.limit > 0
+      ? payload.limit
+      : undefined;
+    const byIdentity = new Map();
+    const modes = new Set();
+    let indexGeneration = 0;
+    let expiredCount = 0;
+    const expiredRetentionClasses = new Set();
+    for (const project of readProjects) {
+      const result = await searchArchive(this.store, { ...payload, project }, {
+        semantic: this.semantic,
+      });
+      modes.add(result.mode);
+      indexGeneration = Math.max(indexGeneration, result.indexGeneration);
+      // Aggregate expired-but-matching evidence across the alias union so a
+      // symlink-widened search still surfaces the aged-out counts a
+      // single-project search would have reported.
+      if (result.expiredMatches) {
+        expiredCount += result.expiredMatches.count;
+        for (const retentionClass of result.expiredMatches.retentionClasses ?? []) {
+          expiredRetentionClasses.add(retentionClass);
+        }
+      }
+      for (const entry of result.results) {
+        const identity = `${entry.documentId}\0${entry.version}`;
+        const current = byIdentity.get(identity);
+        if (current === undefined || entry.score > current.entry.score) {
+          byIdentity.set(identity, { entry, status: result.status });
+        }
+      }
+    }
+    const ranked = [...byIdentity.values()]
+      .sort((left, right) => right.entry.score - left.entry.score
+        || String(left.entry.documentId).localeCompare(String(right.entry.documentId)));
+    const kept = limit === undefined ? ranked : ranked.slice(0, limit);
+    const results = kept.map(({ entry }) => entry);
+    // A structurally special status (ambiguous, or a legacy-fallback expansion)
+    // is a per-project retrieval signal, not just an overall found/not-found
+    // outcome. Surface it whenever a kept result actually carries it, so an
+    // alias-widened search does not hide the ambiguity a single-project search
+    // would have reported for that same result.
+    const special = kept.find(({ status }) => status === "ambiguous")
+      ?? kept.find(({ status }) => status === "legacy-fallback");
+    const merged = assertStoreResult("store.search", {
+      mode: modes.size === 1 ? [...modes][0] : "hybrid",
+      status: results.length === 0 ? "not-found" : special?.status ?? "resolved",
+      indexGeneration,
+      results,
+      ...(expiredCount > 0
+        ? { expiredMatches: { count: expiredCount, retentionClasses: [...expiredRetentionClasses] } }
+        : {}),
     });
+    // Record implicit feedback on the final merged ranking, keyed by the
+    // authenticated project. Locator fingerprints are content-only, so a later
+    // recall (widened over the same aliases) joins back regardless of which
+    // alias authorized it.
+    await this.recordRelevanceFeedback({
+      project: context.project,
+      query: payload.query,
+      mode: merged.mode,
+      status: merged.status,
+      results: merged.results,
+      now: Date.now(),
+    });
+    return merged;
   }
 
   async gather(payload, context) {
@@ -574,15 +664,100 @@ export class DaemonOperations {
     const now = Date.now();
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
-    return gatherArchive(this.store, payload, {
-      project: context.project,
-      semantic: this.semantic,
-      renderFormat: this.renderFormat,
+    const readProjects = readProjectsFor(context);
+    if (readProjects.length <= 1) {
+      return gatherArchive(this.store, payload, {
+        project: context.project,
+        semantic: this.semantic,
+        renderFormat: this.renderFormat,
+      });
+    }
+    return this.#gatherAcrossProjects(payload, readProjects);
+  }
+
+  // Read-compatibility union for evidence packets. Each per-project gather is a
+  // self-consistent search/traverse/recall over one namespace; pooling their
+  // evidence lets a symlink-migrated repo's legacy docs compete for the shared
+  // token budget instead of being hidden behind the canonical project's results.
+  async #gatherAcrossProjects(payload, readProjects) {
+    const maxTokens = Number.isSafeInteger(payload.maxTokens) && payload.maxTokens > 0
+      ? payload.maxTokens
+      : Infinity;
+    const pooled = [];
+    const modes = new Set();
+    let intent;
+    let anchorCount = 0;
+    let candidateCount = 0;
+    let truncated = false;
+    for (const project of readProjects) {
+      const result = await gatherArchive(this.store, payload, {
+        project,
+        semantic: this.semantic,
+        renderFormat: this.renderFormat,
+      });
+      modes.add(result.mode);
+      intent ??= result.intent;
+      anchorCount += result.anchorCount;
+      candidateCount += result.candidateCount;
+      truncated ||= result.truncated;
+      pooled.push(...result.evidence);
+    }
+    // Interleave by anchor rank then distance so a legacy top anchor outranks a
+    // canonical deep neighbor, then fill the shared token budget in that order.
+    pooled.sort((left, right) => left.anchorRank - right.anchorRank
+      || left.distance - right.distance);
+    // The request's own maxEvidence (schema: required, 1..24) is always at least
+    // as strict as the pooling ceiling; honor whichever is tighter so widening
+    // over aliases never hands back more evidence than was asked for.
+    const evidenceCap = Math.min(payload.maxEvidence, MAX_GATHER_EVIDENCE);
+    const evidence = [];
+    let returnedTokens = 0;
+    for (const item of pooled) {
+      if (evidence.length >= evidenceCap) {
+        truncated = true;
+        break;
+      }
+      const itemTokens = item.document?.returnedTokens ?? 0;
+      if (evidence.length > 0 && returnedTokens + itemTokens > maxTokens) {
+        truncated = true;
+        continue;
+      }
+      evidence.push(item);
+      returnedTokens += itemTokens;
+    }
+    // Single-project gather returns evidence in chronological order (gather.js)
+    // and the model-facing guidance asserts that ordering; re-sort after budget
+    // selection so the alias-widened merge matches it instead of leaking the
+    // anchorRank/distance pooling order used only to pick the budget.
+    evidence.sort(chronological);
+    return assertStoreResult("store.gather", {
+      status: evidence.length > 0 ? "resolved" : "not-found",
+      mode: modes.size === 1 ? [...modes][0] : "hybrid",
+      intent: intent ?? payload.intent ?? "auto",
+      anchorCount,
+      candidateCount,
+      returnedTokens,
+      truncated,
+      hasMore: truncated,
+      evidence,
     });
   }
 
-  traverse(payload, context) {
-    return traverseArchive(this.store, payload, { project: context.project });
+  async traverse(payload, context) {
+    const readProjects = readProjectsFor(context);
+    // A locator authorizes exactly one project; a mismatched project throws
+    // LocatorError. Try each alias until one authorizes, and only surface the
+    // authorization failure when none does.
+    let lastError;
+    for (const project of readProjects) {
+      try {
+        return await traverseArchive(this.store, payload, { project });
+      } catch (error) {
+        if (!(error instanceof LocatorError)) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
   }
 
   // Implicit relevance feedback is a local, replayable-from-nothing side log:
@@ -596,11 +771,22 @@ export class DaemonOperations {
   }
 
   async recall(payload, context) {
-    const result = await recallArchive(this.store, payload, {
-      project: context.project,
-      sessionIds: payload.sessionIds ?? [],
-      renderFormat: this.renderFormat,
-    });
+    const readProjects = readProjectsFor(context);
+    const sessionIds = payload.sessionIds ?? [];
+    let result;
+    for (const project of readProjects) {
+      result = await recallArchive(this.store, payload, {
+        project,
+        sessionIds,
+        renderFormat: this.renderFormat,
+      });
+      // A signed locator authorizes exactly one project; other projects report
+      // it as invalid. Keep scanning aliases until one authorizes, and only fall
+      // back to the invalid outcome when none does.
+      if (result.status !== "locator-invalid") break;
+    }
+    // Join the recall back to the search that showed it, keyed by the
+    // authenticated project (where the merged ranking was recorded).
     try {
       await recordRecalledLocator(this.store, {
         project: context.project,
@@ -625,25 +811,27 @@ export class DaemonOperations {
     const sessionIds = new Set(payload.sessionIds
       ?? (payload.sessionId === undefined ? [] : [payload.sessionId]));
     const effectiveScope = payload.scope === "all" ? "project" : payload.scope;
-    const prefixes = effectiveScope === "session"
-      ? [...sessionIds].map((sessionId) => manifestKeys.sessionDocumentReferencePrefix(
-          context.project,
-          sessionId,
-        ))
-      : [[KEYSPACE.META, "session-document-reference", context.project]];
     let count = 0;
     // Admission and migration write one compact project/session reference per
     // canonical version, and retention removes it only after tombstoning. Scan
     // that index instead of multi-MiB manifests; a marker point read excludes
     // versions during the interval before their reference cleanup completes.
-    for (const prefix of prefixes) {
-      for (const { payload: reference } of scanPages(this.store, prefix)) {
-        const marker = await this.store.get([
-          KEYSPACE.SUPERSESSION,
-          reference.documentId,
-          reference.documentVersion,
-        ]);
-        if (marker === undefined) count += 1;
+    for (const project of readProjectsFor(context)) {
+      const prefixes = effectiveScope === "session"
+        ? [...sessionIds].map((sessionId) => manifestKeys.sessionDocumentReferencePrefix(
+            project,
+            sessionId,
+          ))
+        : [[KEYSPACE.META, "session-document-reference", project]];
+      for (const prefix of prefixes) {
+        for (const { payload: reference } of scanPages(this.store, prefix)) {
+          const marker = await this.store.get([
+            KEYSPACE.SUPERSESSION,
+            reference.documentId,
+            reference.documentVersion,
+          ]);
+          if (marker === undefined) count += 1;
+        }
       }
     }
     return { count };

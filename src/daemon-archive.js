@@ -474,6 +474,7 @@ export class DaemonArchive {
     storePath,
     socketPath,
     project,
+    aliasProjects,
     requestTimeoutMs,
     daemonStartTimeoutMs,
     protectionTtlMs = PROTECTION_LEASE_MS,
@@ -488,6 +489,12 @@ export class DaemonArchive {
     this.path = resolveStorePath(storePath);
     this.socketPath = socketPath ?? defaultSocketPath(this.path);
     this.project = requiredString(project, "project");
+    // Read-compatibility aliases recover archives keyed by a pre-canonical
+    // spelling of this same project; writes always stay on the canonical
+    // identity above.
+    this.aliasProjects = Array.isArray(aliasProjects)
+      ? aliasProjects.filter((alias) => typeof alias === "string" && alias.length > 0 && alias !== this.project)
+      : [];
     this.ownerId = `archive:${process.pid}:${randomUUID()}`;
     this.protectionTtlMs = positiveInteger(protectionTtlMs, PROTECTION_LEASE_MS);
     this.recallMaxTokens = positiveInteger(
@@ -509,6 +516,7 @@ export class DaemonArchive {
       storePath: this.path,
       socketPath: this.socketPath,
       project: this.project,
+      ...(this.aliasProjects.length > 0 ? { aliasProjects: this.aliasProjects } : {}),
       ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
       ...(daemonStartTimeoutMs === undefined ? {} : { daemonStartTimeoutMs }),
       autoUpgradeDaemon: autoUpgradeDaemon === true,

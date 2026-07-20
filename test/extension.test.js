@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -524,7 +524,10 @@ test("/window settings persists and applies turn and token caps from its TUI", a
 });
 
 test("Pi defaults to project-bound RocksDB search, locator recall, and protection leases", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "context-window-extension-rocks-"));
+  // Canonicalize the fixture root so its pre-seeded project keys and direct
+  // StoreClient project boundaries match the extension's canonicalized identity
+  // (e.g. macOS resolves /var to /private/var).
+  const directory = realpathSync.native(mkdtempSync(join(tmpdir(), "context-window-extension-rocks-")));
   const storePath = join(directory, "archive.rocks");
   const socketPath = defaultSocketPath(storePath);
   const handlers = new Map();
@@ -810,7 +813,9 @@ test("relation search recovers the latest archived question from a rotated Pi se
 });
 
 test("a pre-rotation fork searches externalized tool results across header lineage only", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "context-window-fork-lineage-"));
+  // Canonicalize so the pre-seeded project keys, session header cwd, and the
+  // extension's canonicalized project identity all agree on one namespace.
+  const directory = realpathSync.native(mkdtempSync(join(tmpdir(), "context-window-fork-lineage-")));
   const dbPath = join(directory, "archive.db");
   const grandparentFile = join(directory, "grandparent.jsonl");
   const parentFile = join(directory, "parent.jsonl");

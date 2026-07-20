@@ -70,7 +70,7 @@ function traversalLineage(request, anchor) {
   return Object.freeze([anchor.source.sessionId]);
 }
 
-function chronological(left, right) {
+export function chronological(left, right) {
   return Number(left.document.createdAt) - Number(right.document.createdAt)
     || String(left.document.documentId).localeCompare(String(right.document.documentId))
     || Number(left.document.version) - Number(right.document.version);

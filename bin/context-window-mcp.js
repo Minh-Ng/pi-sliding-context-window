@@ -5,6 +5,7 @@ import { DaemonArchive } from "../src/daemon-archive.js";
 import { loadConfig } from "../src/config.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import { LineFramer } from "../src/daemon/framing.js";
+import { canonicalProjectId, projectIdentityAlias } from "../src/project-identity.js";
 import {
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
@@ -27,7 +28,19 @@ import {
   MAX_STORE_IDENTIFIER_LENGTH,
 } from "../src/store-contract.js";
 
-const project = process.env.CONTEXT_WINDOW_PROJECT ?? process.cwd();
+// Canonicalize so a repository reached through a symlink or alternate spelling
+// shares one archive namespace. The literal spelling is carried as a read-only
+// alias so archives written under the pre-canonical key stay reachable. An
+// explicit CONTEXT_WINDOW_PROJECT override is left uncanonicalized: it is how an
+// operator names the mutation-authoritative project (e.g. to reach a
+// pre-canonical spelling for supersede/redact/pin), and canonicalizing it would
+// both strand legacy-keyed records as read-only forever and silently rewrite an
+// opaque project label into an absolute realpath whenever it happens to match a
+// directory relative to the current cwd.
+const explicitProject = process.env.CONTEXT_WINDOW_PROJECT;
+const project = explicitProject ?? canonicalProjectId(process.cwd());
+const projectAlias = explicitProject === undefined ? projectIdentityAlias(process.cwd()) : undefined;
+const aliasProjects = projectAlias === undefined ? [] : [projectAlias];
 const sessionId = process.env.CONTEXT_WINDOW_SESSION ?? `mcp-${process.pid}`;
 const config = loadConfig({ cwd: project, projectTrusted: false });
 let archive;
@@ -51,6 +64,7 @@ if (config.archiveBackend === "sqlite") {
     storePath: config.rocksdbPath,
     socketPath: config.socketPath,
     project,
+    aliasProjects,
     recallMaxTokens: Math.max(39, config.searchResultTokens * 2),
     retentionPolicy: retentionPolicyFromDays(config),
     migrationSourcePath: config.dbPath,

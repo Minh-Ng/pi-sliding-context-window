@@ -30,6 +30,7 @@ import {
   formatTraversalResults,
 } from "../src/presentation.js";
 import { archiveDocumentProvenance } from "../src/provenance.js";
+import { canonicalProjectId, projectIdentityAlias } from "../src/project-identity.js";
 import { ancestorSessionIds, stableSessionId } from "../src/session-id.js";
 import { STRUCTURAL_RELATIONS } from "../src/structural.js";
 import { Type } from "typebox";
@@ -104,6 +105,109 @@ function formatDaemonLifecycle(status: any) {
     `clients: ${status.clientConnections ?? "unknown"}; active requests: ${status.activeRequests ?? "unknown"}`,
     `idle shutdown: ${idle}`,
   ].join("\n");
+}
+
+/** Documented daemon default for CONTEXT_WINDOW_CRITICAL_FREE_BYTES. */
+export const DISK_PRESSURE_EMERGENCY_FLOOR_BYTES = 2 * 1024 ** 3;
+/** Warn early, before admissions start failing. */
+export const DISK_PRESSURE_WARN_BYTES = 2 * DISK_PRESSURE_EMERGENCY_FLOOR_BYTES;
+export const DISK_PRESSURE_CHECK_INTERVAL_MS = 5 * 60_000;
+
+export interface DiskPressure {
+  severity: "emergency" | "approaching";
+  message: string;
+}
+
+/**
+ * Interpret archive storage stats for host disk pressure. Emergency mode is
+ * authoritative (the daemon is already rejecting admissions with DISK_LOW,
+ * so rotated turns are silently not archived); the free-space check warns
+ * before that point using the documented default floor.
+ */
+export function evaluateDiskPressure(stats: any): DiskPressure | undefined {
+  if (!stats || typeof stats !== "object") return undefined;
+  if (stats.emergencyMode === true || stats.filesystem?.emergencyMode === true) {
+    return {
+      severity: "emergency",
+      message: "Archive emergency mode: new archival admissions are rejected (DISK_LOW), so rotated turns are NOT being archived. Free disk space, then run /window archive reclaim.",
+    };
+  }
+  const freeBytes = stats.filesystem?.freeBytes;
+  if (Number.isSafeInteger(freeBytes) && freeBytes < DISK_PRESSURE_WARN_BYTES) {
+    const free = (freeBytes / 1024 ** 3).toFixed(1);
+    return {
+      severity: "approaching",
+      message: `Archive host has ${free} GiB free, approaching the 2 GiB emergency floor where archival admissions stop. Free disk space or run /window archive reclaim.`,
+    };
+  }
+  return undefined;
+}
+
+export interface DiskPressureUi {
+  notify: (message: string, level: "warning" | "info" | "error") => void;
+  confirm?: (title: string, message: string) => Promise<boolean>;
+}
+
+/**
+ * Throttled, notify-once disk-pressure monitor. Kept independent of the
+ * extension closure so the notification and remediation flow is unit-testable.
+ */
+export function createDiskPressureMonitor(hooks: {
+  archiveStats: () => any;
+  reclaim?: () => any;
+  formatStorage?: (stats: any) => string;
+  now?: () => number;
+  checkIntervalMs?: number;
+}) {
+  const now = hooks.now ?? Date.now;
+  const interval = hooks.checkIntervalMs ?? DISK_PRESSURE_CHECK_INTERVAL_MS;
+  let notified = false;
+  let lastCheckedAt = Number.NEGATIVE_INFINITY;
+  return {
+    reset() {
+      notified = false;
+      lastCheckedAt = Number.NEGATIVE_INFINITY;
+    },
+    async check(ui: DiskPressureUi): Promise<DiskPressure | undefined> {
+      if (notified) return undefined;
+      const at = now();
+      if (at - lastCheckedAt < interval) return undefined;
+      lastCheckedAt = at;
+      let stats;
+      try {
+        stats = hooks.archiveStats();
+      } catch {
+        return undefined; // status is presentation-only; never disrupt the turn
+      }
+      const pressure = evaluateDiskPressure(stats);
+      if (!pressure) return undefined;
+      notified = true;
+      ui.notify(pressure.message, "warning");
+      if (ui.confirm && hooks.reclaim) {
+        try {
+          const run = await ui.confirm(
+            "Archive disk pressure",
+            pressure.severity === "emergency"
+              ? "The archive daemon is rejecting new admissions. Run physical reclamation now (equivalent to /window archive reclaim)?"
+              : "Free space is low for the archive host. Run physical reclamation now (equivalent to /window archive reclaim)?",
+          );
+          if (run) {
+            const result = hooks.reclaim();
+            if (!result) {
+              ui.notify("Archive reclamation is unavailable for this backend.", "warning");
+            } else {
+              const level = result.status === "error" ? "error" : result.status === "busy" ? "warning" : "info";
+              const suffix = hooks.formatStorage && result.after ? `\n${hooks.formatStorage(result.after)}` : "";
+              ui.notify(`${result.status}${suffix}`, level);
+            }
+          }
+        } catch {
+          // Dialog-incapable mode; the warning notification already fired.
+        }
+      }
+      return pressure;
+    },
+  };
 }
 
 function parseTokenCap(value: string) {
@@ -317,6 +421,22 @@ export function createContextEpochWindow({
       return session;
     }
 
+    const diskPressureMonitor = createDiskPressureMonitor({
+      archiveStats: () => session?.archiveStats(),
+      reclaim: () => session?.reclaimArchive(),
+      formatStorage: formatArchiveStorage,
+    });
+
+    function maybeWarnDiskPressure(ctx: ExtensionContext) {
+      if (!ctx?.hasUI || !session || startupState !== "ready") return;
+      void diskPressureMonitor.check({
+        notify: (message, level) => {
+          try { ctx.ui.notify(message, level); } catch { /* presentation-only */ }
+        },
+        confirm: (title, message) => ctx.ui.confirm(title, message),
+      });
+    }
+
     function exposeRecallHandles(results: any[]) {
       return results.map((result) => {
         const target = typeof result.documentId === "string"
@@ -524,6 +644,13 @@ export function createContextEpochWindow({
       let nextSession: EpochWindowSession | undefined;
       try {
         const config = configLoader({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted?.() === true });
+        // Canonicalize project identity so one repository opened through a
+        // symlink or alternate path spelling maps to a single archive namespace.
+        // The literal spelling rides along as a read-only alias so archives
+        // written under the pre-canonical key stay reachable.
+        const project = canonicalProjectId(ctx.cwd);
+        const projectAlias = projectIdentityAlias(ctx.cwd);
+        const aliasProjects = projectAlias === undefined ? [] : [projectAlias];
         let sessionFile: string | undefined;
         try { sessionFile = ctx.sessionManager.getSessionFile?.(); } catch { /* lineage is best-effort */ }
         const forkParentFile = event.reason === "fork" ? event.previousSessionFile : undefined;
@@ -552,7 +679,7 @@ export function createContextEpochWindow({
                     storePath: (config as any).rocksdbPath,
                     socketPath: (config as any).socketPath,
                     sourcePath: config.dbPath,
-                    project: ctx.cwd,
+                    project,
                   });
                 }
                 return new SQLiteArchive(config.dbPath, { retention });
@@ -560,7 +687,8 @@ export function createContextEpochWindow({
             : new RocksArchive({
                 storePath: config.rocksdbPath,
                 socketPath: (config as any).socketPath,
-                project: ctx.cwd,
+                project,
+                aliasProjects,
                 recallMaxTokens: Math.max(39, config.searchResultTokens * 2),
                 retentionPolicy: retentionPolicyFromDays(config),
                 migrationSourcePath: config.dbPath,
@@ -576,9 +704,9 @@ export function createContextEpochWindow({
         nextSession = new EpochWindowSession({
           archive,
           config,
-          sessionId: stableSessionId(ctx.sessionManager, ctx.cwd),
+          sessionId: stableSessionId(ctx.sessionManager, project),
           initialSessionIds,
-          project: ctx.cwd,
+          project,
           model: ctx.model,
           onRotation: (state) => pi.appendEntry(ROTATION_STATE_ENTRY, state),
         });
@@ -600,6 +728,7 @@ export function createContextEpochWindow({
       }
       session = nextSession;
       startupState = "ready";
+      diskPressureMonitor.reset();
       // Status is presentation-only. A healthy session must not be reported to
       // Pi as a failed startup merely because the UI cannot render its footer.
       try { updateStatus(ctx); } catch {}
@@ -645,6 +774,7 @@ export function createContextEpochWindow({
     pi.on("agent_settled", (_event, ctx) => {
       session?.refreshArchiveProtection();
       updateStatus(ctx);
+      maybeWarnDiskPressure(ctx);
     });
 
     pi.on("model_select", (event, ctx) => {

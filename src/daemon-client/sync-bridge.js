@@ -35,6 +35,7 @@ export class SynchronousStoreBridge {
     storePath,
     socketPath,
     project,
+    aliasProjects,
     clientVersion = "0.1.0",
     requestTimeoutMs = 90_000,
     daemonStartTimeoutMs = 30_000,
@@ -58,6 +59,9 @@ export class SynchronousStoreBridge {
       storePath,
       socketPath,
       project,
+      ...(Array.isArray(aliasProjects) && aliasProjects.length > 0
+        ? { aliasProjects }
+        : {}),
       clientVersion,
       requestTimeoutMs: this.requestTimeoutMs,
       daemonStartTimeoutMs: this.daemonStartTimeoutMs,

@@ -44,7 +44,7 @@ Manual `context_window_search` is broader when requested:
 
 **Projects and sessions**
 
-All projects share the default RocksDB files, but records are logically partitioned by Pi's exact current-working-directory string. A project-scoped search can bridge unrelated sessions in that same directory. It cannot cross into another project. Opening one repository through a symlink or alternate path spelling can therefore create a separate logical project namespace.
+All projects share the default RocksDB files, but records are logically partitioned by project identity: the canonical real path of Pi's current working directory, with symlinks and alternate spellings resolved so one repository opened through different paths maps to a single namespace. A project-scoped search can bridge unrelated sessions in that same directory. It cannot cross into another project, and two genuinely different directories never collapse. Archives written under a pre-canonical spelling stay reachable through a read-only path alias; new writes always use the canonical identity. When the real path cannot be resolved, partitioning falls back to the exact directory string.
 
 Resuming a Pi session preserves its session identity. A fork gets a new identity but session-scoped recall includes structurally verified ancestors. A new unrelated session starts with no session-lineage memory; use a project-scoped search when prior work from another session is relevant. Work that never rotated, externalized, checkpointed, or entered an explicit archive write remains only in the earlier Pi transcript.
 

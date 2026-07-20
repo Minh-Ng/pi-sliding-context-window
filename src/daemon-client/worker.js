@@ -171,6 +171,9 @@ function createClient() {
   return new StoreClient({
     socketPath: options.socketPath,
     project: options.project,
+    ...(Array.isArray(options.aliasProjects) && options.aliasProjects.length > 0
+      ? { aliasProjects: options.aliasProjects }
+      : {}),
     client: "context-window-sync-archive",
     clientVersion: options.clientVersion,
     requestTimeoutMs: options.requestTimeoutMs,

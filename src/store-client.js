@@ -45,25 +45,51 @@ function conflictError(message) {
   return error;
 }
 
+function isAliasRejection(error) {
+  return error instanceof StoreRemoteError
+    && error.code === "INVALID_REQUEST"
+    && error.details?.path === "$.aliasProjects";
+}
+
+function withoutAliasProjects(handshake) {
+  if (!("aliasProjects" in handshake)) return handshake;
+  const { aliasProjects, ...rest } = handshake;
+  return rest;
+}
+
 export class StoreClient {
   constructor({
     socketPath,
     client = "context-window-client",
     clientVersion = "0.1.0",
     project,
+    aliasProjects,
     requestTimeoutMs = 30_000,
     maxFrameBytes,
   }) {
     if (!socketPath) throw new TypeError("socketPath is required.");
     if (!project) throw new TypeError("project is required.");
     this.socketPath = socketPath;
+    // Only well-formed and non-duplicate; realpath verification against this
+    // authenticated project happens daemon-side (authorizedReadProjects in
+    // src/daemon/server.js), not here.
+    const declaredAliases = Array.isArray(aliasProjects)
+      ? aliasProjects.filter((alias) => typeof alias === "string" && alias.length > 0 && alias !== project)
+      : [];
+    this.declaredAliases = declaredAliases;
     this.handshake = {
       protocolVersion: STORE_PROTOCOL_VERSION,
       type: "handshake",
       client,
       clientVersion,
       project,
+      ...(declaredAliases.length > 0 ? { aliasProjects: declaredAliases } : {}),
     };
+    // Set once a still-live daemon has rejected aliasProjects outright (a
+    // pre-alias daemon during a rolling upgrade). Remembered for this
+    // client's lifetime so later reconnects go straight to the
+    // canonical-only handshake instead of repeating a doomed round trip.
+    this.aliasHandshakeRejected = false;
     this.requestTimeoutMs = requestTimeoutMs;
     this.maxFrameBytes = maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     if (!Number.isSafeInteger(this.maxFrameBytes) || this.maxFrameBytes <= 0) {
@@ -90,6 +116,25 @@ export class StoreClient {
   }
 
   async #connect() {
+    const initialHandshake = this.aliasHandshakeRejected
+      ? withoutAliasProjects(this.handshake)
+      : this.handshake;
+    try {
+      return await this.#handshakeOnce(initialHandshake);
+    } catch (error) {
+      // A daemon that predates alias-widened reads rejects the aliasProjects
+      // field outright (schema additionalProperties: false), which would
+      // otherwise hard-fail every session against a symlink/non-canonical
+      // cwd for as long as a stale pre-upgrade daemon keeps the socket.
+      // Retry once, canonical-project-only: reads simply don't widen across
+      // aliases until the daemon is replaced, instead of failing to connect.
+      if (this.aliasHandshakeRejected || !isAliasRejection(error)) throw error;
+      this.aliasHandshakeRejected = true;
+      return await this.#handshakeOnce(withoutAliasProjects(this.handshake));
+    }
+  }
+
+  async #handshakeOnce(handshake) {
     const socket = createConnection(this.socketPath);
     this.socket = socket;
     const framer = new LineFramer({ maxFrameBytes: this.maxFrameBytes });
@@ -143,7 +188,7 @@ export class StoreClient {
           reject(error);
         },
       };
-      socket.write(encodeProtocolFrame(this.handshake));
+      socket.write(encodeProtocolFrame(handshake));
     });
     assertHandshakeResponse(response);
     if (!response.accepted) {

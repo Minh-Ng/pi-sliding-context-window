@@ -4,6 +4,7 @@ import { createServer, createConnection } from "node:net";
 import { join } from "node:path";
 import { fileLockRelease, tryFileLock } from "@harperfast/rocksdb-js";
 import { ContractError } from "../store-contract.js";
+import { canonicalProjectId } from "../project-identity.js";
 import {
   STORE_OPERATIONS,
   STORE_PROTOCOL_VERSION,
@@ -51,6 +52,23 @@ function codedError(code, message, details) {
   error.code = code;
   if (details !== undefined) error.details = details;
   return error;
+}
+
+// The authenticated project always leads and is the sole write target. Each
+// declared read-compatibility alias is honored only when the real filesystem
+// confirms it canonicalizes to that same authenticated project, so an alias can
+// never widen reads into a genuinely different project and a failed realpath
+// simply drops the alias (fail-closed to the authenticated project alone).
+function authorizedReadProjects(project, aliasProjects) {
+  const projects = [project];
+  const seen = new Set([project]);
+  for (const alias of Array.isArray(aliasProjects) ? aliasProjects : []) {
+    if (typeof alias !== "string" || alias.length === 0 || seen.has(alias)) continue;
+    if (canonicalProjectId(alias) !== project) continue;
+    seen.add(alias);
+    projects.push(alias);
+  }
+  return projects;
 }
 
 async function socketIsLive(path) {
@@ -672,6 +690,7 @@ export class StoreDaemon {
       framer,
       handshaken: false,
       project: undefined,
+      readProjects: undefined,
       pendingLines: [],
       queuedBytes: 0,
       pendingFrameBytes: 0,
@@ -872,6 +891,7 @@ export class StoreDaemon {
         state.handshaken = true;
         this.handshakenConnections += 1;
         state.project = handshake.project;
+        state.readProjects = authorizedReadProjects(handshake.project, handshake.aliasProjects);
         await this.#writeFrame(socket, createHandshakeAccepted({
           serverVersion: this.serverVersion,
           storePath: this.storePath,
@@ -914,6 +934,7 @@ export class StoreDaemon {
     try {
       response = await this.#executeRequest(request, {
         project: state.project,
+        readProjects: state.readProjects ?? [state.project],
         requestBytes: line.byteLength + 1,
         requestFingerprint: createHash("sha256").update(line).digest("hex"),
         socket,

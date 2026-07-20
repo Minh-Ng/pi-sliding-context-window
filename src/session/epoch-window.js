@@ -1,16 +1,12 @@
-import { createHash } from "node:crypto";
 import {
   ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS,
   ARCHIVE_CHECKPOINT_PREVIEW_TOKENS,
   createArchiveCheckpoint,
   createCompactionCatalog,
-  inspectCheckpointManifest,
   reconstructCheckpointSource,
 } from "../archive/archive-checkpoint.js";
-import { estimateModelVisibleTokens } from "./model-token-budget.js";
 import {
   buildTocMarkerText,
-  contentToText,
   deduplicateToolResults,
   estimateTokens,
   extractDecisionCandidates,
@@ -28,11 +24,41 @@ import {
   TOC_TOKEN_BUDGET,
   turnTopic,
 } from "./window.js";
-import { structuralMessageScores } from "../structural-annotations.js";
 import {
-  MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT,
-  MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT,
-} from "../store/store-contract.js";
+  measureToolResultTokens,
+  resolveToolResultBudget,
+  toolArgumentId,
+  toolResultId,
+} from "./epoch-budget.js";
+import {
+  appendArchivedHint,
+  inlineUserTokens,
+  OversizedInputArchiveError,
+  replaceProviderText,
+  structuralMessages,
+  structuralText,
+  userMessageKeys,
+} from "./epoch-messages.js";
+import {
+  CHECKPOINT_ROOT_KIND,
+  checkpointCreatedAt,
+  checkpointIds,
+  checkpointPlanningArchive,
+  checkpointResultMatches,
+  checkpointSourceChunks,
+  checkpointSourceKey,
+  CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION,
+  latestTrustedArchiveEntries,
+  MAX_TOC_CHECKPOINT_IDS_PER_ENTRY,
+  normalizedArchiveEntries,
+  normalizedMergedArchiveEntries,
+  restoredTocEntry,
+} from "./epoch-checkpoint.js";
+
+// Re-export the split modules' public surface so importers of this module keep
+// their existing entry point. CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION and
+// OversizedInputArchiveError now live with the checkpoint and message helpers.
+export { CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION, OversizedInputArchiveError };
 
 // Bounds persisted rotation-state growth; the marker text is separately
 // bounded by the token budget in buildTocMarkerText.
@@ -40,440 +66,8 @@ export const TOC_MAX_ENTRIES = 64;
 
 const HINT_STATE_VERSION = 1;
 const MAX_RECONSTRUCT_ONLY_HINT_KEYS = 1_000;
-const MAX_ARCHIVE_DETAIL_ENTRIES = 1_000;
-const MAX_ARCHIVE_DETAIL_PART_IDS = 1_000;
-const MAX_ARCHIVE_DETAIL_TOTAL_PART_IDS = 4_096;
-const MAX_TOC_CHECKPOINT_IDS_PER_ENTRY = MAX_ARCHIVE_DETAIL_PART_IDS + 2;
-const CHECKPOINT_ROOT_KIND = "archive-checkpoint-root";
-const CHECKPOINT_ROOT_ID = /^checkpoint-root:[a-f0-9]{64}$/u;
-const CHECKPOINT_PUBLICATION_ID = /^checkpoint-publication:[a-f0-9]{64}$/u;
-const CHECKPOINT_PART_ID = /^checkpoint-part:[a-f0-9]{64}$/u;
-
-export const CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION = 1;
 
 export const ROTATION_STATE_ENTRY = "context-epoch-window:rotation";
-
-function toolResultId(sessionId, message, text) {
-  const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
-  return `tool-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
-}
-
-function toolArgumentId(sessionId, part, text) {
-  const toolCallId = String(part?.id ?? part?.toolCallId ?? part?.tool_call_id ?? "");
-  return `tool-arg-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
-}
-
-// Sum the tool-result characters that actually land in the active window
-// (whole results plus the bounded previews of externalized ones). This is a
-// pure function of the post-externalization active slice, so it reproduces
-// deterministically on resume and resets to the retained slice on rotation.
-function measureToolResultTokens(messages) {
-  let chars = 0;
-  for (const message of messages) {
-    if (message?.role === "toolResult" || message?.role === "tool") {
-      chars += contentToText(message.content).length;
-    }
-  }
-  return Math.ceil(chars / 4);
-}
-
-// Adaptive tool-result budget knobs, resolved against defaults so partial
-// embedder configs (and older persisted configs) behave like the shipped
-// policy. The floor never raises the base per-result gate.
-function resolveToolResultBudget(config, rotationTokens) {
-  const configuredMax = Number(config.maxToolResultTokens);
-  const maxToolResultTokens = Number.isSafeInteger(configuredMax) && configuredMax > 0
-    ? configuredMax
-    : 4_000;
-  const ratio = Number(config.toolResultBudgetRatio);
-  const effectiveRatio = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : 0.3;
-  const configuredFloor = Number(config.toolResultBudgetFloorTokens);
-  const effectiveFloor = Number.isSafeInteger(configuredFloor) && configuredFloor > 0
-    ? configuredFloor
-    : 1_000;
-  const target = Number.isFinite(rotationTokens) && rotationTokens > 0 ? rotationTokens : 1;
-  return {
-    maxToolResultTokens,
-    budgetTokens: Math.max(1, Math.floor(target * effectiveRatio)),
-    floorTokens: Math.min(maxToolResultTokens, effectiveFloor),
-  };
-}
-
-function structuralText(message) {
-  const role = String(message?.role ?? "unknown");
-  if (role !== "user" && role !== "assistant") return "";
-  if (typeof message?.content === "string") return message.content;
-  if (!Array.isArray(message?.content)) return "";
-  return message.content.map((part) => {
-    if (typeof part === "string") return part;
-    return part?.type === "text" && typeof part.text === "string" ? part.text : "";
-  }).filter(Boolean).join("\n");
-}
-
-function structuralMessages(messages) {
-  let terminalAssistantIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "assistant"
-      && messages[index]?.stopReason !== "error"
-      && structuralText(messages[index]).trim()) {
-      terminalAssistantIndex = index;
-      break;
-    }
-  }
-  return messages.map((message, messageIndex) => {
-    const role = String(message?.role ?? "unknown");
-    const text = structuralText(message);
-    const scores = structuralMessageScores({
-      role,
-      text,
-      isTerminalAssistant: messageIndex === terminalAssistantIndex,
-      stopReason: message?.stopReason,
-    });
-    return {
-      messageIndex,
-      messageKey: messageKey(message),
-      role,
-      createdAt: Number(message?.timestamp) || 0,
-      text,
-      questionScore: scores.question,
-      requestScore: scores.request,
-      correctionScore: scores.correction,
-      answerScore: scores.answer,
-    };
-  });
-}
-
-function appendArchivedHint(message, hint) {
-  if (typeof message.content === "string") {
-    return { ...message, content: `${message.content}${hint}` };
-  }
-  if (Array.isArray(message.content)) {
-    return {
-      ...message,
-      content: [...message.content, { type: "text", text: hint }],
-    };
-  }
-  return { ...message, content: [{ type: "text", text: hint }] };
-}
-
-function userMessageKeys(messages) {
-  return new Set(messages
-    .filter((message) => message?.role === "user" && structuralText(message).trim())
-    .map((message) => messageKey(message)));
-}
-
-export class OversizedInputArchiveError extends Error {
-  constructor() {
-    super("Oversized user input could not be archived safely.");
-    this.name = "OversizedInputArchiveError";
-    this.code = "OVERSIZED_INPUT_ARCHIVE_FAILED";
-  }
-}
-
-function checkpointPlanningArchive(archive) {
-  return Object.freeze({
-    get(id) { return archive.get?.(id); },
-    put(document) { return document?.id; },
-  });
-}
-
-function checkpointCreatedAt(messages) {
-  for (const message of messages) {
-    const value = Number(message?.timestamp);
-    if (Number.isSafeInteger(value) && value >= 0) return value;
-  }
-  return Date.now();
-}
-
-function checkpointSourceKey(label, messages, text) {
-  const hash = createHash("sha256");
-  hash.update(label);
-  for (const message of messages) {
-    const key = messageKey(message);
-    hash.update(`\0${Buffer.byteLength(key, "utf8")}:`);
-    hash.update(key);
-  }
-  hash.update(`\0${Buffer.byteLength(text, "utf8")}:`);
-  hash.update(text);
-  return `${label}:${hash.digest("hex")}`;
-}
-
-function checkpointSourceChunks(messages) {
-  const chunks = [];
-  let current = [];
-  let currentKeyBytes = 0;
-  for (const message of messages) {
-    const keyBytes = Buffer.byteLength(messageKey(message), "utf8");
-    if (current.length > 0 && (
-      current.length >= MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT
-      || currentKeyBytes + keyBytes > MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT
-    )) {
-      chunks.push(current);
-      current = [];
-      currentKeyBytes = 0;
-    }
-    current.push(message);
-    currentKeyBytes += keyBytes;
-  }
-  if (current.length > 0) chunks.push(current);
-  return chunks;
-}
-
-function textContentPart(part) {
-  return typeof part === "string"
-    || (part && typeof part === "object" && part.type === "text"
-      && typeof part.text === "string");
-}
-
-function replaceProviderText(message, replacement) {
-  if (typeof message?.content === "string") return { ...message, content: replacement };
-  if (!Array.isArray(message?.content)) {
-    return { ...message, content: [{ type: "text", text: replacement }] };
-  }
-  let inserted = false;
-  const content = [];
-  for (const part of message.content) {
-    if (!textContentPart(part)) {
-      content.push(part);
-      continue;
-    }
-    if (inserted) continue;
-    content.push(typeof part === "string" ? replacement : { ...part, text: replacement });
-    inserted = true;
-  }
-  if (!inserted) content.unshift({ type: "text", text: replacement });
-  return { ...message, content };
-}
-
-function inlineUserTokens(message) {
-  return Math.max(
-    estimateTokens([message]),
-    estimateModelVisibleTokens(serializeMessage(message)),
-  );
-}
-
-function checkpointIds(entries) {
-  const ids = new Set();
-  for (const entry of entries) {
-    ids.add(entry.publicationId);
-    ids.add(entry.rootId);
-    for (const partId of entry.partIds) ids.add(partId);
-  }
-  return ids;
-}
-
-function exactObjectKeys(value, expected) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  return actual.length === wanted.length
-    && actual.every((key, index) => key === wanted[index]);
-}
-
-const ARCHIVE_ENTRY_KEYS = Object.freeze([
-  "rootId",
-  "publicationId",
-  "kind",
-  "topic",
-  "terms",
-  "byteCount",
-  "hash",
-  "partCount",
-  "partIds",
-]);
-
-function checkpointArchiveId(value) {
-  return typeof value === "string"
-    && (CHECKPOINT_ROOT_ID.test(value)
-      || CHECKPOINT_PUBLICATION_ID.test(value)
-      || CHECKPOINT_PART_ID.test(value));
-}
-
-function normalizedArchiveEntry(value) {
-  if (!exactObjectKeys(value, ARCHIVE_ENTRY_KEYS)
-    || typeof value.rootId !== "string"
-    || !CHECKPOINT_ROOT_ID.test(value.rootId)
-    || typeof value.publicationId !== "string"
-    || !CHECKPOINT_PUBLICATION_ID.test(value.publicationId)
-    || typeof value.kind !== "string" || value.kind.length === 0 || value.kind.length > 80
-    || typeof value.topic !== "string" || value.topic.length > 80
-    || !Array.isArray(value.terms) || value.terms.length > 8
-    || value.terms.some((term) => typeof term !== "string" || term.length > 60)
-    || !Number.isSafeInteger(value.byteCount) || value.byteCount < 0
-    || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/u.test(value.hash)
-    || !Number.isSafeInteger(value.partCount) || value.partCount <= 0
-    || !Array.isArray(value.partIds)
-    || value.partIds.length !== value.partCount
-    || value.partIds.length > MAX_ARCHIVE_DETAIL_PART_IDS
-    || value.partIds.some((partId) => typeof partId !== "string"
-      || !CHECKPOINT_PART_ID.test(partId))) {
-    return undefined;
-  }
-  return Object.freeze({
-    rootId: value.rootId,
-    publicationId: value.publicationId,
-    kind: value.kind,
-    topic: value.topic,
-    terms: Object.freeze([...value.terms]),
-    byteCount: value.byteCount,
-    hash: value.hash,
-    partCount: value.partCount,
-    partIds: Object.freeze([...value.partIds]),
-  });
-}
-
-function normalizedArchiveEntries(value) {
-  if (!Array.isArray(value) || value.length === 0
-    || value.length > MAX_ARCHIVE_DETAIL_ENTRIES) return undefined;
-  const entries = [];
-  const roots = new Set();
-  let totalPartIds = 0;
-  for (const candidate of value) {
-    const entry = normalizedArchiveEntry(candidate);
-    totalPartIds += entry?.partIds.length ?? 0;
-    if (entry === undefined || roots.has(entry.rootId)
-      || totalPartIds > MAX_ARCHIVE_DETAIL_TOTAL_PART_IDS) return undefined;
-    roots.add(entry.rootId);
-    entries.push(entry);
-  }
-  return Object.freeze(entries);
-}
-
-function checkpointDescriptor(archive, rootId) {
-  try {
-    let root = inspectCheckpointManifest(archive, rootId);
-    // New roots commit their complete part layout into their content address.
-    // Legacy roots do not, so trust them only after exact byte reconstruction.
-    if (root.layoutIdentity === undefined) {
-      root = reconstructCheckpointSource(archive, rootId).root;
-    }
-    return Object.freeze({
-      rootId,
-      publicationId: root.publicationId,
-      kind: root.sourceKind,
-      byteCount: root.byteCount,
-      hash: root.hash,
-      partCount: root.parts.length,
-      partIds: Object.freeze(root.parts.map((part) => part.id)),
-    });
-  } catch {
-    return undefined;
-  }
-}
-
-function checkpointEntryMatchesArchive(archive, entry, requireExactSource) {
-  const verified = checkpointDescriptor(archive, entry.rootId);
-  const matches = verified !== undefined
-    && verified.publicationId === entry.publicationId
-    && verified.kind === entry.kind
-    && verified.byteCount === entry.byteCount
-    && verified.hash === entry.hash
-    && verified.partCount === entry.partCount
-    && JSON.stringify(verified.partIds) === JSON.stringify(entry.partIds);
-  if (!matches || !requireExactSource) return matches;
-  try {
-    reconstructCheckpointSource(archive, entry.rootId);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function latestTrustedArchiveEntries(
-  branchEntries,
-  expectedSummary,
-  archive,
-  { requireExactSource = false } = {},
-) {
-  if (!Array.isArray(branchEntries)) return undefined;
-  let latest;
-  for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
-    if (branchEntries[index]?.type === "compaction") {
-      latest = branchEntries[index];
-      break;
-    }
-  }
-  if (!latest || latest.fromHook !== true || typeof latest.summary !== "string"
-    || (expectedSummary !== undefined && latest.summary !== expectedSummary)) return undefined;
-  if (!exactObjectKeys(latest.details, ["contextWindowArchive"])) return undefined;
-  const namespace = latest.details?.contextWindowArchive;
-  if (!exactObjectKeys(namespace, ["version", "entries"])
-    || namespace.version !== CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION) return undefined;
-  const entries = normalizedArchiveEntries(namespace.entries);
-  if (entries === undefined) return undefined;
-  try {
-    if (createCompactionCatalog(entries, {
-      maxTokens: ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS,
-    }) !== latest.summary) return undefined;
-  } catch {
-    return undefined;
-  }
-  if (entries.some((entry) =>
-    !checkpointEntryMatchesArchive(archive, entry, requireExactSource))) {
-    return undefined;
-  }
-  return entries;
-}
-
-function mergedArchiveEntries(previous, current) {
-  const byRoot = new Map();
-  for (const entry of [...previous, ...current]) {
-    const existing = byRoot.get(entry.rootId);
-    if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(entry)) {
-      return undefined;
-    }
-    byRoot.set(entry.rootId, entry);
-  }
-  return Object.freeze([...byRoot.values()]);
-}
-
-function normalizedMergedArchiveEntries(previous, current) {
-  const merged = mergedArchiveEntries(previous, current);
-  return merged === undefined ? undefined : normalizedArchiveEntries(merged);
-}
-
-function restoredTocEntry(value, archive) {
-  if (!value || typeof value !== "object" || typeof value.id !== "string") return undefined;
-  if (CHECKPOINT_ROOT_ID.test(value.id) && value.archiveIds === undefined) return undefined;
-  let archiveIds;
-  if (value.archiveIds !== undefined) {
-    if (!Array.isArray(value.archiveIds)
-      || value.archiveIds.length > MAX_TOC_CHECKPOINT_IDS_PER_ENTRY
-      || value.archiveIds.some((id) => !checkpointArchiveId(id))) return undefined;
-    archiveIds = [...new Set(value.archiveIds)];
-    if (archiveIds.length !== value.archiveIds.length || !archiveIds.includes(value.id)) {
-      return undefined;
-    }
-    const verified = CHECKPOINT_ROOT_ID.test(value.id)
-      ? checkpointDescriptor(archive, value.id)
-      : undefined;
-    const completeIds = verified === undefined
-      ? undefined
-      : [...new Set([verified.publicationId, verified.rootId, ...verified.partIds])];
-    if (completeIds === undefined
-      || verified.partCount > MAX_ARCHIVE_DETAIL_PART_IDS
-      || completeIds.length > MAX_TOC_CHECKPOINT_IDS_PER_ENTRY
-      || completeIds.length !== archiveIds.length
-      || completeIds.some((id) => !archiveIds.includes(id))) return undefined;
-    archiveIds = completeIds;
-  }
-  return {
-    id: value.id,
-    topic: typeof value.topic === "string" ? value.topic : "",
-    terms: Array.isArray(value.terms)
-      ? value.terms.filter((term) => typeof term === "string")
-      : [],
-    ...(archiveIds === undefined ? {} : { archiveIds }),
-  };
-}
-
-function checkpointResultMatches(planned, stored) {
-  return stored?.status === "stored"
-    && stored.publicationId === planned.publicationId
-    && JSON.stringify(stored.roots) === JSON.stringify(planned.roots)
-    && stored.preview === planned.preview
-    && stored.catalog === planned.catalog;
-}
 
 /**
  * Host-independent state machine for one active context-window session.

@@ -22,7 +22,7 @@ The model normally sees the active epoch. Archived history stays outside the pro
 RocksDB is one local physical store with four logical layers:
 
 1. Canonical archived documents are immutable source records.
-2. Exact, BM25 lexical, and structural indexes locate candidates without loading the archive into the prompt. The current implementation uses neither embeddings nor generated memory summaries.
+2. Exact, BM25 lexical, and structural indexes locate candidates without loading the archive into the prompt. Automatic preflight uses neither embeddings nor generated memory summaries. Explicit `context_window_search` and `context_window_gather` may additionally fall back to a local, non-LLM semantic embedding index; it is on by default and is disabled at the configuration/environment level with `semanticRetrieval: false` (the internal `store.search` wire API also accepts a per-call `semanticPolicy: "never"` override, not exposed as a tool parameter).
 3. Retrieval hints cache bounded decisions for stable user-message keys. Explicit historical intent can cache one quoted excerpt; an implicit recurring concept can cache only a marker made from exact phrases the user just wrote. Normal context reconciliation after rotation or compaction removes hints whose user message left the active path. Hints unique to an abandoned branch may remain until the default 30-day inactivity cleanup. Separate source-exposure records preserve the default 24-hour repeat-suppression window, after which bounded maintenance tombstones them.
 4. RocksDB compaction reclaims obsolete physical records; it does not decide which evidence is semantically live.
 

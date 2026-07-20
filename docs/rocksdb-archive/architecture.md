@@ -113,8 +113,10 @@ Stores created before per-document turn/tool ownership references are upgraded o
 **Explicit non-goals for the first cutover**
 
 - Distributed RocksDB ownership or remote multi-host service.
-- Vector embeddings, query-expansion models, or model-based reranking.
+- Vector embeddings, query-expansion models, or model-based reranking on the automatic retrieval/preflight path.
 - LLM-generated memory summaries.
 - Repository indexing; live repository state remains the host's `rg`, SCIP, ctags, or IDE responsibility.
 - Online SQLite/RocksDB dual writes or rollback after the first acknowledged RocksDB authority write.
 - Automatically deleting the SQLite migration source.
+
+Explicit `context_window_search` and `context_window_gather` separately ship a default-on local, non-LLM semantic embedding fallback for conceptual misses after lexical retrieval, opted out at the configuration/environment level (`semanticRetrieval: false`, or `CONTEXT_WINDOW_SEMANTIC_RETRIEVAL`); the internal `DaemonArchive.searchDetailed`/`store.search` API additionally accepts a `semanticPolicy: "auto" | "always" | "never"` override, not currently exposed as a parameter on either tool surface. Automatic preflight never enables or consults it; see [retrieval.md](./retrieval.md).

@@ -17,7 +17,7 @@ Every new user message receives a cheap preflight retrieval. Full recall remains
 | Lexical | Multi-term historical concept | BM25 postings |
 | Structural | Latest question, request, correction, answer, or decision | Reverse relation index |
 | Concept continuity | Implicit reuse of a concept from earlier discussion | Exact/BM25 candidate, but only current-message phrases may enter the marker |
-| Embedding semantic | Conceptual miss after lexical retrieval | Deferred; no embedding call participates in current automatic retrieval |
+| Embedding semantic | Conceptual miss after lexical retrieval | Local, non-LLM embedding index; default-on fallback for explicit `context_window_search` and `context_window_gather`, opted out via the `semanticRetrieval` config/env setting (the internal `store.search` API also accepts a per-call `semanticPolicy` override, not exposed on either tool); never consulted by automatic preflight |
 
 Exact lookup runs before BM25. Exact-looking input must not be decomposed into broad OR terms before the exact lookup has failed.
 
@@ -87,7 +87,7 @@ Canonical admission and derived publication have separate success boundaries. A 
 - Supersession exclusion.
 - Evidence-kind policy.
 
-No hidden model call participates in first-cutover ranking.
+No hidden model call participates in automatic preflight ranking; the embedding semantic mode above is an explicit, disclosed opt-out fallback, not a hidden call.
 
 **Automatic preflight gate**
 

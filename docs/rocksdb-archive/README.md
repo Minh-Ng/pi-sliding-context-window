@@ -28,7 +28,7 @@ Every implementation agent reads this file plus the guide named by its task. Age
 - Keep a disk-low emergency mode; RocksDB compaction is not logical retention.
 - Keep existing SQLite archives authoritative until explicit offline copy and verification pass. Preserve the source after cutover; rollback is supported only before the first RocksDB-only write.
 - Do not claim online dual writes, production shadow reads, or post-authority rollback in the first cutover.
-- Keep vectors and model-generated summaries outside the first production cutover.
+- Keep vectors and model-generated summaries out of the automatic retrieval/preflight path in the first production cutover; explicit `context_window_search` and `context_window_gather` separately ship a default-on, opt-out local vector embedding fallback (no generated summaries), documented in [retrieval.md](./retrieval.md).
 
 **Swarm rules**
 

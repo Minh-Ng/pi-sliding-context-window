@@ -336,7 +336,7 @@ function callTool(name, args = {}) {
         createdAt: document.createdAt,
         // recalledText carries the raw decision text; text may be a rendered,
         // JSON-framed evidence envelope on backends with a model-visible trust
-        // boundary (see recalledDocument in src/daemon-archive.js).
+        // boundary (see recalledDocument in src/archive/daemon-archive.js).
         text: document.recalledText ?? document.text,
         subjectKey: document.subjectKey,
         sessionId: document.sessionId,

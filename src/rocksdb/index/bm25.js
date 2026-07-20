@@ -140,7 +140,7 @@ function compareStrings(left, right) {
 }
 
 // Fallback (non-cue) structural scores are never exactly 0 in production
-// (structuralMessageScores in ../../structural.js gives every non-empty user
+// (structuralMessageScores in ../../structural-annotations.js gives every non-empty user
 // message question:10+/request:10+, and every non-error assistant message
 // answer:75+), so a `> 0` promotion threshold would promote every located
 // user and assistant span to the structural tier and collapse the intended

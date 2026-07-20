@@ -2017,6 +2017,9 @@ export async function searchBm25(view, request = {}, options = {}) {
       windowEndByte: candidate.endByte,
       score: candidate.score,
       rawScore: candidate.score,
+      // Not part of the store.search contract; consumed only by the search
+      // orchestration layer to compute a query-time recency multiplier.
+      retentionClass: candidate.manifest.retentionClass,
       margin: candidate.score - nextScore,
       matchType: "bm25",
       matchedTerms: candidate.retrievalEvidence.matchedTerms,

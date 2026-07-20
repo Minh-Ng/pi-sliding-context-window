@@ -15,6 +15,18 @@ export const DEFAULT_RETENTION_CLASS_BY_KIND = Object.freeze({
   manual: "durable-evidence",
 });
 
+// Recency decay is a separate axis from expiry: expiry decides what remains
+// live, half-life decides how quickly live evidence loses ranking weight.
+// Durable/active evidence intentionally never decays so promoted decisions
+// keep full weight regardless of age.
+export const DEFAULT_RECENCY_HALF_LIFE_MS_BY_CLASS = Object.freeze({
+  "ephemeral-payload": 3 * DAY_MS,
+  "conversation-source": 21 * DAY_MS,
+  "derived-evidence": 14 * DAY_MS,
+  "durable-evidence": null,
+  "active-evidence": null,
+});
+
 const RETENTION_CLASSES = new Set(Object.keys(DEFAULT_RETENTION_LIFETIMES_MS));
 
 function duration(value, label) {
@@ -121,4 +133,41 @@ export function retentionPolicyFromDays({
       "derived-evidence": asDuration(derivedRetentionDays, "derivedRetentionDays"),
     },
   };
+}
+
+/** Merge caller overrides onto the default recency half-life table once per search call. */
+export function normalizeRecencyHalfLifeMsByClass(overrides = {}) {
+  const requested = object(overrides, "recencyDecay.halfLifeMsByClass");
+  const halfLifeMsByClass = { ...DEFAULT_RECENCY_HALF_LIFE_MS_BY_CLASS };
+  for (const [retentionClass, halfLifeMs] of Object.entries(requested)) {
+    className(retentionClass, "recencyDecay.halfLifeMsByClass key");
+    halfLifeMsByClass[retentionClass] = duration(
+      halfLifeMs,
+      `recency half-life for class ${retentionClass}`,
+    );
+  }
+  return Object.freeze(halfLifeMsByClass);
+}
+
+/**
+ * Multiplicative recency weight for a rerank score: 0.5 at exactly one
+ * half-life old, approaching 0 as age grows. Pure function of retention
+ * class and age (relative to the query timestamp), so a given
+ * (query, corpus, query-time) triple always recomputes to the same weight.
+ */
+export function recencyDecayMultiplier({
+  retentionClass,
+  ageMs,
+  halfLifeMsByClass = DEFAULT_RECENCY_HALF_LIFE_MS_BY_CLASS,
+} = {}) {
+  const halfLifeMs = halfLifeMsByClass[retentionClass];
+  if (halfLifeMs === undefined || halfLifeMs === null) return 1;
+  if (!Number.isSafeInteger(halfLifeMs) || halfLifeMs <= 0) {
+    throw new TypeError("Recency half-life must be null or a positive safe integer.");
+  }
+  if (!Number.isFinite(ageMs)) return 1;
+  // A future-dated createdAt (clock skew, backfilled fixtures) gets no decay
+  // penalty; it never gets a boost either.
+  const clampedAgeMs = Math.max(0, ageMs);
+  return 2 ** (-clampedAgeMs / halfLifeMs);
 }

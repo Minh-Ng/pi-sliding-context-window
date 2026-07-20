@@ -366,6 +366,8 @@ export async function preflightArchive(store, request, options = {}) {
     now,
     leaseMs: options.leaseMs ?? DEFAULT_HINT_LEASE_MS,
     ownerId: `hint:${normalized.sessionId}:${normalized.messageKey}`,
+    // Automatic preflight never sets recencyDecay: a frozen hint must stay
+    // byte-identical however much older the corpus grows around it.
   });
   const candidate = search.results[0];
   const epochId = options.epochId ?? normalized.sessionId;

@@ -19,6 +19,10 @@ import {
   releaseLease,
   RetrievalLeaseTargetUnavailableError,
 } from "./leases.js";
+import {
+  normalizeRecencyHalfLifeMsByClass,
+  recencyDecayMultiplier,
+} from "../daemon/retention-policy.js";
 
 const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, semantic: 1 });
 const WINDOW_SCAN_PAGE = 1_000;
@@ -92,10 +96,26 @@ function exactCandidates(response) {
   }));
 }
 
+/**
+ * Explicit search/gather callers opt in via `options.recencyDecay`; the
+ * automatic preflight path never sets it, so its BM25 candidate ranking
+ * stays undecayed and its frozen hints stay byte-identical over time.
+ */
+function recencyDecayContext(options, now) {
+  const setting = options.recencyDecay;
+  if (!setting) return undefined;
+  const overrides = setting === true ? {} : (setting.halfLifeMsByClass ?? {});
+  return Object.freeze({ now, halfLifeMsByClass: normalizeRecencyHalfLifeMsByClass(overrides) });
+}
+
 function lexicalCandidates(response) {
   return response.results.map((result) => ({
     ...result,
     retrievalMode: "lexical",
+    // rawScore (above) is the untouched BM25 value the index layer computed;
+    // normalizedScore is the undecayed calibration. Decay is applied later, in
+    // applyRecencyDecay, so shouldTrySemantic's cost-control gate below always
+    // reads the undecayed lexical score regardless of options.recencyDecay.
     normalizedScore: normalizeModeScore("lexical", result.rawScore),
     matchedAnchors: Object.freeze([]),
   }));
@@ -490,11 +510,45 @@ async function broadenWithSemantic(collected, request, options) {
 }
 
 /**
+ * Rerank the fully-collected (lexical + structural/exact + any semantic
+ * broadening) candidate set by query-time recency. This runs after
+ * broadenWithSemantic on purpose: shouldTrySemantic's cost/behavior gate must
+ * see the undecayed lexical score, or decay would change which requests pay
+ * for an embedding-backed semantic search, an interaction the caller never
+ * opted into via recencyDecay. It also runs before the importance prior
+ * below, which re-fuses by whatever normalizedScore it is handed and must see
+ * the decay-adjusted value to reorder consistently with the exposed score.
+ */
+function applyRecencyDecay(collected, decay, candidateLimit) {
+  if (decay === undefined) return collected;
+  const decayed = collected.candidates.map((candidate) => {
+    if (candidate.retrievalMode !== "lexical") return candidate;
+    const multiplier = recencyDecayMultiplier({
+      retentionClass: candidate.retentionClass,
+      ageMs: decay.now - candidate.createdAt,
+      halfLifeMsByClass: decay.halfLifeMsByClass,
+    });
+    // rawScore stays the untouched BM25 value; only normalizedScore (the
+    // ranking/rerank score) moves, so BM25 evidence stays independently
+    // recomputable from `explanation` regardless of query time.
+    return { ...candidate, normalizedScore: candidate.normalizedScore * multiplier };
+  });
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(preserveCandidateMargins(
+      fuseCandidates(decayed, candidateLimit),
+    )),
+  });
+}
+
+/**
  * Apply the importance prior to the final candidate set, after semantic
- * broadening. Semantic broadening re-fuses candidates by normalizedScore
- * (broadenWithSemantic), which would otherwise discard any prior-driven
- * reorder from an earlier pass — applying the prior once, last, keeps it
- * consistent regardless of whether semantic search engaged.
+ * broadening and any recency decay. Semantic broadening re-fuses candidates by
+ * normalizedScore (broadenWithSemantic), and recency decay does the same
+ * (applyRecencyDecay), either of which would otherwise discard any
+ * prior-driven reorder from an earlier pass — applying the prior once, last,
+ * keeps it consistent regardless of whether semantic search engaged or decay
+ * was requested.
  */
 async function rankByImportance(store, collected, project) {
   const ranked = await store.snapshot((view) => applyImportancePriors(view, collected.candidates, project));
@@ -592,16 +646,24 @@ async function locateCandidates(store, collected, request, options, secret) {
 export async function searchArchive(store, request, options = {}) {
   requireStore(store);
   const normalized = normalizeRequest(request);
+  const now = options.now ?? Date.now();
+  if (!Number.isSafeInteger(now) || now < 0) throw new TypeError("now must be a non-negative timestamp.");
+  // One resolved timestamp for the secret, the leases, and any recency decay
+  // below keeps a (query, corpus, query-time) triple's score recomputable.
+  const resolvedOptions = Object.freeze({ ...options, now });
   const secret = await getOrCreateLocatorSecret(store, {
-    secret: options.secret,
-    now: options.now,
+    secret: resolvedOptions.secret,
+    now,
   });
-  const lexical = await store.snapshot((view) => collectCandidates(view, normalized, options));
-  const broadened = await broadenWithSemantic(lexical, normalized, options);
-  const collected = options.applyImportancePrior === true
-    ? await rankByImportance(store, broadened, normalized.project)
-    : broadened;
-  const results = await locateCandidates(store, collected, normalized, options, secret);
+  const lexical = await store.snapshot((view) => collectCandidates(view, normalized, resolvedOptions));
+  const undecayed = await broadenWithSemantic(lexical, normalized, resolvedOptions);
+  const decay = recencyDecayContext(resolvedOptions, now);
+  const candidateLimit = Math.min(100, Math.max(normalized.limit, normalized.limit * 3));
+  const decayed = applyRecencyDecay(undecayed, decay, candidateLimit);
+  const collected = resolvedOptions.applyImportancePrior === true
+    ? await rankByImportance(store, decayed, normalized.project)
+    : decayed;
+  const results = await locateCandidates(store, collected, normalized, resolvedOptions, secret);
   let status = results.length === 0 ? "not-found" : "resolved";
   if (results.length > 0 && collected.mode === "structural"
     && ["ambiguous", "legacy-fallback"].includes(collected.structuralStatus)) {
@@ -624,7 +686,7 @@ export async function searchArchive(store, request, options = {}) {
       mode: result.mode,
       status: result.status,
       results: result.results,
-      now: options.now ?? Date.now(),
+      now,
     });
   }
   return result;

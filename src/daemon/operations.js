@@ -582,19 +582,24 @@ export class DaemonOperations {
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
     const readProjects = readProjectsFor(context);
     if (readProjects.length <= 1) {
+      // Explicit search is the "gather evidence" path: rerank with recency
+      // decay. Automatic preflight calls searchArchive directly and never sets
+      // this, so frozen hints stay undecayed.
       return searchArchive(this.store, { ...payload, project: context.project }, {
         semantic: this.semantic,
         recordShownResults: (event) => this.recordRelevanceFeedback(event),
         applyImportancePrior: true,
+        now,
+        recencyDecay: true,
       });
     }
-    return this.#searchAcrossProjects(payload, readProjects, context);
+    return this.#searchAcrossProjects(payload, readProjects, context, now);
   }
 
   // Read-compatibility union over the authenticated project and its verified
   // aliases. Each per-project search authorizes and signs its own locators, so a
   // legacy-alias result stays authorized only for that alias on recall.
-  async #searchAcrossProjects(payload, readProjects, context) {
+  async #searchAcrossProjects(payload, readProjects, context, now) {
     const limit = Number.isSafeInteger(payload.limit) && payload.limit > 0
       ? payload.limit
       : undefined;
@@ -604,9 +609,14 @@ export class DaemonOperations {
     let expiredCount = 0;
     const expiredRetentionClasses = new Set();
     for (const project of readProjects) {
+      // Same query-time recency decay as the single-project path, so an
+      // alias-widened search ranks consistently with the results it merges by
+      // score against single-project search.
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
         applyImportancePrior: true,
+        now,
+        recencyDecay: true,
       });
       modes.add(result.mode);
       indexGeneration = Math.max(indexGeneration, result.indexGeneration);
@@ -670,21 +680,26 @@ export class DaemonOperations {
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
     const readProjects = readProjectsFor(context);
     if (readProjects.length <= 1) {
+      // gatherArchive forwards its options object to searchArchive as-is
+      // (src/retrieval/gather.js), so recencyDecay/now rerank gather's search
+      // anchors the same way as the explicit search path above.
       return gatherArchive(this.store, payload, {
         project: context.project,
         semantic: this.semantic,
         renderFormat: this.renderFormat,
         applyImportancePrior: true,
+        now,
+        recencyDecay: true,
       });
     }
-    return this.#gatherAcrossProjects(payload, readProjects);
+    return this.#gatherAcrossProjects(payload, readProjects, now);
   }
 
   // Read-compatibility union for evidence packets. Each per-project gather is a
   // self-consistent search/traverse/recall over one namespace; pooling their
   // evidence lets a symlink-migrated repo's legacy docs compete for the shared
   // token budget instead of being hidden behind the canonical project's results.
-  async #gatherAcrossProjects(payload, readProjects) {
+  async #gatherAcrossProjects(payload, readProjects, now) {
     const maxTokens = Number.isSafeInteger(payload.maxTokens) && payload.maxTokens > 0
       ? payload.maxTokens
       : Infinity;
@@ -700,6 +715,8 @@ export class DaemonOperations {
         semantic: this.semantic,
         renderFormat: this.renderFormat,
         applyImportancePrior: true,
+        now,
+        recencyDecay: true,
       });
       modes.add(result.mode);
       intent ??= result.intent;

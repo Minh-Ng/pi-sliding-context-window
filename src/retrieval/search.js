@@ -342,6 +342,8 @@ function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, s
   return "lexical";
 }
 
+const EMPTY_EXPIRED_MATCHES = Object.freeze({ count: 0, retentionClasses: Object.freeze([]) });
+
 async function collectCandidates(view, request, options) {
   const generation = await publishedGeneration(view);
   const plan = planExactQuery(request.query);
@@ -351,6 +353,8 @@ async function collectCandidates(view, request, options) {
   let lexicalAttempted = false;
   let structuralAttempted = false;
   let structuralStatus;
+  // Bounded by what the lexical pass already touched; never a separate scan.
+  let expiredMatches = EMPTY_EXPIRED_MATCHES;
 
   if (plan.anchors.length > 0) {
     exactAttempted = true;
@@ -383,6 +387,7 @@ async function collectCandidates(view, request, options) {
       ...(generation > 0 ? { generation } : {}),
     }, options.bm25);
     candidates.push(...lexicalCandidates(lexical));
+    expiredMatches = lexical.work.expiredMatches;
   }
 
   if (request.relation !== null) {
@@ -410,6 +415,7 @@ async function collectCandidates(view, request, options) {
     lexicalAttempted,
     structuralAttempted,
     structuralStatus,
+    expiredMatches,
   });
 }
 
@@ -550,5 +556,6 @@ export async function searchArchive(store, request, options = {}) {
     status,
     indexGeneration: collected.generation,
     results,
+    expiredMatches: collected.expiredMatches,
   });
 }

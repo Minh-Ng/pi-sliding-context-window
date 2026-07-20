@@ -88,6 +88,7 @@ export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "When a durable project fact or decision is settled (a chosen value, name, convention, or agreed constraint), archive it explicitly under a stable subjectKey so one live document per subject stays retrievable by context_window_search; unkeyed turn history recalls settled facts poorly because only decision-shaped phrasing is distilled. On a later correction, call context_window_supersede or re-archive with supersedes targeting the live document so the outdated value leaves search instead of remaining a second live hit.",
   "When a decision or constraint must outlive the archive retention window (cross-session process, security, standing project rule), write it into the repository (AGENTS.md, CLAUDE.md, ADR, or config). The archive is provenance, not the system of record; do not pin archive documents for longevity.",
   "Route a user-scoped fact that holds across projects (a standing preference, personal workflow, or cross-repository convention) to the host's own memory mechanism (Claude Code memory, Pi settings), not this project-partitioned archive and not the repository (AGENTS.md, CLAUDE.md), since neither carries it to the next project.",
+  "If context_window_search reports matching documents expired by retention, treat that as evidence the topic was discussed and later aged out of eligibility—not as proof it was never discussed. The count and retention class are the only disclosed detail; do not guess or assert the expired content itself.",
 ]);
 
 export const ARCHIVED_EVIDENCE_LABEL =

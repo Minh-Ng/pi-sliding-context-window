@@ -9,8 +9,29 @@ import {
 } from "./model-token-budget.js";
 import { archiveDocumentProvenance } from "./provenance.js";
 import { oneLineJson } from "./retrieval/render.js";
+import { DEFAULT_RETENTION_LIFETIMES_MS } from "./daemon/retention-policy.js";
 
 const TRUNCATION_MARKER = "[… retrieval truncated …]";
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+/** Label a retention class with its default lifetime; a deployment can
+ * override the actual duration, so this is a legible approximation, not a
+ * per-document fact. */
+function retentionClassLabel(retentionClass) {
+  const lifetimeMs = DEFAULT_RETENTION_LIFETIMES_MS[retentionClass];
+  if (!Number.isSafeInteger(lifetimeMs)) return retentionClass;
+  return `${retentionClass} retention ${Math.round(lifetimeMs / DAY_MS)}d`;
+}
+
+/** Cheap honesty: matching documents retention already removed without a
+ * live replacement never appear in results, so name only the count and
+ * retention class — never their content — to head off "never discussed". */
+function expiredMatchesNotice(expiredMatches) {
+  if (!expiredMatches || expiredMatches.count <= 0) return undefined;
+  const classes = expiredMatches.retentionClasses.map(retentionClassLabel).join(", ");
+  const plural = expiredMatches.count === 1 ? "document" : "documents";
+  return `${expiredMatches.count} matching ${plural} expired${classes ? ` (${classes})` : ""}.`;
+}
 
 function tokenBudget(tokens) {
   const numeric = Number(tokens);
@@ -121,8 +142,9 @@ export function formatSearchResults(results, tokenLimit, searchDetails) {
     try { return new Date(result.createdAt).toISOString(); } catch { return undefined; }
   };
   const guidance = reconcileState ? ARCHIVE_STATE_RECONCILIATION_HINT : undefined;
+  const expiredNotice = expiredMatchesNotice(searchDetails?.expiredMatches);
   const maxTokens = tokenBudget(tokenLimit);
-  let output = [heading, status, guidance].filter(Boolean).join("\n\n");
+  let output = [heading, status, guidance, expiredNotice].filter(Boolean).join("\n\n");
   if (estimateModelVisibleTokens(output) >= maxTokens) {
     return modelVisiblePrefix(output, maxTokens);
   }
@@ -484,6 +506,16 @@ function identity(text) {
   return text;
 }
 
+const EMERGENCY_RETENTION_NOTICE_TURNS = 4;
+
+function showEmergencyRetentionNotice(status) {
+  if (status.lastRotationMode !== "emergency-retention"
+    || !Number.isSafeInteger(status.effectiveRetainTurns)) return false;
+  if (!Number.isSafeInteger(status.activeTurns)) return true;
+  const turnsSinceRotation = Math.max(0, status.activeTurns - status.effectiveRetainTurns);
+  return turnsSinceRotation < EMERGENCY_RETENTION_NOTICE_TURNS;
+}
+
 export function statusUrgency(status) {
   if (status.rotationPending) return "queued";
   if (status.activeTurns == null || status.activeTokens == null) return "unknown";
@@ -522,7 +554,7 @@ export function formatStatusLine(status, style = {}) {
   if (urgency === "queued") sections.push(warning("rotation queued"));
   else if (urgency === "limit") sections.push(warning("at limit"));
   else if (urgency === "near") sections.push(warning("near limit"));
-  if (status.lastRotationMode === "emergency-retention" && status.effectiveRetainTurns != null) {
+  if (showEmergencyRetentionNotice(status)) {
     sections.push(warning(`emergency retention ${status.effectiveRetainTurns}/${status.retainTurns}`));
   }
   if (status.compactionFallbackReason) sections.push(warning("history checkpoint needed"));
@@ -543,7 +575,7 @@ export function formatStatusDetails(status) {
     );
   }
   if (status.modelPattern) sections.push(`Model profile: ${status.modelPattern}`);
-  if (status.lastRotationMode === "emergency-retention") {
+  if (showEmergencyRetentionNotice(status)) {
     sections.push(`Last rotation: emergency ${status.lastRotationReason}; retained ${status.effectiveRetainTurns}/${status.retainTurns} user-role messages`);
   }
   if (status.compactionFallbackReason) {

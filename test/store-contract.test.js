@@ -215,6 +215,7 @@ const results = Object.freeze({
         messageKey: "assistant:1",
       },
     }],
+    expiredMatches: { count: 0, retentionClasses: [] },
   },
   "store.gather": {
     status: "resolved",

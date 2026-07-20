@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { KEYSPACE } from "../keys.js";
-import { manifestKeys } from "../manifests.js";
+import { manifestKeys, retiredDocumentStatus } from "../manifests.js";
 import { readDocumentRange } from "../document-range.js";
 import { semanticIdentifier } from "../../semantic-identifiers.js";
 import { assertVisibleSourceKeys } from "../../store-contract.js";
+import { DEFAULT_RETENTION_CLASS_BY_KIND } from "../../daemon/retention-policy.js";
 import {
   MAX_BM25_ANALYZED_TOKENS_PER_DOCUMENT,
   MAX_BM25_TERM_WINDOWS_PER_DOCUMENT,
@@ -47,6 +48,7 @@ const DOCUMENT_WINDOWS_PER_SHARD = 256;
 const DOCUMENT_TERM_ORDINALS_PER_SHARD = 1_024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const BM25_WORD = /[\p{L}\p{M}\p{N}_]+/gu;
+const EMPTY_EXPIRED_MATCHES = Object.freeze({ count: 0, retentionClasses: Object.freeze([]) });
 const MAX_BUFFERED_CROSS_SEGMENT_CODE_POINTS = 1_024;
 
 function identifier(value, label) {
@@ -86,6 +88,12 @@ function requireView(view) {
 
 function compareStrings(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** Best-effort retention-class label for an honesty count only; the manifest
+ * that recorded the real class is exactly what already went missing. */
+function fallbackRetentionClass(kind) {
+  return DEFAULT_RETENTION_CLASS_BY_KIND[kind] ?? "conversation-source";
 }
 
 function generationFromRecord(record) {
@@ -1645,6 +1653,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks: 0,
       truncated: false,
       termsConsidered: Object.freeze([]),
+      expiredMatches: EMPTY_EXPIRED_MATCHES,
     }) });
   }
   const statistics = await readBm25Statistics(view, {
@@ -1660,6 +1669,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks: 0,
       truncated: false,
       termsConsidered: Object.freeze([]),
+      expiredMatches: EMPTY_EXPIRED_MATCHES,
     }) });
   }
   const activeTerms = queryTerms
@@ -1675,6 +1685,10 @@ export async function searchBm25(view, request = {}, options = {}) {
   let supersessionChecks = 0;
   let truncated = false;
   const supersession = new Map();
+  // Retention class of each matched-but-retired document, keyed by
+  // documentId so the same expired document is never double-counted across
+  // its stale windows/terms or a later retired-without-manifest hit below.
+  const expiredRetentionClasses = new Map();
 
   for (const term of activeTerms) {
     const remaining = normalized.maxPostingRecords - postingRecordsRead;
@@ -1710,13 +1724,24 @@ export async function searchBm25(view, request = {}, options = {}) {
       const versionIdentity = `${posting.documentId}\0${posting.documentVersion}`;
       let isSuperseded = supersession.get(versionIdentity);
       if (isSuperseded === undefined) {
-        isSuperseded = view.scan([
+        const marker = view.scan([
           KEYSPACE.SUPERSESSION,
           posting.documentId,
           posting.documentVersion,
-        ], { limit: 1 }).length > 0;
+        ], { limit: 1 })[0]?.payload;
+        isSuperseded = marker !== undefined;
         supersession.set(versionIdentity, isSuperseded);
         supersessionChecks += 1;
+        // Only a tombstone with no live replacement is the silent-amnesia
+        // case; a version-bump marker always carries "superseded" and must
+        // not inflate this count, since that document still resolves live.
+        if (marker?.status === "expired" && !expiredRetentionClasses.has(posting.documentId)) {
+          const manifest = await view.get(manifestKeys.document(posting.documentId, posting.documentVersion));
+          expiredRetentionClasses.set(
+            posting.documentId,
+            manifest?.retentionClass ?? fallbackRetentionClass(posting.kind),
+          );
+        }
       }
       if (isSuperseded) continue;
       const { window } = posting;
@@ -1767,7 +1792,27 @@ export async function searchBm25(view, request = {}, options = {}) {
     seenDocuments.add(identity);
     const manifest = await view.get(manifestKeys.document(candidate.documentId, candidate.version));
     // Retention may have removed canonical source before an index cleanup pass.
-    if (manifest === undefined) continue;
+    if (manifest === undefined) {
+      if (!expiredRetentionClasses.has(candidate.documentId)) {
+        const marker = view.scan([
+          KEYSPACE.SUPERSESSION,
+          candidate.documentId,
+          candidate.version,
+        ], { limit: 1 })[0]?.payload;
+        // The tombstone (step 1 of deletion) always precedes canonical
+        // removal (a later step), so a marker is normally already present
+        // here too; documentHistory is only a fallback for the rare window
+        // before that write or after its audited tombstone metadata ages out.
+        const status = marker?.status ?? retiredDocumentStatus(
+          await view.get(manifestKeys.documentHistory(candidate.documentId)),
+          candidate.version,
+        )?.status;
+        if (status === "expired") {
+          expiredRetentionClasses.set(candidate.documentId, fallbackRetentionClass(candidate.kind));
+        }
+      }
+      continue;
+    }
     selected.push({ ...candidate, manifest });
     if (selected.length === normalized.limit) break;
   }
@@ -1850,6 +1895,10 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks,
       truncated,
       termsConsidered: Object.freeze(activeTerms),
+      expiredMatches: Object.freeze({
+        count: expiredRetentionClasses.size,
+        retentionClasses: Object.freeze([...new Set(expiredRetentionClasses.values())].sort()),
+      }),
     }),
   });
 }

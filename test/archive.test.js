@@ -33,6 +33,13 @@ test("archives and BM25-searches documents by scope", () => {
     assert.match(results[0].snippet, /refresh/i);
     assert.equal(archive.get(first).kind, "turn");
     assert.equal(archive.count({ sessionId: "s1" }), 1);
+    // The SQLite legacy backend has no retention-expiry index; it must still
+    // report the zero-value shape rather than leaving the field undefined,
+    // so presentation's expired-match notice behaves consistently across backends.
+    assert.deepEqual(
+      archive.searchDetailed("refresh token session", { sessionId: "s1", project: "/project/a" }).expiredMatches,
+      { count: 0, retentionClasses: [] },
+    );
   } finally {
     archive.close();
     rmSync(directory, { recursive: true, force: true });

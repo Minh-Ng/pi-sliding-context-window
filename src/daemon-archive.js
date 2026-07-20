@@ -827,6 +827,7 @@ export class DaemonArchive {
         status: "not-found",
         results: [],
         candidates: [],
+        expiredMatches: { count: 0, retentionClasses: [] },
       };
     }
     const sessionIds = normalizedSessionLineage(options.sessionIds, options.sessionId);
@@ -917,6 +918,7 @@ export class DaemonArchive {
         granularity: "document",
       })),
       indexGeneration: response.indexGeneration,
+      expiredMatches: response.expiredMatches,
     };
   }
 

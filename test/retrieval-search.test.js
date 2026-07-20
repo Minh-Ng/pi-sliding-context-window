@@ -7,7 +7,12 @@ import { createBm25IndexHandler } from "../src/rocksdb/index/bm25.js";
 import { createExactIndexHandler } from "../src/rocksdb/index/exact.js";
 import { createStructuralIndexHandler } from "../src/rocksdb/index/structural.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
-import { admitDocument, readCanonicalDocument } from "../src/rocksdb/manifests.js";
+import {
+  admitDocument,
+  DOCUMENT_HISTORY_FORMAT_VERSION,
+  manifestKeys,
+  readCanonicalDocument,
+} from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 import { decodeKey, encodeKey, KEYSPACE } from "../src/rocksdb/keys.js";
 import { verifyLocator } from "../src/retrieval/locator.js";
@@ -684,4 +689,70 @@ test("no-result searches create no retrieval leases and malformed requests fail 
     ...withoutUndefined(searchRequest("known")),
     project: "",
   }), /at least 1 characters|project boundary/u);
+});
+
+test("search counts a tombstoned document with no live replacement as expired without exposing its content", async (t) => {
+  const { store, worker } = await fixture(t, "search-expired-count");
+  await admit(store, "expired-doc", "EXPIRED_COUNT_ANCHOR sensitive prior detail.");
+  await worker.drain();
+  await store.put([KEYSPACE.SUPERSESSION, "expired-doc", 1], {
+    documentId: "expired-doc",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("EXPIRED_COUNT_ANCHOR")),
+    { now: 3_000 },
+  );
+  assert.equal(response.status, "not-found");
+  assert.equal(response.results.length, 0);
+  assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+  assert.equal(JSON.stringify(response).includes("sensitive prior detail"), false);
+});
+
+test("a version-bump supersession is not counted among expired matches", async (t) => {
+  const { store, worker } = await fixture(t, "search-superseded-not-expired");
+  await admit(store, "superseded-doc", "SUPERSEDED_ONLY_ANCHOR original wording.");
+  await worker.drain();
+  await admit(store, "superseded-doc", "Replacement text without the old anchor.", { version: 2 });
+  // No further drain: the version-bump supersession marker on v1 is already
+  // durable, but v1's own postings have not been through an index cleanup
+  // pass yet, so the lexical candidate loop must classify the marker itself.
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("SUPERSEDED_ONLY_ANCHOR")),
+    { now: 1_000 },
+  );
+  assert.equal(response.status, "not-found");
+  assert.deepEqual(response.expiredMatches, { count: 0, retentionClasses: [] });
+});
+
+test("a manifest missing with no tombstone marker yet is classified expired from document history", async (t) => {
+  const { store, worker } = await fixture(t, "search-expired-history-fallback");
+  await admit(store, "history-fallback", "HISTORY_FALLBACK_ANCHOR evidence removed by retention.");
+  await worker.drain();
+  // Simulate retention's canonical-cleanup phase completing before its
+  // separate index-delete outbox pass, and before this document's tombstone
+  // metadata was itself audited away — leaving only the durable ledger.
+  await store.remove(manifestKeys.document("history-fallback", 1));
+  await store.put(manifestKeys.documentHistory("history-fallback"), {
+    documentHistoryFormatVersion: DOCUMENT_HISTORY_FORMAT_VERSION,
+    documentId: "history-fallback",
+    project: "/workspace/search",
+    highestAdmittedVersion: 1,
+    retiredThrough: 1,
+  });
+
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("HISTORY_FALLBACK_ANCHOR")),
+    { now: 1_000 },
+  );
+  assert.equal(response.status, "not-found");
+  assert.equal(response.results.length, 0);
+  assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
 });

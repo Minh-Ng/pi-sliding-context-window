@@ -442,12 +442,23 @@ const searchResult = object({
   "source",
 ]);
 
+const expiredMatchesSummary = object({
+  count: nonNegativeInteger,
+  retentionClasses: array(enumeration(RETENTION_CLASSES), { maxItems: RETENTION_CLASSES.length }),
+});
+
 const searchResponse = object({
   mode: enumeration(RETRIEVAL_MODES),
   status: enumeration(["resolved", "not-found", "ambiguous", "legacy-fallback"]),
   indexGeneration: nonNegativeInteger,
   results: array(searchResult),
-});
+  // Matching documents that retention already expired/tombstoned without a
+  // live replacement; surfaced so an agent learns evidence existed and aged
+  // out instead of concluding a topic was never discussed. Never includes
+  // expired content itself. Optional (not in the required list below) so
+  // older daemons/clients that predate this field do not fail validation.
+  expiredMatches: expiredMatchesSummary,
+}, ["mode", "status", "indexGeneration", "results"]);
 
 const traversalResponse = object({
   status: enumeration(["resolved", "not-found"]),

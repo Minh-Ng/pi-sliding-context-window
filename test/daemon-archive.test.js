@@ -906,6 +906,55 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
   }
 });
 
+test("searchDetailed forwards the store's expired-match summary instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-expired-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/expired-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // The daemon's own store.search response already carries expiredMatches
+    // (proven end-to-end in retrieval-search.test.js); this test isolates the
+    // facade's own reshaping of that response, which previously rebuilt its
+    // return object with a fixed key set and silently dropped the field.
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.search") return realRequest(operation, payload, options);
+      return {
+        mode: "lexical",
+        status: "not-found",
+        indexGeneration: 0,
+        results: [],
+        expiredMatches: { count: 2, retentionClasses: ["conversation-source"] },
+      };
+    };
+    const detailed = archive.searchDetailed("EXPIRED_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/expired-wiring",
+      scope: "session",
+    });
+    assert.deepEqual(detailed.expiredMatches, { count: 2, retentionClasses: ["conversation-source"] });
+
+    const wrongProject = archive.searchDetailed("EXPIRED_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      project: "/different/project",
+    });
+    assert.deepEqual(wrongProject.expiredMatches, { count: 0, retentionClasses: [] });
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("daemon facade gathers exact workflow successors in one bounded call", async () => {
   const paths = fixture("context-window-gather-facade-");
   const project = "/project/gather-facade";

@@ -704,6 +704,10 @@ export class Archive {
       status: results.length > 0 ? "resolved" : "not-found",
       results,
       candidates: results.map(({ id }) => ({ id, granularity: "document" })),
+      // The SQLite legacy backend has no retention-expiry index to count
+      // against; report zero rather than leaving the field undefined so
+      // presentation's expired-match notice behaves the same across backends.
+      expiredMatches: { count: 0, retentionClasses: [] },
     };
   }
 

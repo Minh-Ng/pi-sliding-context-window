@@ -1,0 +1,473 @@
+{
+  "kind": "reranker-rank-sensitive-eval",
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-20T17:29:45.912Z",
+  "corpus": {
+    "id": "reranker-rank-sensitive-2026-07-18",
+    "fingerprint": "sha256:ac372f75b89fe8ca059ea35048b30e87bc8a1e05c2e209dcb5d298233ea5af70",
+    "documentCount": 48,
+    "caseCount": 8,
+    "now": 1784376000000
+  },
+  "reranker": {
+    "id": "Xenova/ms-marco-MiniLM-L-6-v2",
+    "revision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+    "dtype": "q8",
+    "device": "cpu",
+    "maxLength": 512
+  },
+  "environment": {
+    "capturedAt": "2026-07-20T17:29:20.817Z",
+    "node": {
+      "version": "v26.4.0",
+      "abi": "147"
+    },
+    "operatingSystem": {
+      "platform": "darwin",
+      "release": "25.5.0",
+      "arch": "arm64"
+    },
+    "cpu": {
+      "model": "Apple M4 Max",
+      "count": 16
+    },
+    "totalMemoryBytes": 68719476736,
+    "filesystem": {
+      "path": "/Users/minh.nguyen/notdotfiles/.claude/worktrees/wf_0997d1d3-0af-8/context-window",
+      "type": "0x1a",
+      "blockSize": 4096,
+      "totalBytes": 1995218165760,
+      "availableBytes": 740259418112
+    },
+    "package": {
+      "name": "context-epoch-window",
+      "version": "0.1.0"
+    },
+    "dependencyLockSha256": "sha256:54833f21fa6c69829b58c485e3aab035144f64a6a0ba6cd4da1a3127f6e983c9",
+    "dependencies": {
+      "rocksdb": "2.4.0",
+      "typebox": "1.1.38"
+    },
+    "git": {
+      "revision": "57b06a7d31e4e3064384796a28a5e030c75fefa9",
+      "dirty": true
+    }
+  },
+  "hardCase": {
+    "count": 8,
+    "total": 8,
+    "allSatisfied": true,
+    "contract": "target is inside the BM25 top-50 and outside the fused top-3 at baseline"
+  },
+  "baselineObservations": [
+    {
+      "id": "rank-dedup",
+      "targetDocumentId": "rank-dedup--target",
+      "bm25Rank": 1,
+      "baselineFusedRank": 28,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-cache-prefix",
+      "targetDocumentId": "rank-cache-prefix--target",
+      "bm25Rank": 5,
+      "baselineFusedRank": 9,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-compaction",
+      "targetDocumentId": "rank-compaction--target",
+      "bm25Rank": 2,
+      "baselineFusedRank": 13,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-migration",
+      "targetDocumentId": "rank-migration--target",
+      "bm25Rank": 1,
+      "baselineFusedRank": 7,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-flaky-test",
+      "targetDocumentId": "rank-flaky-test--target",
+      "bm25Rank": 1,
+      "baselineFusedRank": 6,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-build-log",
+      "targetDocumentId": "rank-build-log--target",
+      "bm25Rank": 3,
+      "baselineFusedRank": 6,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-layout",
+      "targetDocumentId": "rank-layout--target",
+      "bm25Rank": 1,
+      "baselineFusedRank": 18,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    },
+    {
+      "id": "rank-lease-ttl",
+      "targetDocumentId": "rank-lease-ttl--target",
+      "bm25Rank": 10,
+      "baselineFusedRank": 18,
+      "inBm25Top50": true,
+      "inFusedTop3": false,
+      "inRerankWindow": true,
+      "hardCase": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "rank-dedup",
+      "targetDocumentId": "rank-dedup--target",
+      "bm25Rank": 1,
+      "baselineRank": 28,
+      "rerankRank": 1,
+      "windowSize": 32,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.035714,
+      "rerankReciprocalRank": 1,
+      "rerankedDocumentIds": [
+        "rank-dedup--target",
+        "rank-dedup--distractor-4",
+        "rank-dedup--distractor-5",
+        "rank-dedup--distractor-1",
+        "rank-dedup--distractor-3",
+        "rank-dedup--distractor-2",
+        "rank-compaction--distractor-3",
+        "rank-flaky-test--distractor-1",
+        "rank-cache-prefix--distractor-4",
+        "rank-cache-prefix--target",
+        "rank-flaky-test--distractor-4",
+        "rank-flaky-test--distractor-2",
+        "rank-flaky-test--distractor-3",
+        "rank-flaky-test--distractor-5",
+        "rank-flaky-test--target",
+        "rank-compaction--target",
+        "rank-compaction--distractor-5",
+        "rank-compaction--distractor-1",
+        "rank-compaction--distractor-2",
+        "rank-compaction--distractor-4",
+        "rank-layout--distractor-2",
+        "rank-cache-prefix--distractor-2",
+        "rank-cache-prefix--distractor-3",
+        "rank-migration--target",
+        "rank-layout--target",
+        "rank-layout--distractor-1",
+        "rank-layout--distractor-4",
+        "rank-layout--distractor-3",
+        "rank-lease-ttl--distractor-1",
+        "rank-build-log--distractor-4",
+        "rank-layout--distractor-5",
+        "rank-lease-ttl--target"
+      ]
+    },
+    {
+      "id": "rank-cache-prefix",
+      "targetDocumentId": "rank-cache-prefix--target",
+      "bm25Rank": 5,
+      "baselineRank": 9,
+      "rerankRank": 3,
+      "windowSize": 11,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.111111,
+      "rerankReciprocalRank": 0.333333,
+      "rerankedDocumentIds": [
+        "rank-cache-prefix--distractor-3",
+        "rank-cache-prefix--distractor-1",
+        "rank-cache-prefix--target",
+        "rank-cache-prefix--distractor-2",
+        "rank-cache-prefix--distractor-5",
+        "rank-cache-prefix--distractor-4",
+        "rank-dedup--distractor-4",
+        "rank-migration--distractor-2",
+        "rank-layout--target",
+        "rank-build-log--distractor-3",
+        "rank-build-log--target"
+      ]
+    },
+    {
+      "id": "rank-compaction",
+      "targetDocumentId": "rank-compaction--target",
+      "bm25Rank": 2,
+      "baselineRank": 13,
+      "rerankRank": 1,
+      "windowSize": 15,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.076923,
+      "rerankReciprocalRank": 1,
+      "rerankedDocumentIds": [
+        "rank-compaction--target",
+        "rank-compaction--distractor-3",
+        "rank-compaction--distractor-1",
+        "rank-compaction--distractor-5",
+        "rank-compaction--distractor-2",
+        "rank-compaction--distractor-4",
+        "rank-cache-prefix--target",
+        "rank-dedup--target",
+        "rank-lease-ttl--distractor-5",
+        "rank-dedup--distractor-4",
+        "rank-dedup--distractor-5",
+        "rank-dedup--distractor-3",
+        "rank-migration--distractor-2",
+        "rank-build-log--target",
+        "rank-layout--target"
+      ]
+    },
+    {
+      "id": "rank-migration",
+      "targetDocumentId": "rank-migration--target",
+      "bm25Rank": 1,
+      "baselineRank": 7,
+      "rerankRank": 1,
+      "windowSize": 8,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.142857,
+      "rerankReciprocalRank": 1,
+      "rerankedDocumentIds": [
+        "rank-migration--target",
+        "rank-migration--distractor-2",
+        "rank-migration--distractor-4",
+        "rank-migration--distractor-5",
+        "rank-migration--distractor-3",
+        "rank-migration--distractor-1",
+        "rank-build-log--target",
+        "rank-layout--target"
+      ]
+    },
+    {
+      "id": "rank-flaky-test",
+      "targetDocumentId": "rank-flaky-test--target",
+      "bm25Rank": 1,
+      "baselineRank": 6,
+      "rerankRank": 4,
+      "windowSize": 6,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": false,
+      "baselineReciprocalRank": 0.166667,
+      "rerankReciprocalRank": 0.25,
+      "rerankedDocumentIds": [
+        "rank-flaky-test--distractor-1",
+        "rank-flaky-test--distractor-2",
+        "rank-flaky-test--distractor-4",
+        "rank-flaky-test--target",
+        "rank-flaky-test--distractor-3",
+        "rank-flaky-test--distractor-5"
+      ]
+    },
+    {
+      "id": "rank-build-log",
+      "targetDocumentId": "rank-build-log--target",
+      "bm25Rank": 3,
+      "baselineRank": 6,
+      "rerankRank": 2,
+      "windowSize": 8,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.166667,
+      "rerankReciprocalRank": 0.5,
+      "rerankedDocumentIds": [
+        "rank-build-log--distractor-5",
+        "rank-build-log--target",
+        "rank-build-log--distractor-4",
+        "rank-build-log--distractor-3",
+        "rank-build-log--distractor-1",
+        "rank-build-log--distractor-2",
+        "rank-compaction--target",
+        "rank-cache-prefix--target"
+      ]
+    },
+    {
+      "id": "rank-layout",
+      "targetDocumentId": "rank-layout--target",
+      "bm25Rank": 1,
+      "baselineRank": 18,
+      "rerankRank": 1,
+      "windowSize": 21,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.055556,
+      "rerankReciprocalRank": 1,
+      "rerankedDocumentIds": [
+        "rank-layout--target",
+        "rank-layout--distractor-2",
+        "rank-layout--distractor-1",
+        "rank-layout--distractor-4",
+        "rank-layout--distractor-3",
+        "rank-layout--distractor-5",
+        "rank-flaky-test--distractor-5",
+        "rank-flaky-test--distractor-1",
+        "rank-flaky-test--distractor-4",
+        "rank-flaky-test--target",
+        "rank-flaky-test--distractor-3",
+        "rank-flaky-test--distractor-2",
+        "rank-lease-ttl--distractor-5",
+        "rank-lease-ttl--target",
+        "rank-lease-ttl--distractor-2",
+        "rank-dedup--distractor-1",
+        "rank-dedup--distractor-3",
+        "rank-dedup--distractor-4",
+        "rank-dedup--distractor-5",
+        "rank-dedup--target",
+        "rank-dedup--distractor-2"
+      ]
+    },
+    {
+      "id": "rank-lease-ttl",
+      "targetDocumentId": "rank-lease-ttl--target",
+      "bm25Rank": 10,
+      "baselineRank": 18,
+      "rerankRank": 1,
+      "windowSize": 20,
+      "baselineRecalledAt3": false,
+      "rerankRecalledAt3": true,
+      "baselineReciprocalRank": 0.055556,
+      "rerankReciprocalRank": 1,
+      "rerankedDocumentIds": [
+        "rank-lease-ttl--target",
+        "rank-lease-ttl--distractor-4",
+        "rank-lease-ttl--distractor-2",
+        "rank-flaky-test--distractor-3",
+        "rank-flaky-test--distractor-5",
+        "rank-flaky-test--distractor-4",
+        "rank-flaky-test--distractor-2",
+        "rank-flaky-test--distractor-1",
+        "rank-flaky-test--target",
+        "rank-lease-ttl--distractor-3",
+        "rank-lease-ttl--distractor-1",
+        "rank-lease-ttl--distractor-5",
+        "rank-migration--distractor-1",
+        "rank-migration--target",
+        "rank-compaction--distractor-3",
+        "rank-migration--distractor-2",
+        "rank-migration--distractor-5",
+        "rank-migration--distractor-3",
+        "rank-cache-prefix--distractor-2",
+        "rank-dedup--distractor-5"
+      ]
+    }
+  ],
+  "metrics": {
+    "caseCount": 8,
+    "baseline": {
+      "recallAt3": 0,
+      "meanReciprocalRank": 0.101381
+    },
+    "rerank": {
+      "recallAt3": 0.875,
+      "meanReciprocalRank": 0.760417
+    },
+    "delta": {
+      "recallAt3Absolute": 0.875,
+      "meanReciprocalRankAbsolute": 0.659036,
+      "meanReciprocalRankRelative": 6.500587
+    }
+  },
+  "latency": {
+    "candidateWindow": 40,
+    "sampleCount": 160,
+    "samplesPerQuery": 20,
+    "warmupPerQuery": 3,
+    "p50Ms": 87.117,
+    "p95Ms": 334.464,
+    "perQuery": [
+      {
+        "id": "rank-dedup",
+        "candidateCount": 40,
+        "p50Ms": 56.862,
+        "p95Ms": 63.908
+      },
+      {
+        "id": "rank-cache-prefix",
+        "candidateCount": 40,
+        "p50Ms": 55.357,
+        "p95Ms": 61.347
+      },
+      {
+        "id": "rank-compaction",
+        "candidateCount": 40,
+        "p50Ms": 94.985,
+        "p95Ms": 339.823
+      },
+      {
+        "id": "rank-migration",
+        "candidateCount": 40,
+        "p50Ms": 298.042,
+        "p95Ms": 714.943
+      },
+      {
+        "id": "rank-flaky-test",
+        "candidateCount": 40,
+        "p50Ms": 110.809,
+        "p95Ms": 229.968
+      },
+      {
+        "id": "rank-build-log",
+        "candidateCount": 40,
+        "p50Ms": 86.839,
+        "p95Ms": 145.501
+      },
+      {
+        "id": "rank-layout",
+        "candidateCount": 40,
+        "p50Ms": 90.347,
+        "p95Ms": 219.603
+      },
+      {
+        "id": "rank-lease-ttl",
+        "candidateCount": 40,
+        "p50Ms": 86.802,
+        "p95Ms": 119.809
+      }
+    ]
+  },
+  "decision": {
+    "verdict": "build",
+    "rule": {
+      "minRelativeMrrGain": 0.1,
+      "minAbsoluteRecallAt3Gain": 0.05,
+      "maxP50LatencyMs": 1500,
+      "candidateWindow": 40
+    },
+    "criteria": {
+      "relativeMrrGain": 6.500587,
+      "relativeMrrGainMet": true,
+      "absoluteRecallAt3Gain": 0.875,
+      "absoluteRecallAt3GainMet": true,
+      "qualityCriterionMet": true,
+      "p50LatencyMs": 87.117,
+      "latencyCriterionMet": true
+    },
+    "rationale": "Rerank cleared the quality bar (MRR or Recall@3) and the p50 latency budget on this machine."
+  },
+  "caveat": "This measures reranker capability on constructed hard cases (target in BM25 top-50 but out of the fused top-3). How often real sessions actually hit such cases is a separate question answered by the live relevance-feedback log, not by this suite."
+}

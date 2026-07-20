@@ -1,4 +1,4 @@
-export const BM25_TOKENIZER_VERSION = 1;
+export const BM25_TOKENIZER_VERSION = 2;
 export const MAX_BM25_TERM_CODE_POINTS = 128;
 
 const WORD = /[\p{L}\p{M}\p{N}_]+/gu;
@@ -144,6 +144,68 @@ export function normalizeBm25Term(value) {
   return /^[a-z]+$/u.test(normalized) ? porterStem(normalized) : normalized;
 }
 
+function isAsciiLower(character) {
+  return character >= "a" && character <= "z";
+}
+
+function isAsciiUpper(character) {
+  return character >= "A" && character <= "Z";
+}
+
+function isAsciiDigit(character) {
+  return character >= "0" && character <= "9";
+}
+
+/**
+ * Split one delimited word into camelCase/snake_case pieces via a single
+ * left-to-right scan (no nested-quantifier regex, so no backtracking risk
+ * on adversarial identifiers). Underscores delimit; a lower/digit-to-upper
+ * transition or an acronym-to-word transition (e.g. "HTTPServer") also
+ * starts a new piece. Non-ASCII case (accents, CJK, etc.) never splits.
+ * Returns [] when the word has no internal boundary to offer beyond itself.
+ */
+export function splitBm25Subtokens(word) {
+  if (typeof word !== "string") throw new TypeError("BM25 subtoken splitting requires a string.");
+  const segments = [];
+  let start = 0;
+  const pushSegment = (from, to) => {
+    if (to > from) segments.push(word.slice(from, to));
+  };
+  for (let index = 0; index <= word.length; index += 1) {
+    if (index < word.length && word[index] === "_") {
+      pushSegment(start, index);
+      start = index + 1;
+      continue;
+    }
+    if (index === start || index === word.length) continue;
+    const previous = word[index - 1];
+    const current = word[index];
+    const humpBoundary = (isAsciiLower(previous) || isAsciiDigit(previous)) && isAsciiUpper(current);
+    const acronymBoundary = isAsciiUpper(previous) && isAsciiUpper(current)
+      && index + 1 < word.length && isAsciiLower(word[index + 1]);
+    if (humpBoundary || acronymBoundary) {
+      pushSegment(start, index);
+      start = index;
+    }
+  }
+  pushSegment(start, word.length);
+  if (segments.length === 1 && segments[0] === word) return [];
+  return segments;
+}
+
+/** Deduplicated, normalized camelCase/snake_case subterms distinct from the compound term. */
+export function bm25Subterms(surface, compoundTerm) {
+  const seen = new Set(compoundTerm ? [compoundTerm] : []);
+  const subterms = [];
+  for (const piece of splitBm25Subtokens(surface)) {
+    const term = normalizeBm25Term(piece);
+    if (!term || seen.has(term)) continue;
+    seen.add(term);
+    subterms.push(Object.freeze({ term, surface: piece }));
+  }
+  return Object.freeze(subterms);
+}
+
 /** Tokenize text with original UTF-8 byte positions and stable Porter terms. */
 export function tokenizeBm25(text) {
   if (typeof text !== "string") throw new TypeError("BM25 text must be a string.");
@@ -163,6 +225,17 @@ export function tokenizeBm25(text) {
       tokens.push(Object.freeze({
         term,
         surface: match[0],
+        position,
+        startByte,
+        endByte,
+      }));
+    }
+    // Subtokens carry the compound token's byte range: they are the same
+    // source occurrence, just indexed under additional normalized terms.
+    for (const subterm of bm25Subterms(match[0], term)) {
+      tokens.push(Object.freeze({
+        term: subterm.term,
+        surface: subterm.surface,
         position,
         startByte,
         endByte,

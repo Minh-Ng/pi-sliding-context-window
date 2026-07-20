@@ -15,9 +15,16 @@ export const MAX_STRUCTURAL_PREPARED_MUTATIONS = Math.min(
   MAX_HANDLER_PREPARED_MUTATIONS,
   Math.floor(MAX_HANDLER_STAGED_MUTATIONS / 2),
 );
-export const MAX_BM25_TOKENS_PER_WINDOW = 4_000;
-export const MAX_BM25_ANALYZED_TOKENS_PER_DOCUMENT = 16_000;
-export const MAX_BM25_TERM_WINDOWS_PER_DOCUMENT = 1_024;
+// Subtoken splitting emits a compound term plus its camelCase/snake_case
+// pieces for every identifier, so code-dense windows now produce roughly
+// 4x as many raw token occurrences as the pre-subtoken tokenizer (measured:
+// 100 three-piece identifiers -> 400 tokens). These three raw-token limits
+// are raised 4x from their pre-subtoken values so that documents which
+// indexed cleanly before this change keep indexing cleanly now, instead of
+// being silently skipped by the indexer on IndexPreparationLimitError.
+export const MAX_BM25_TOKENS_PER_WINDOW = 16_000;
+export const MAX_BM25_ANALYZED_TOKENS_PER_DOCUMENT = 64_000;
+export const MAX_BM25_TERM_WINDOWS_PER_DOCUMENT = 4_096;
 export const MAX_EXACT_INDEX_ANCHORS = 8_000;
 export const MAX_EXACT_POSTING_MUTATIONS = 1_000;
 export const MAX_STRUCTURAL_INDEX_MESSAGES = MAX_STRUCTURAL_MESSAGES_PER_DOCUMENT;

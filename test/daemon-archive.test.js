@@ -669,7 +669,7 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
     const unavailableId = archive.put({
       id: "legacy-without-source-keys",
       sessionId: "session-a",
-      text: "Legacy evidence with OLD_ONLY_SOURCE_ABSENCE.",
+      text: "Legacy evidence with OLD_VANISHED_PHANTOM_RELIC.",
       createdAt: 124,
     });
     const unavailable = archive.get(unavailableId);
@@ -679,12 +679,12 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
     assert.equal(archive.put({
       id: unavailableId,
       sessionId: "session-a",
-      text: "Replacement evidence with NEW_ONLY_SOURCE_ABSENCE.",
+      text: "Replacement evidence with NEW_MODERN_ACTIVE_TOKEN.",
       createdAt: 125,
     }), unavailableId);
     assert.equal(archive.get(unavailableId).version, 2);
-    assert.equal(archive.get(unavailableId).text, "Replacement evidence with NEW_ONLY_SOURCE_ABSENCE.");
-    assert.equal(archive.search("OLD_ONLY_SOURCE_ABSENCE", {
+    assert.equal(archive.get(unavailableId).text, "Replacement evidence with NEW_MODERN_ACTIVE_TOKEN.");
+    assert.equal(archive.search("OLD_VANISHED_PHANTOM_RELIC", {
       sessionId: "session-a",
       project: "/project/a",
     }).length, 0, "superseded versions are not searchable");

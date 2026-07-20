@@ -18,7 +18,9 @@ import {
   searchBm25,
 } from "../src/rocksdb/index/bm25.js";
 import {
+  bm25Subterms,
   normalizeBm25Term,
+  splitBm25Subtokens,
   tokenizeBm25,
   tokenizeBm25Query,
 } from "../src/rocksdb/index/tokenizer.js";
@@ -82,6 +84,105 @@ test("tokenizer stems deterministic terms and retains original UTF-8 positions",
   for (const token of tokens) {
     assert.equal(Buffer.from(text).subarray(token.startByte, token.endByte).toString(), token.surface);
   }
+});
+
+test("subtoken splitting isolates camelCase, PascalCase, acronym, and snake_case pieces", () => {
+  assert.deepEqual(splitBm25Subtokens("handleRotationCheckpoint"), ["handle", "Rotation", "Checkpoint"]);
+  assert.deepEqual(splitBm25Subtokens("foo_bar"), ["foo", "bar"]);
+  assert.deepEqual(splitBm25Subtokens("HTTPServer"), ["HTTP", "Server"]);
+  assert.deepEqual(splitBm25Subtokens("getHTTPResponse"), ["get", "HTTP", "Response"]);
+  assert.deepEqual(splitBm25Subtokens("_foo"), ["foo"]);
+  assert.deepEqual(splitBm25Subtokens("__init__"), ["init"]);
+  assert.deepEqual(splitBm25Subtokens("fooBar123Baz"), ["foo", "Bar123", "Baz"]);
+  // No internal boundary: a plain word or an acronym-only word does not split.
+  assert.deepEqual(splitBm25Subtokens("Foo"), []);
+  assert.deepEqual(splitBm25Subtokens("foo"), []);
+  assert.deepEqual(splitBm25Subtokens("ID"), []);
+  // Non-ASCII case never triggers a boundary itself, but an ASCII hump
+  // elsewhere in the word still splits around the non-ASCII run.
+  assert.deepEqual(splitBm25Subtokens("café"), []);
+  assert.deepEqual(splitBm25Subtokens("naïveBuilder"), ["naïve", "Builder"]);
+});
+
+test("bm25Subterms normalizes subtokens and excludes duplicates of the compound term", () => {
+  const compound = normalizeBm25Term("handleRotationCheckpoint");
+  const subterms = bm25Subterms("handleRotationCheckpoint", compound);
+  assert.deepEqual(subterms.map(({ term }) => term), ["handl", "rotat", "checkpoint"]);
+  assert.deepEqual(subterms.map(({ surface }) => surface), ["handle", "Rotation", "Checkpoint"]);
+  // A word that does not decompose contributes no subterms.
+  assert.deepEqual(bm25Subterms("Foo", normalizeBm25Term("Foo")), []);
+  // Repeated pieces within one word collapse to a single subterm.
+  assert.deepEqual(bm25Subterms("FooFoo", normalizeBm25Term("FooFoo")).map(({ term }) => term), ["foo"]);
+});
+
+test("tokenizeBm25 indexes camelCase/snake_case compounds alongside their subtokens", () => {
+  const text = "handleRotationCheckpoint foo_bar HTTPServer";
+  const tokens = tokenizeBm25(text);
+  assert.deepEqual(
+    tokens.map(({ term, surface, startByte, endByte }) => ({ term, surface, startByte, endByte })),
+    [
+      { term: "handlerotationcheckpoint", surface: "handleRotationCheckpoint", startByte: 0, endByte: 24 },
+      { term: "handl", surface: "handle", startByte: 0, endByte: 24 },
+      { term: "rotat", surface: "Rotation", startByte: 0, endByte: 24 },
+      { term: "checkpoint", surface: "Checkpoint", startByte: 0, endByte: 24 },
+      { term: "foo_bar", surface: "foo_bar", startByte: 25, endByte: 32 },
+      { term: "foo", surface: "foo", startByte: 25, endByte: 32 },
+      { term: "bar", surface: "bar", startByte: 25, endByte: 32 },
+      { term: "httpserver", surface: "HTTPServer", startByte: 33, endByte: 43 },
+      { term: "http", surface: "HTTP", startByte: 33, endByte: 43 },
+      { term: "server", surface: "Server", startByte: 33, endByte: 43 },
+    ],
+  );
+  // Query tokenization applies the identical split, in first-occurrence order.
+  assert.deepEqual(
+    tokenizeBm25Query("handleRotationCheckpoint"),
+    ["handlerotationcheckpoint", "handl", "rotat", "checkpoint"],
+  );
+});
+
+test("BM25 search finds a compound identifier by a camelCase or snake_case subtoken", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "subtokens"));
+  t.after(() => store.close());
+  await admit(store, "doc-checkpoint", "The daemon calls handleRotationCheckpoint before archiving old_epoch_state.", {
+    createdAt: 100,
+  });
+  await admit(store, "doc-unrelated", "Nothing here discusses rotation or archiving at all.", {
+    createdAt: 200,
+  });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:subtokens",
+    // The IndexWorker context always supplies readSourceRange, so this
+    // exercises the production streaming tokenizer path, not tokenizeBm25
+    // directly.
+    handlers: [createBm25IndexHandler()],
+  });
+  assert.equal((await worker.drain({ throwOnError: true })).processed, 2);
+
+  const bySubtoken = await searchBm25(store, {
+    query: "checkpoint",
+    project: "/fixture/project",
+    scope: "project",
+    limit: 3,
+  });
+  assert.equal(bySubtoken.results[0]?.documentId, "doc-checkpoint");
+  assert.ok(bySubtoken.results[0].matchedTerms.includes("checkpoint"));
+
+  const bySnakeSubtoken = await searchBm25(store, {
+    query: "epoch",
+    project: "/fixture/project",
+    scope: "project",
+    limit: 3,
+  });
+  assert.equal(bySnakeSubtoken.results[0]?.documentId, "doc-checkpoint");
+
+  const byCompound = await searchBm25(store, {
+    query: "handleRotationCheckpoint",
+    project: "/fixture/project",
+    scope: "project",
+    limit: 3,
+  });
+  assert.equal(byCompound.results[0]?.documentId, "doc-checkpoint");
+  assert.ok(byCompound.results[0].matchedTerms.includes("handlerotationcheckpoint"));
 });
 
 test("IndexWorker publishes complete BM25 generations with recomputable scores", async (t) => {

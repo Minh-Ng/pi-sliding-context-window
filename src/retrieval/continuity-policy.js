@@ -51,17 +51,51 @@ function exactSpans(message, values) {
   return Object.freeze(spans);
 }
 
+/**
+ * Whole message words (not camelCase/snake_case subtoken fragments) that
+ * carry at least one term from `wanted`, one entry per distinct matched
+ * term. A compound identifier tokenizes into its compound term plus
+ * subterms sharing one position; all of them collapse to the single
+ * whole-word surface at that position, so a subterm-only match still
+ * credits exactly one word of evidence. A position is only credited if it
+ * carries a matched term not already credited by an earlier position, so a
+ * literally repeated word, and distinct inflections of the same stemmed
+ * term (e.g. "connect" and "connecting"), are not double-counted either —
+ * this keeps the evidence bar keyed on distinct matched terms, matching the
+ * pre-subtoken-splitting behavior. Returned in first-occurrence order.
+ */
+function matchedMessageWords(message, wanted) {
+  const widestSurfaceByPosition = new Map();
+  const matchedTermsByPosition = new Map();
+  const positionOrder = [];
+  for (const token of tokenizeBm25(message)) {
+    const current = widestSurfaceByPosition.get(token.position);
+    if (current === undefined || token.surface.length > current.length) {
+      widestSurfaceByPosition.set(token.position, token.surface);
+    }
+    let matchedTerms = matchedTermsByPosition.get(token.position);
+    if (matchedTerms === undefined) {
+      matchedTerms = new Set();
+      matchedTermsByPosition.set(token.position, matchedTerms);
+      positionOrder.push(token.position);
+    }
+    if (wanted.has(token.term)) matchedTerms.add(token.term);
+  }
+  const words = [];
+  const creditedTerms = new Set();
+  for (const position of positionOrder) {
+    const matchedTerms = matchedTermsByPosition.get(position);
+    if (matchedTerms.size === 0) continue;
+    if ([...matchedTerms].every((term) => creditedTerms.has(term))) continue;
+    for (const term of matchedTerms) creditedTerms.add(term);
+    words.push(widestSurfaceByPosition.get(position));
+  }
+  return words;
+}
+
 function lexicalSpans(message, matchedTerms) {
   if (!Array.isArray(matchedTerms) || matchedTerms.length === 0) return Object.freeze([]);
-  const wanted = new Set(matchedTerms);
-  const spans = [];
-  const seenTerms = new Set();
-  for (const token of tokenizeBm25(message)) {
-    if (!wanted.has(token.term) || seenTerms.has(token.term)) continue;
-    seenTerms.add(token.term);
-    spans.push(token.surface);
-  }
-  return Object.freeze(spans);
+  return Object.freeze(matchedMessageWords(message, new Set(matchedTerms)));
 }
 
 /** Detect only routing intent. Concept evidence is evaluated separately. */
@@ -91,11 +125,12 @@ function strongExact(message, candidate) {
 
 function strongLexical(message, candidate) {
   const matchedTerms = Array.isArray(candidate.matchedTerms) ? new Set(candidate.matchedTerms) : new Set();
-  const messageTerms = new Set(tokenizeBm25(message).map(({ term }) => term));
-  let termsInMessage = 0;
-  for (const term of matchedTerms) if (messageTerms.has(term)) termsInMessage += 1;
+  // Count distinct whole message words with evidence, not distinct terms:
+  // a compound identifier's camelCase/snake_case subterms must count as one
+  // word, and a literally repeated word must not count twice.
+  const words = matchedMessageWords(message, matchedTerms);
   return candidate.retrievalMode === "lexical"
-    && termsInMessage >= CONTINUITY_THRESHOLDS.lexicalTerms
+    && words.length >= CONTINUITY_THRESHOLDS.lexicalTerms
     && finiteNumber(candidate.termCoverage) >= CONTINUITY_THRESHOLDS.termCoverage
     && finiteNumber(candidate.maxNormalizedIdf) >= CONTINUITY_THRESHOLDS.maxNormalizedIdf;
 }

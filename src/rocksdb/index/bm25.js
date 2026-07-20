@@ -12,6 +12,7 @@ import {
   preparationLimit,
 } from "../index-preparation.js";
 import {
+  bm25Subterms,
   BM25_TOKENIZER_VERSION,
   normalizeBm25Term,
   tokenizeBm25,
@@ -37,7 +38,11 @@ const ROOT = Object.freeze([
   BM25_TOKENIZER_VERSION,
 ]);
 const MAX_SCAN_LIMIT = 100_000;
-const MAX_UNIQUE_TERMS_PER_DOCUMENT = 256;
+// Subtoken splitting indexes each camelCase/snake_case identifier under both
+// its compound term and its pieces, roughly doubling unique terms for
+// code-dense text; raised from the pre-subtoken 256 so that documents which
+// indexed cleanly before this change keep indexing cleanly now.
+const MAX_UNIQUE_TERMS_PER_DOCUMENT = 512;
 const DOCUMENT_WINDOWS_PER_SHARD = 256;
 const DOCUMENT_TERM_ORDINALS_PER_SHARD = 1_024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -437,6 +442,23 @@ function finishStreamedWord(state, target) {
       startByte: word.startByte,
       endByte: word.endByte,
     }));
+  }
+  // Subtokens carry the compound token's byte range, matching tokenizeBm25.
+  if (!word.overflow) {
+    for (const subterm of bm25Subterms(word.surface, term)) {
+      preparationLimit(
+        "bm25",
+        "tokens per window",
+        MAX_BM25_TOKENS_PER_WINDOW,
+        target.length + 1,
+      );
+      target.push(Object.freeze({
+        term: subterm.term,
+        position: state.position,
+        startByte: word.startByte,
+        endByte: word.endByte,
+      }));
+    }
   }
   state.position += 1;
   state.pending = undefined;

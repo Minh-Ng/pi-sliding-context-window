@@ -182,6 +182,53 @@ test("marker rendering rejects archive-only or duplicate dynamic material", () =
   );
 });
 
+test("one compound identifier's camelCase subtokens do not alone satisfy the two-term evidence bar", () => {
+  const message = "why handleRotationCheckpoint?";
+  const candidate = lexicalCandidate({
+    matchedTerms: ["rotat", "checkpoint"],
+    termCoverage: 1,
+    maxNormalizedIdf: 1,
+  });
+  const decision = decideContinuityDisclosure({ message, candidate });
+  assert.equal(decision.outcome, "suppress");
+  assert.equal(decision.reason, CONTINUITY_REASON.WEAK_EVIDENCE);
+});
+
+test("subterms from two distinct compound identifiers still satisfy the two-term evidence bar", () => {
+  const message = "why handleRotationCheckpoint and validateSnapshotSync?";
+  const candidate = lexicalCandidate({
+    matchedTerms: ["rotat", "snapshot"],
+    termCoverage: 1,
+    maxNormalizedIdf: 1,
+  });
+  const decision = decideContinuityDisclosure({ message, candidate });
+  assert.equal(decision.outcome, "continuity-marker");
+  assert.equal(decision.reason, CONTINUITY_REASON.IMPLICIT_CONTINUITY);
+});
+
+test("a literally repeated word with only one matched term does not satisfy the two-term evidence bar", () => {
+  const message = "tablet tablet compaction issue";
+  const candidate = lexicalCandidate({
+    matchedTerms: ["tablet"],
+    termCoverage: 1,
+    maxNormalizedIdf: 1,
+  });
+  const decision = decideContinuityDisclosure({ message, candidate });
+  assert.equal(decision.outcome, "suppress");
+  assert.equal(decision.reason, CONTINUITY_REASON.WEAK_EVIDENCE);
+});
+
+test("a subterm-only match anchors on the whole identifier the user typed, not a word fragment", () => {
+  const message = "why handleRotationCheckpoint and validateSnapshotSync?";
+  const candidate = lexicalCandidate({
+    matchedTerms: ["rotat", "snapshot"],
+    termCoverage: 1,
+    maxNormalizedIdf: 1,
+  });
+  const decision = decideContinuityDisclosure({ message, candidate });
+  assert.deepEqual(decision.anchors, ["handleRotationCheckpoint", "validateSnapshotSync"]);
+});
+
 test("routing intent remains narrow enough for implicit concepts", () => {
   assert.deepEqual(continuityIntent("Could tablets help here?"), {
     historical: false,

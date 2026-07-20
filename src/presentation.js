@@ -517,6 +517,21 @@ function showEmergencyRetentionNotice(status) {
   return turnsSinceRotation < EMERGENCY_RETENTION_NOTICE_TURNS;
 }
 
+/**
+ * Adaptive tool-result budget state for the footer: "over" once admitted
+ * tool-result tokens reached the budget (new results are now gated at the lower
+ * floor), "near" while approaching it, otherwise undefined. Presentation only;
+ * the enforcement decision lives in the epoch session.
+ */
+export function toolResultBudgetState(status) {
+  const tokens = Number(status?.toolResultTokens);
+  const budget = Number(status?.toolResultBudgetTokens);
+  if (!Number.isFinite(tokens) || !Number.isFinite(budget) || budget <= 0) return undefined;
+  if (status.toolResultOverBudget || tokens >= budget) return "over";
+  if (tokens >= budget * 0.8) return "near";
+  return undefined;
+}
+
 export function statusUrgency(status) {
   if (status.rotationPending) return "queued";
   if (status.activeTurns == null || status.activeTokens == null) return "unknown";
@@ -558,6 +573,9 @@ export function formatStatusLine(status, style = {}) {
   if (showEmergencyRetentionNotice(status)) {
     sections.push(warning(`emergency retention ${status.effectiveRetainTurns}/${status.retainTurns}`));
   }
+  const budgetState = toolResultBudgetState(status);
+  if (budgetState === "over") sections.push(warning("tool-result budget reached"));
+  else if (budgetState === "near") sections.push(warning("tool-result budget near"));
   if (status.compactionFallbackReason) sections.push(warning("history checkpoint needed"));
   return sections.join(separator);
 }
@@ -576,6 +594,14 @@ export function formatStatusDetails(status) {
     );
   }
   if (status.modelPattern) sections.push(`Model profile: ${status.modelPattern}`);
+  if (Number.isFinite(status.toolResultTokens) && Number.isFinite(status.toolResultBudgetTokens)) {
+    const gate = status.toolResultOverBudget
+      ? `new results externalized at ${Number(status.toolResultBudgetFloorTokens).toLocaleString()} tokens`
+      : `new results externalized at ${Number(status.toolResultMaxTokens ?? status.toolResultBudgetFloorTokens).toLocaleString()} tokens`;
+    sections.push(
+      `Tool-result budget: ${status.toolResultTokens.toLocaleString()}/${status.toolResultBudgetTokens.toLocaleString()} tokens admitted; ${gate}`,
+    );
+  }
   if (showEmergencyRetentionNotice(status)) {
     sections.push(`Last rotation: emergency ${status.lastRotationReason}; retained ${status.effectiveRetainTurns}/${status.retainTurns} user-role messages`);
   }
@@ -650,6 +676,15 @@ export function formatWindowUsage(status, messages, options = {}) {
     }
   } else {
     lines.push("Provider-reported usage: unavailable");
+  }
+
+  if (Number.isFinite(status.toolResultTokens) && Number.isFinite(status.toolResultBudgetTokens)) {
+    const gateTokens = status.toolResultOverBudget
+      ? status.toolResultBudgetFloorTokens
+      : status.toolResultMaxTokens ?? status.toolResultBudgetFloorTokens;
+    lines.push(
+      `Tool-result budget: ${status.toolResultTokens.toLocaleString()}/${status.toolResultBudgetTokens.toLocaleString()} tokens admitted${status.toolResultOverBudget ? " (reached)" : ""}; new results externalized above ${Number(gateTokens).toLocaleString()} tokens`,
+    );
   }
 
   if (!Array.isArray(messages) || messages.length === 0) {

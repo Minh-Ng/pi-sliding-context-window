@@ -43,7 +43,7 @@ Default policy:
 - Rotate once at a user-message boundary, normally retaining the configured number of latest interaction groups (each user-role message plus its following assistant/tool traffic). If that suffix does not fit the rotation target, retain progressively fewer complete groups, down to one. The footer reports `emergency retention N/M` when this safety policy goes below the configured target; the notice clears after four new user-role messages while the underlying rotation history remains persisted.
 - Archive removed interaction groups in `~/.pi/context-window/archive.rocks` through the shared daemon.
 - Record each archived turn/preamble's ordered stable source message keys, explicit first/last keys, source count, session, project, archive kind, and creation time. Keys hash the complete deterministic message serialization. Exact recall shows this provenance in Pi and MCP; Pi also returns it as structured tool-result details for host/UI consumers.
-- Externalize individual tool results above **4K estimated tokens before the provider sees them**, recording the one original source message key while keeping the resulting document distinct from an archived turn.
+- Externalize individual tool results above **4K estimated tokens before the provider sees them**, recording the one original source message key while keeping the resulting document distinct from an archived turn. A cumulative companion guards against aggregate creep: once tool results admitted into the active epoch reach **30% of the rotation target** (`toolResultBudgetRatio`), new tool results externalize above the lower **1K-token floor** (`toolResultBudgetFloorTokens`) instead of the 4K gate. The tightening is forward-only — each result's decision depends only on results before it, so the exposed prefix and its provider prompt cache are never rewritten — and the running counter is recomputed deterministically from the boundary-filtered epoch on every pass (including resume) and resets on rotation. Oversized tool-call arguments keep their own separate `maxToolArgumentTokens` gate and do not count toward this budget.
 - Session-scoped search in a fork includes that session's verified parent archive lineage immediately, even if no ancestor has rotated. Ancestor identities come only from structurally valid Pi JSONL session headers; persisted rotation entries retain lineage only as informational state and cannot grant search access. Stable path identity is reserved for the current session when Pi does not provide its ID.
 - Keep exact source session entries unchanged. Archived text is deterministic source-derived message serialization, not stored raw message objects. Pi's `bashExecution`, `compactionSummary`, and `branchSummary` roles are serialized from their native payload fields so token estimates, stable keys, and archived preambles include their actual command/output or summary text.
 - Before accounting or provider dispatch, archive user input above the default 16K-token inline limit exactly. Only the provider-facing text receives a bounded head/tail preview; non-text blocks remain present, automatic retrieval skips that still-visible source, and the Pi transcript stays unchanged. Admission failure aborts the turn without exposing the raw oversized text.
@@ -182,6 +182,8 @@ Use the `context-window` namespace in Pi's shared settings files:
     },
     "retainTurns": 5,
     "maxToolResultTokens": 4000,
+    "toolResultBudgetRatio": 0.3,
+    "toolResultBudgetFloorTokens": 1000,
     "maxInlineUserTokens": 16000,
     "searchResults": 3,
     "searchResultTokens": 1500,
@@ -326,7 +328,7 @@ After `offline-ready`, explicitly select RocksDB and restart the adapter. At sta
 
 ## Cache rationale
 
-A strict sliding window removes the oldest prefix every turn, repeatedly invalidating provider prompt caches. Epoch rotation leaves the prompt append-only for tens of turns and pays one cache reset at rotation. Large tool output is externalized on first exposure so it never becomes part of the provider-cached transcript.
+A strict sliding window removes the oldest prefix every turn, repeatedly invalidating provider prompt caches. Epoch rotation leaves the prompt append-only for tens of turns and pays one cache reset at rotation. Large tool output is externalized on first exposure so it never becomes part of the provider-cached transcript. The cumulative tool-result budget tightens the externalization gate forward-only — only for tool results appended after the budget is reached — so it lowers aggregate tool-result pressure without rewriting the already-exposed prefix that the provider cache depends on.
 
 Resuming a Pi session preserves its session ID and deterministically rebuilds the filtered message prefix, but the first resumed request still rotates when either configured threshold is already met. The footer can therefore show fewer than `rotationTurns` while an explicit legacy `rotationTokens` cap triggers a cache-breaking rotation. Remove an obsolete absolute cap to use the model-relative ratio. A miss can also remain unavoidable after the provider's cache TTL expires (Pi treats five minutes as the diagnostic idle threshold) or when the model, system prompt, tool schemas, or epoch boundary changes.
 

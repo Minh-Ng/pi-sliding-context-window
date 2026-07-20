@@ -10,6 +10,7 @@ import {
 import { estimateModelVisibleTokens } from "./model-token-budget.js";
 import {
   buildTocMarkerText,
+  contentToText,
   estimateTokens,
   extractDecisionCandidates,
   extractSalientTerms,
@@ -59,6 +60,42 @@ function toolResultId(sessionId, message, text) {
 function toolArgumentId(sessionId, part, text) {
   const toolCallId = String(part?.id ?? part?.toolCallId ?? part?.tool_call_id ?? "");
   return `tool-arg-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
+}
+
+// Sum the tool-result characters that actually land in the active window
+// (whole results plus the bounded previews of externalized ones). This is a
+// pure function of the post-externalization active slice, so it reproduces
+// deterministically on resume and resets to the retained slice on rotation.
+function measureToolResultTokens(messages) {
+  let chars = 0;
+  for (const message of messages) {
+    if (message?.role === "toolResult" || message?.role === "tool") {
+      chars += contentToText(message.content).length;
+    }
+  }
+  return Math.ceil(chars / 4);
+}
+
+// Adaptive tool-result budget knobs, resolved against defaults so partial
+// embedder configs (and older persisted configs) behave like the shipped
+// policy. The floor never raises the base per-result gate.
+function resolveToolResultBudget(config, rotationTokens) {
+  const configuredMax = Number(config.maxToolResultTokens);
+  const maxToolResultTokens = Number.isSafeInteger(configuredMax) && configuredMax > 0
+    ? configuredMax
+    : 4_000;
+  const ratio = Number(config.toolResultBudgetRatio);
+  const effectiveRatio = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : 0.3;
+  const configuredFloor = Number(config.toolResultBudgetFloorTokens);
+  const effectiveFloor = Number.isSafeInteger(configuredFloor) && configuredFloor > 0
+    ? configuredFloor
+    : 1_000;
+  const target = Number.isFinite(rotationTokens) && rotationTokens > 0 ? rotationTokens : 1;
+  return {
+    maxToolResultTokens,
+    budgetTokens: Math.max(1, Math.floor(target * effectiveRatio)),
+    floorTokens: Math.min(maxToolResultTokens, effectiveFloor),
+  };
 }
 
 function structuralText(message) {
@@ -464,6 +501,7 @@ export class EpochWindowSession {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
     this.activeMessages = undefined;
+    this.toolResultBudget = undefined;
     this.rotations = 0;
     this.forceRotation = false;
     this.lastRotationReason = undefined;
@@ -593,9 +631,15 @@ export class EpochWindowSession {
     active = oversized.messages;
     const suppressedHintMessageKeys = oversized.providerMessageKeys;
     this.activeArchiveIds = new Set(oversized.archiveIds);
+    const budgetPolicy = resolveToolResultBudget(
+      this.config,
+      this.contextLimits.rotationTokens,
+    );
     const externalized = externalizeLargeToolResults(active, {
-      maxTokens: this.config.maxToolResultTokens,
+      maxTokens: budgetPolicy.maxToolResultTokens,
       store: (message, text) => this.storeToolResult(message, text),
+      budgetTokens: budgetPolicy.budgetTokens,
+      floorTokens: budgetPolicy.floorTokens,
     });
     active = externalized.messages;
     for (const id of externalized.archiveIds) this.activeArchiveIds.add(id);
@@ -669,6 +713,17 @@ export class EpochWindowSession {
     this.activeTurns = this.countUserTurns(active);
     this.activeMessages = marker ? [marker, ...active] : active;
     this.activeTokens = estimateTokens(this.activeMessages);
+    // Measure over the final retained slice: this recomputes the same counter
+    // deterministically on resume and resets to the retained epoch after a
+    // rotation slices the active window.
+    const toolResultTokens = measureToolResultTokens(active);
+    this.toolResultBudget = Object.freeze({
+      tokens: toolResultTokens,
+      budgetTokens: budgetPolicy.budgetTokens,
+      floorTokens: budgetPolicy.floorTokens,
+      maxTokens: budgetPolicy.maxToolResultTokens,
+      overBudget: toolResultTokens >= budgetPolicy.budgetTokens,
+    });
     return this.activeMessages;
   }
 
@@ -698,6 +753,8 @@ export class EpochWindowSession {
       "piCompactionReserveTokens",
       "rotationTurns",
       "retainTurns",
+      "toolResultBudgetRatio",
+      "toolResultBudgetFloorTokens",
       "models",
       "environmentOverrides",
     ]) {
@@ -960,6 +1017,7 @@ export class EpochWindowSession {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
     this.activeMessages = undefined;
+    this.toolResultBudget = undefined;
   }
 
   search(query, options = {}) {
@@ -1327,6 +1385,13 @@ export class EpochWindowSession {
     return {
       activeTokens: this.activeTokens,
       activeTurns: this.activeTurns,
+      ...(this.toolResultBudget === undefined ? {} : {
+        toolResultTokens: this.toolResultBudget.tokens,
+        toolResultBudgetTokens: this.toolResultBudget.budgetTokens,
+        toolResultBudgetFloorTokens: this.toolResultBudget.floorTokens,
+        toolResultMaxTokens: this.toolResultBudget.maxTokens,
+        toolResultOverBudget: this.toolResultBudget.overBudget,
+      }),
       rotationTokens: this.contextLimits.rotationTokens,
       rotationTurns: this.contextLimits.rotationTurns,
       ...(this.contextLimits.inputWindowTokens === undefined ? {} : {

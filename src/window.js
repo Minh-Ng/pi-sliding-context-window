@@ -357,31 +357,81 @@ function replaceTextContent(content, replacement) {
   return [{ type: "text", text: replacement }, ...nonText];
 }
 
+/**
+ * Externalize tool results that exceed the per-result token gate, with an
+ * optional cumulative epoch budget layered on top.
+ *
+ * The per-result gate (`maxTokens`) alone lets a long run of individually
+ * moderate results (1-3K each) dominate the window in aggregate. When
+ * `budgetTokens` and `floorTokens` are supplied, this walks results in order
+ * and tracks the tool-result characters admitted so far (both whole results
+ * kept inline and the bounded previews of externalized ones — every character
+ * that lands in the window counts). Once that running total reaches the budget,
+ * NEW results are gated at the lower `floorTokens` threshold instead of
+ * `maxTokens`.
+ *
+ * Forward-only by construction: each result's decision depends only on the
+ * characters admitted by results BEFORE it — a strictly append-only prefix
+ * within an epoch — so an already-exposed result is never re-externalized on a
+ * later pass, preserving the provider prompt cache. The running total is not
+ * persisted: it is recomputed from the same filtered prefix on every pass
+ * (including after session resume) and resets naturally when epoch rotation
+ * advances the boundary to a new, shorter active slice.
+ */
 export function externalizeLargeToolResults(messages, {
   maxTokens,
   store,
   previewTokens = Math.min(800, Math.floor(maxTokens / 2)),
+  budgetTokens,
+  floorTokens,
 } = {}) {
   const maxChars = Math.max(1, maxTokens) * 4;
   const previewChars = Math.max(1, previewTokens) * 4;
+  const hasBudget = Number.isFinite(budgetTokens) && budgetTokens > 0
+    && Number.isFinite(floorTokens) && floorTokens > 0;
+  const budgetChars = hasBudget ? Math.max(1, Math.floor(budgetTokens)) * 4 : Infinity;
+  // The floor only ever lowers the gate; a misconfigured floor above the base
+  // threshold is clamped so the adaptive path can never admit more than the
+  // static per-result gate would.
+  const floorChars = hasBudget ? Math.min(maxChars, Math.max(1, Math.floor(floorTokens)) * 4) : maxChars;
+  let admittedChars = 0;
   let changed = false;
   const archiveIds = [];
   const output = messages.map((message) => {
     const isToolResult = message?.role === "toolResult" || message?.role === "tool";
     if (!isToolResult) return message;
     const text = contentToText(message.content);
-    if (text.length <= maxChars) return message;
+    const effectiveMaxChars = admittedChars >= budgetChars ? floorChars : maxChars;
+    if (text.length <= effectiveMaxChars) {
+      admittedChars += text.length;
+      return message;
+    }
 
     const id = store(message, text);
-    if (!id) return message;
+    if (!id) {
+      // Archival failed, so the whole result stays inline and still consumes
+      // window space; count it so the budget reflects real admitted tokens.
+      admittedChars += text.length;
+      return message;
+    }
     archiveIds.push(id);
-    const head = text.slice(0, Math.floor(previewChars * 0.7));
-    const tail = text.slice(-Math.floor(previewChars * 0.3));
+    // A preview must not exceed the gate that admitted it, so the head/tail is
+    // bounded by the effective threshold as well as the configured preview.
+    const effectivePreviewChars = Math.min(previewChars, effectiveMaxChars);
+    const head = text.slice(0, Math.floor(effectivePreviewChars * 0.7));
+    const tail = text.slice(-Math.floor(effectivePreviewChars * 0.3));
     const replacement = `${head}\n\n[… ${text.length - head.length - tail.length} characters archived as ${id}; use context_recall …]\n\n${tail}`;
+    admittedChars += replacement.length;
     changed = true;
     return { ...message, content: replaceTextContent(message.content, replacement) };
   });
-  return { messages: changed ? output : messages, changed, archiveIds };
+  return {
+    messages: changed ? output : messages,
+    changed,
+    archiveIds,
+    admittedTokens: Math.ceil(admittedChars / 4),
+    ...(hasBudget ? { overBudget: admittedChars >= budgetChars, budgetTokens: Math.floor(budgetTokens) } : {}),
+  };
 }
 
 function toolCallArgumentField(part) {

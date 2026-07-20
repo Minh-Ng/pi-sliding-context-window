@@ -23,6 +23,13 @@ export const DEFAULT_CONFIG = Object.freeze({
   retainTurns: 5,
   maxToolResultTokens: 4_000,
   maxToolArgumentTokens: 4_000,
+  // Cumulative tool-result admission budget. Once admitted tool-result tokens
+  // in the active epoch reach this fraction of the rotation target, NEW tool
+  // results are gated at toolResultBudgetFloorTokens instead of
+  // maxToolResultTokens. Set the ratio to 1 to effectively disable adaptive
+  // tightening (rotation triggers before results alone can reach the target).
+  toolResultBudgetRatio: 0.3,
+  toolResultBudgetFloorTokens: 1_000,
   maxInlineUserTokens: 16_000,
   searchResults: 3,
   searchResultTokens: 1_500,
@@ -414,6 +421,8 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     retainTurns: numeric("retainTurns", parsePositiveInteger, env.CONTEXT_WINDOW_RETAIN_TURNS),
     maxToolResultTokens: numeric("maxToolResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_TOOL_RESULT_TOKENS),
     maxToolArgumentTokens: numeric("maxToolArgumentTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_TOOL_ARGUMENT_TOKENS),
+    toolResultBudgetRatio: numeric("toolResultBudgetRatio", parsePositiveRatio, env.CONTEXT_WINDOW_TOOL_RESULT_BUDGET_RATIO),
+    toolResultBudgetFloorTokens: numeric("toolResultBudgetFloorTokens", parsePositiveInteger, env.CONTEXT_WINDOW_TOOL_RESULT_BUDGET_FLOOR_TOKENS),
     maxInlineUserTokens: numeric("maxInlineUserTokens", parsePositiveInteger, env.CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS),
     searchResults: numeric("searchResults", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULTS),
     searchResultTokens: numeric("searchResultTokens", parsePositiveInteger, env.CONTEXT_WINDOW_SEARCH_RESULT_TOKENS),

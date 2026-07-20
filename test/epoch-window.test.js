@@ -336,6 +336,11 @@ test("session controller rotates, archives source turns, and emits durable state
   assert.deepEqual(session.status(), {
     activeTokens: estimateTokens(active),
     activeTurns: 1,
+    toolResultTokens: 0,
+    toolResultBudgetTokens: 30_000,
+    toolResultBudgetFloorTokens: 1_000,
+    toolResultMaxTokens: 4_000,
+    toolResultOverBudget: false,
     rotationTokens: 100_000,
     rotationTurns: 3,
     modelPattern: undefined,
@@ -727,6 +732,144 @@ test("tool-result previews retain every archive ID created in the same context b
   assert.equal(ids.length, 2);
   assert.match(result[1].content[0].text, new RegExp(ids[0]));
   assert.match(result[2].content[0].text, new RegExp(ids[1]));
+});
+
+function toolResult(text, timestamp, id) {
+  return { role: "toolResult", content: [{ type: "text", text }], timestamp, toolCallId: id, toolName: "read" };
+}
+
+test("over-budget epoch externalizes new tool results below the base gate", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: {
+      ...config,
+      rotationTurns: 50,
+      maxToolResultTokens: 4_000, // base gate 16000 chars
+      toolResultBudgetRatio: 0.02, // budget = 2000 tokens = 8000 chars
+      toolResultBudgetFloorTokens: 500, // floor gate 2000 chars
+    },
+    sessionId: "budget-session",
+    project: "/project",
+  });
+  const messages = [
+    user("run tools", 1),
+    toolResult("a".repeat(12_000), 2, "r1"), // under base gate; pushes epoch over budget
+    toolResult("b".repeat(3_000), 3, "r2"), // clears base gate but trips the lowered floor gate
+  ];
+
+  const result = session.process(messages, { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 0);
+  // r1 is admitted whole and drives the epoch over the 8000-char budget.
+  assert.equal(result[1].content[0].text.length, 12_000);
+  // r2 would clear the 16000-char base gate but is externalized because the
+  // epoch is already over budget and its 3000 chars exceed the 2000-char floor.
+  assert.match(result[2].content[0].text, /tool-[a-f0-9]{16}/);
+  assert.equal(archive.documents.size, 1);
+  const status = session.status();
+  assert.equal(status.toolResultOverBudget, true);
+  assert.equal(status.toolResultBudgetTokens, 2_000);
+  assert.equal(status.toolResultBudgetFloorTokens, 500);
+  assert.ok(status.toolResultTokens >= 3_000);
+});
+
+test("resume reproduces the tool-result budget counter from the filtered prefix", () => {
+  const budgetConfig = {
+    ...config,
+    rotationTurns: 2,
+    retainTurns: 1,
+    maxToolResultTokens: 4_000, // base gate 16000 chars
+    toolResultBudgetRatio: 0.001, // budget = 100 tokens = 400 chars
+    toolResultBudgetFloorTokens: 500, // floor gate 2000 chars
+  };
+  const messages = [
+    user("one", 1), toolResult("a".repeat(2_000), 2, "tr1"), assistant("answer one", 3),
+    user("two", 4), toolResult("b".repeat(2_000), 5, "tr2"), toolResult("c".repeat(2_500), 6, "tr3"), assistant("answer two", 7),
+  ];
+
+  const archive = memoryArchive();
+  const rotations = [];
+  const session = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "resume-budget",
+    project: "/project",
+    onRotation: (state) => rotations.push(state),
+  });
+  const first = session.process(messages, { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+  assert.equal(rotations.at(-1).boundaryKey, messageKey(messages[3]));
+  // Retained epoch keeps tr2 (2000 chars, at the floor gate) and externalizes
+  // tr3 (2500 chars, over the floor gate) because the epoch is over budget.
+  const firstStatus = session.status();
+  assert.equal(firstStatus.toolResultOverBudget, true);
+  assert.ok(firstStatus.toolResultTokens > 0);
+
+  const restored = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: budgetConfig,
+    sessionId: "resume-budget",
+    project: "/project",
+  });
+  restored.restore([{ type: "custom", customType: ROTATION_STATE_ENTRY, data: rotations.at(-1) }]);
+  const resumed = restored.process(messages, { contextWindow: 200_000 });
+
+  // The filtered-prefix rebuild recomputes an identical window and counter.
+  assert.deepEqual(resumed, first);
+  const resumedStatus = restored.status();
+  assert.equal(resumedStatus.toolResultTokens, firstStatus.toolResultTokens);
+  assert.equal(resumedStatus.toolResultOverBudget, firstStatus.toolResultOverBudget);
+  assert.equal(resumedStatus.toolResultBudgetTokens, firstStatus.toolResultBudgetTokens);
+});
+
+test("rotation resets the tool-result budget counter to the retained epoch", () => {
+  const budgetConfig = {
+    ...config,
+    rotationTurns: 2,
+    retainTurns: 1,
+    maxToolResultTokens: 4_000,
+    toolResultBudgetRatio: 0.001, // budget = 100 tokens = 400 chars
+    toolResultBudgetFloorTokens: 500,
+  };
+  const heavyTurn = [
+    user("heavy", 1),
+    toolResult("a".repeat(8_000), 2, "h1"),
+    assistant("done heavy", 3),
+  ];
+
+  // A single heavy turn alone is over budget.
+  const heavyOnly = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: budgetConfig,
+    sessionId: "reset-budget",
+    project: "/project",
+  });
+  heavyOnly.process(heavyTurn, { contextWindow: 200_000 });
+  const heavyTokens = heavyOnly.status().toolResultTokens;
+  assert.equal(heavyOnly.status().rotations, 0);
+  assert.equal(heavyOnly.status().toolResultOverBudget, true);
+  assert.equal(heavyTokens, Math.ceil(8_000 / 4));
+
+  // Adding a light second turn rotates the heavy turn out; the counter is
+  // recomputed over the retained light epoch only.
+  const session = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: budgetConfig,
+    sessionId: "reset-budget",
+    project: "/project",
+  });
+  const messages = [
+    ...heavyTurn,
+    user("light", 4),
+    toolResult("b".repeat(200), 5, "l1"),
+    assistant("done light", 6),
+  ];
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+  const retainedTokens = session.status().toolResultTokens;
+  assert.ok(retainedTokens < heavyTokens);
+  assert.equal(retainedTokens, Math.ceil(200 / 4));
+  assert.equal(session.status().toolResultOverBudget, false);
 });
 
 test("multi-turn rotation protects every new TOC target before cleanup", () => {

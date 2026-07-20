@@ -9,6 +9,7 @@ The shipped defaults are:
 | Rotate active context | 65% of the model window or 20 user messages |
 | Normally retain after rotation | 5 complete interaction groups |
 | Externalize one large tool result | Above 4,000 estimated tokens |
+| Tighten the tool-result gate | After admitted tool results reach 30% of the rotation target, new results externalize above 1,000 tokens |
 | Manual search results | 3 |
 | Automatic recall | Enabled |
 | Automatic hint budget | 160 tokens per message; 640 across the active context |
@@ -18,6 +19,8 @@ The shipped defaults are:
 Pi's native session transcript and the context-window archive are separate state. The transcript supports Pi resume and branch navigation. Canonical archived documents are added after an epoch rotation, large-tool externalization, explicit archive write, oversized-user admission, or Pi compaction checkpoint. RocksDB is not a second copy of every live message. Automatic retrieval may separately persist one bounded marker or excerpt in a hint record.
 
 The model normally sees the active epoch. Archived history stays outside the prompt until retrieval selects bounded material. Ordinary recent turns that have neither rotated nor been checkpointed are not yet searchable in RocksDB; an oversized user source or a span covered by Pi compaction is already archived even if no epoch boundary moved. Deleting Pi session files would not clear RocksDB memory, and clearing RocksDB would not delete Pi's native transcript.
+
+The per-result externalization gate has a cumulative companion. Dozens of individually moderate tool results (1-3K tokens each) can pass the per-result gate yet dominate the epoch in aggregate. The session tracks the tool-result tokens admitted into the active epoch — whole results kept inline plus the bounded previews of externalized ones — and once that total reaches `toolResultBudgetRatio` (default 0.3) of the rotation target, new tool results are externalized above the lower `toolResultBudgetFloorTokens` (default 1,000) instead of `maxToolResultTokens`. The gate is forward-only: each result's decision depends only on the tokens admitted by results before it, so an already-exposed result is never rewritten and the provider prompt cache survives. The counter is not persisted separately; it is recomputed deterministically from the same boundary-filtered active slice on every pass — including after session resume — and resets when rotation advances the boundary to a new, shorter epoch. Oversized tool-call *arguments* are governed by their own independent `maxToolArgumentTokens` gate and are deliberately excluded from this tool-result budget: the budget targets the tool-result output that dominates real epochs, and keeping the two accounts separate avoids one symmetric feature perturbing the other's threshold.
 
 RocksDB is one local physical store with four logical layers:
 

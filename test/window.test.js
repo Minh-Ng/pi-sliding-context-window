@@ -277,6 +277,66 @@ test("failed tool-result archival leaves the original provider content intact", 
   assert.equal(result.messages[1].content[0].text, "x".repeat(10_000));
 });
 
+test("reports admitted tool-result tokens and omits budget fields when unbudgeted", () => {
+  const result = externalizeLargeToolResults([tool("a".repeat(400), 1, "a")], {
+    maxTokens: 1_000,
+    store: () => "unused",
+  });
+  assert.equal(result.changed, false);
+  assert.equal(result.admittedTokens, Math.ceil(400 / 4));
+  assert.equal("overBudget" in result, false);
+  assert.equal("budgetTokens" in result, false);
+});
+
+test("cumulative tool-result budget lowers the per-result gate exactly at the boundary", () => {
+  // Base gate 1000 tokens (4000 chars); floor gate 100 tokens (400 chars);
+  // budget 500 tokens (2000 chars). The mid result (1000 chars) clears the
+  // base gate but trips the floor gate.
+  const gate = { maxTokens: 1_000, floorTokens: 100, budgetTokens: 500, previewTokens: 40 };
+  const mid = tool("m".repeat(1_000), 2, "mid");
+
+  // Prefix admits 1999 chars — one below the 2000-char budget — so the mid
+  // result is still gated at the base threshold and kept whole.
+  const below = externalizeLargeToolResults(
+    [tool("p".repeat(1_999), 1, "pre"), mid],
+    { ...gate, store: () => "arc-below" },
+  );
+  assert.equal(below.changed, false);
+  assert.equal(below.messages[1], mid);
+
+  // Prefix admits exactly 2000 chars — the budget is now reached, so the same
+  // mid result trips the lowered floor gate and is externalized.
+  const atBoundary = externalizeLargeToolResults(
+    [tool("p".repeat(2_000), 1, "pre"), mid],
+    { ...gate, store: () => "arc-mid" },
+  );
+  assert.equal(atBoundary.changed, true);
+  assert.equal(atBoundary.overBudget, true);
+  assert.match(atBoundary.messages[1].content[0].text, /arc-mid/);
+  // The prefix result (2000 chars, under the base gate) is never rewritten.
+  assert.equal(atBoundary.messages[0].content[0].text, "p".repeat(2_000));
+});
+
+test("cumulative tool-result budget is forward-only within an epoch", () => {
+  const gate = { maxTokens: 1_000, floorTokens: 100, budgetTokens: 500, previewTokens: 40 };
+  const early = tool("e".repeat(1_000), 1, "early"); // admitted while under budget
+  const filler = tool("f".repeat(1_600), 2, "filler"); // pushes the total over budget
+  const late = tool("l".repeat(1_000), 3, "late"); // same size as early, arrives over budget
+  const result = externalizeLargeToolResults([early, filler, late], {
+    ...gate,
+    store: (message) => `arc-${message.toolCallId}`,
+  });
+
+  // early and filler were admitted before the budget was crossed, so both stay
+  // inline even though the epoch ends over budget — the exposed prefix is not
+  // rewritten. late, the same size as early, is externalized because it arrives
+  // after the crossing.
+  assert.equal(result.messages[0], early);
+  assert.equal(result.messages[1], filler);
+  assert.match(result.messages[2].content[0].text, /arc-late/);
+  assert.equal(result.overBudget, true);
+});
+
 test("externalizes large tool-call arguments deterministically without disturbing other content", () => {
   const stored = [];
   const original = [

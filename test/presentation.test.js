@@ -17,6 +17,7 @@ import {
   formatTraversalResults,
   formatWindowUsage,
   statusUrgency,
+  toolResultBudgetState,
 } from "../src/presentation.js";
 import { renderRecalledEvidence } from "../src/retrieval/render.js";
 
@@ -632,6 +633,50 @@ test("footer expires emergency retention after four new turns", () => {
       retainTurns: 10,
     })),
     /Compaction safety: archive checkpoint required; the latest retained turn is too large to rotate safely\./u,
+  );
+});
+
+test("footer and details surface the adaptive tool-result budget state", () => {
+  const withinBudget = status({
+    toolResultTokens: 5_000,
+    toolResultBudgetTokens: 30_000,
+    toolResultBudgetFloorTokens: 1_000,
+    toolResultMaxTokens: 4_000,
+    toolResultOverBudget: false,
+  });
+  assert.equal(toolResultBudgetState(withinBudget), undefined);
+  assert.doesNotMatch(formatStatusLine(withinBudget), /tool-result budget/u);
+  assert.match(
+    formatStatusDetails({ ...withinBudget, rotations: 0, archivedDocuments: 0, dbPath: "/archive", retainTurns: 5 }),
+    /Tool-result budget: 5,000\/30,000 tokens admitted; new results externalized at 4,000 tokens/u,
+  );
+
+  const nearBudget = status({
+    toolResultTokens: 25_000,
+    toolResultBudgetTokens: 30_000,
+    toolResultBudgetFloorTokens: 1_000,
+    toolResultMaxTokens: 4_000,
+    toolResultOverBudget: false,
+  });
+  assert.equal(toolResultBudgetState(nearBudget), "near");
+  assert.match(formatStatusLine(nearBudget), /tool-result budget near/u);
+
+  const overBudget = status({
+    toolResultTokens: 31_000,
+    toolResultBudgetTokens: 30_000,
+    toolResultBudgetFloorTokens: 1_000,
+    toolResultMaxTokens: 4_000,
+    toolResultOverBudget: true,
+  });
+  assert.equal(toolResultBudgetState(overBudget), "over");
+  assert.match(formatStatusLine(overBudget), /tool-result budget reached/u);
+  assert.match(
+    formatStatusDetails({ ...overBudget, rotations: 0, archivedDocuments: 0, dbPath: "/archive", retainTurns: 5 }),
+    /Tool-result budget: 31,000\/30,000 tokens admitted; new results externalized at 1,000 tokens/u,
+  );
+  assert.match(
+    formatWindowUsage(overBudget, [{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "x" }] }]),
+    /Tool-result budget: 31,000\/30,000 tokens admitted \(reached\); new results externalized above 1,000 tokens/u,
   );
 });
 

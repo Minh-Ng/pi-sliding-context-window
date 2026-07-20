@@ -125,6 +125,8 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(defaults.epochHintBudgetTokens, 640);
     assert.equal(defaults.hintSourceCooldownHours, 24);
     assert.equal(defaults.maxInlineUserTokens, 16_000);
+    assert.equal(defaults.toolResultBudgetRatio, 0.3);
+    assert.equal(defaults.toolResultBudgetFloorTokens, 1_000);
     assert.equal(defaults.ephemeralAutoRetrievalDays, 7);
     assert.equal(defaults.conversationAutoRetrievalDays, 30);
     assert.equal(defaults.derivedAutoRetrievalDays, 30);
@@ -199,6 +201,48 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.ephemeralRetentionDays, 2);
     assert.equal(overridden.conversationRetentionDays, 30);
     assert.equal(overridden.derivedRetentionDays, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("tool-result budget knobs resolve from env, settings, and defaults", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-tool-budget-"));
+  try {
+    const fromEnv = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: {
+        CONTEXT_WINDOW_TOOL_RESULT_BUDGET_RATIO: "0.5",
+        CONTEXT_WINDOW_TOOL_RESULT_BUDGET_FLOOR_TOKENS: "750",
+      },
+      home: directory,
+    });
+    assert.equal(fromEnv.toolResultBudgetRatio, 0.5);
+    assert.equal(fromEnv.toolResultBudgetFloorTokens, 750);
+
+    mkdirSync(join(directory, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(directory, ".pi", "agent", "context-window.json"),
+      JSON.stringify({ toolResultBudgetRatio: 0.15, toolResultBudgetFloorTokens: 2_000 }),
+    );
+    const fromSettings = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(fromSettings.toolResultBudgetRatio, 0.15);
+    assert.equal(fromSettings.toolResultBudgetFloorTokens, 2_000);
+
+    // Invalid values fall back to the shipped defaults (ratio must be in (0, 1];
+    // floor must be a positive integer).
+    const invalid = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      env: {
+        CONTEXT_WINDOW_TOOL_RESULT_BUDGET_RATIO: "2",
+        CONTEXT_WINDOW_TOOL_RESULT_BUDGET_FLOOR_TOKENS: "-5",
+      },
+      home: directory,
+    });
+    assert.equal(invalid.toolResultBudgetRatio, 0.15);
+    assert.equal(invalid.toolResultBudgetFloorTokens, 2_000);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

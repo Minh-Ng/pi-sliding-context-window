@@ -1,12 +1,12 @@
 import { Worker } from "node:worker_threads";
 
 export class LocalEmbedder {
-  constructor({ model, revision, cachePath, timeoutMs = 60_000 }) {
+  constructor({ model, revision, cachePath, pooling = "mean", timeoutMs = 60_000 }) {
     this.timeoutMs = timeoutMs;
     this.sequence = 0;
     this.pending = new Map();
     this.worker = new Worker(new URL("./embedder-worker.js", import.meta.url), {
-      workerData: { model, revision, cachePath },
+      workerData: { model, revision, cachePath, pooling },
       execArgv: [],
     });
     this.worker.on("message", (message) => this.#settle(message));

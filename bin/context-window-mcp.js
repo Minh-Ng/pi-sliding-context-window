@@ -75,6 +75,10 @@ if (config.archiveBackend === "sqlite") {
       cachePath: config.semanticModelCachePath,
       indexPath: config.semanticIndexPath,
       candidates: config.semanticCandidates,
+      // Undefined unless explicitly overridden: the spawned daemon derives
+      // dimensions/pooling from `model` via the catalog (model-catalog.js).
+      dimensions: config.semanticModelDimensions,
+      pooling: config.semanticModelPooling,
     },
   });
 }

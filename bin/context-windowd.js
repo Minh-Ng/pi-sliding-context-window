@@ -5,6 +5,7 @@ import { DAEMON_RUNTIME_VERSION } from "../src/daemon/runtime-version.js";
 import { startStoreDaemon } from "../src/daemon/server.js";
 import { defaultDaemonLogPath } from "../src/daemon/log-file.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
+import { SEMANTIC_TIER_ALIASES, semanticModelProfile } from "../src/semantic/model-catalog.js";
 import {
   DaemonWatchdog,
   DEFAULT_SLOW_REQUEST_MS,
@@ -37,6 +38,8 @@ const VALUE_OPTIONS = new Set([
   "--semantic-cache",
   "--semantic-index",
   "--semantic-candidates",
+  "--semantic-dimensions",
+  "--semantic-pooling",
 ]);
 const FLAG_OPTIONS = new Set(["--allow-shutdown", "--semantic", "--help"]);
 
@@ -63,6 +66,8 @@ function usage() {
     "  --semantic-cache PATH              Library-managed local model cache",
     "  --semantic-index PATH              Library-managed local ANN indexes",
     "  --semantic-candidates N            ANN candidates before filtering",
+    "  --semantic-dimensions N            Override the model's catalog dimensions",
+    "  --semantic-pooling MODE            Override the model's catalog pooling strategy",
     "  --help                             Show this help",
   ].join("\n");
 }
@@ -151,12 +156,26 @@ const maintenance = {
     process.env.CONTEXT_WINDOW_ADMISSION_RESERVE_BYTES,
   ),
 };
+const semanticDimensions = argument(
+  "--semantic-dimensions",
+  process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS,
+);
+const semanticPooling = argument("--semantic-pooling", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING);
+// A direct daemon launch (unlike the config-driven paths, which resolve
+// aliases in loadConfig) is the only place a tier alias like "quality" can
+// still reach --semantic-model as a raw CLI/env value, so resolve it here
+// too — otherwise it's treated as a literal HF model id and misses the
+// catalog entirely.
+const rawSemanticModel = argument("--semantic-model", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL);
+const resolvedSemanticModel = rawSemanticModel === undefined
+  ? "Xenova/all-MiniLM-L6-v2"
+  : SEMANTIC_TIER_ALIASES[rawSemanticModel] ?? rawSemanticModel;
 const semantic = {
   enabled: parsed.flags.has("--semantic")
     || ["1", "true", "yes", "on"].includes(String(process.env.CONTEXT_WINDOW_SEMANTIC_RETRIEVAL).toLowerCase()),
-  model: argument("--semantic-model", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL
-    ?? "Xenova/all-MiniLM-L6-v2"),
+  model: resolvedSemanticModel,
   revision: argument("--semantic-revision", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION
+    ?? semanticModelProfile(resolvedSemanticModel)?.revision
     ?? "751bff37182d3f1213fa05d7196b954e230abad9"),
   cachePath: resolve(argument("--semantic-cache", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
     ?? ".context-window/models")),
@@ -164,6 +183,10 @@ const semantic = {
     ?? ".context-window/semantic-index")),
   candidates: Number(argument("--semantic-candidates", process.env.CONTEXT_WINDOW_SEMANTIC_CANDIDATES
     ?? 40)),
+  // Left unset unless explicitly overridden, so LocalSemanticIndex derives
+  // both from the model above via its catalog (see model-catalog.js).
+  ...(semanticDimensions === undefined ? {} : { dimensions: Number(semanticDimensions) }),
+  ...(semanticPooling === undefined ? {} : { pooling: semanticPooling }),
 };
 
 let daemon;

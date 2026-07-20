@@ -1005,6 +1005,8 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
         projects: nonNegativeInteger,
         model: identifier,
         revision: identifier,
+        dimensions: nonNegativeInteger,
+        pooling: identifier,
       }),
       retention: retentionStats,
       rocksdb: metadata,

@@ -82,6 +82,33 @@ test("daemon admission reports durable, retryable disk-low state", async (t) => 
   assert.equal(status.retention.emergencyMode, true);
 });
 
+test("daemon.status reports catalog-derived semantic dimensions and pooling over the wire", async (t) => {
+  // Regression coverage: the versioned daemon.status wire contract
+  // (src/store-contract.js) allowlists the fields inside `semantic`, so
+  // adding dimensions/pooling to LocalSemanticIndex.status() without also
+  // widening that contract makes every daemon.status response fail client-side
+  // validation as an unknown field, not just this one.
+  const { socketPath } = await runningRuntime(t, {
+    semantic: {
+      enabled: true,
+      model: "onnx-community/embeddinggemma-300m-ONNX",
+      revision: "main",
+    },
+  });
+  const client = new StoreClient({ socketPath, project: "/workspace/semantic-status" });
+  t.after(() => client.close());
+  const status = await client.request("daemon.status", {});
+  assert.deepEqual(status.semantic, {
+    enabled: true,
+    available: true,
+    projects: 0,
+    model: "onnx-community/embeddinggemma-300m-ONNX",
+    revision: "main",
+    dimensions: 768,
+    pooling: "mean",
+  });
+});
+
 test("daemon admission reports oversized native keys as invalid requests", async (t) => {
   const { socketPath, store } = await runningRuntime(t);
   const project = "/workspace/oversized-native-key";

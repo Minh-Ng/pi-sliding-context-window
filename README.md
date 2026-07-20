@@ -102,7 +102,7 @@ Use archive tools for prior intent, rationale, exact wording, decisions, rejecte
 
 For a conceptually phrased historical question without an exact identifier, the agent preserves the original question for semantic matching and supplies 3–8 concise likely synonyms or domain terms separately for BM25 expansion. Exact file names, symbols, errors, commits, PRs, and specific values are searched verbatim and are never broadened. A missed conceptual archive search permits at most one reformulation; a missed well-anchored search routes the agent to live or external evidence instead.
 
-Local semantic fallback is enabled by default and applies only to explicit search after exact lookup misses and BM25 evidence is weak. It does not change automatic prompt insertion. Install the pinned model once:
+Local semantic fallback is enabled by default and applies only to explicit search after exact lookup misses and BM25 evidence is weak. It does not change automatic prompt insertion. Install the configured model once:
 
 ```bash
 context-window-semantic install
@@ -111,6 +111,18 @@ node ./bin/context-window-semantic.js install
 ```
 
 The installer is the only path that permits a model download. Restart the shared daemon after installation. Runtime inference uses the library-managed cache with remote model access disabled; embeddings and per-project ANN indexes remain on the local machine. If the model or native index is unavailable, search falls back to exact/BM25 without failing the request.
+
+The shipped default is `Xenova/all-MiniLM-L6-v2` (384-dim, ~90MB quantized). `src/semantic/model-catalog.js` also carries two unshipped candidate tiers for a manual upgrade — a small tier (`embeddinggemma-300m`, 768-dim, ~300MB quantized) and a quality tier (`Qwen3-Embedding-0.6B`, 1024-dim, ~600MB quantized; Jina v5 text-small is a same-size alternative with a non-commercial license). Install a candidate by tier alias or full model id, and pass a revision to pin something other than the catalog's `main`:
+
+```bash
+context-window-semantic install small
+context-window-semantic install quality
+context-window-semantic install jinaai/jina-embeddings-v5-text-small
+```
+
+Installing only warms the cache; it does not switch the daemon to the new model. Set `semanticModel` (and `semanticModelRevision`, if pinning) in config to that model id — or to the same tier alias (`small`/`quality`/`default`) you installed, which config resolves to the catalog's model id and pinned revision the same way the installer does — and restart the shared daemon. The per-project ANN index is keyed by a fingerprint of model, revision, embedding dimensions, and pooling strategy, so switching models rebuilds it automatically from canonical records in the background rather than mixing incompatible vectors; existing indexes for the previous model stay on disk until manually removed. Embedding dimensions and pooling (mean vs. last-token) come from the catalog entry for the configured model, not a fixed literal — set `semanticModelDimensions`/`semanticModelPooling` only to override a custom or self-hosted model the catalog does not recognize.
+
+The small and quality tiers above are unvalidated in this environment: their dimensions and pooling are sourced from each model's published card, not measured by running the model here (no network access to download weights during that change). Confirm the installer's reported `dimensions` for a candidate before relying on it, and expect the quality tier's retrieval quality to fall short of its published benchmarks until per-model instruction/query prompting (recommended by the Qwen3/Jina model cards, not implemented here) is added.
 
 Semantic retrieval is opt-out. On a machine where its additional memory, CPU, or disk use is undesirable, disable it explicitly:
 
@@ -208,6 +220,8 @@ Use the `context-window` namespace in Pi's shared settings files:
     "semanticModelCachePath": "~/.pi/context-window/models",
     "semanticIndexPath": "~/.pi/context-window/semantic-index",
     "semanticCandidates": 40,
+    "semanticModelDimensions": null,
+    "semanticModelPooling": null,
     "dbPath": "~/.pi/context-window/archive.db",
     "maxArchiveBytes": 1073741824,
     "targetArchiveBytes": 805306368,
@@ -252,6 +266,8 @@ CONTEXT_WINDOW_SEMANTIC_MODEL
 CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION
 CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
 CONTEXT_WINDOW_SEMANTIC_INDEX
+CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS
+CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING
 CONTEXT_WINDOW_SEMANTIC_CANDIDATES
 CONTEXT_WINDOW_HINT_BUDGET_TOKENS
 CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS

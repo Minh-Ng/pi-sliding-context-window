@@ -139,6 +139,9 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(defaults.semanticModelRevision, "751bff37182d3f1213fa05d7196b954e230abad9");
     assert.equal(defaults.semanticModelCachePath, join(directory, ".pi", "context-window", "models"));
     assert.equal(defaults.semanticIndexPath, join(directory, ".pi", "context-window", "semantic-index"));
+    // Unset by default: LocalSemanticIndex derives both from semanticModel.
+    assert.equal(defaults.semanticModelDimensions, undefined);
+    assert.equal(defaults.semanticModelPooling, undefined);
 
     mkdirSync(join(directory, ".pi", "context-window"), { recursive: true });
     writeFileSync(defaults.dbPath, "legacy SQLite placeholder");
@@ -179,6 +182,8 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
         CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE: "~/models/local",
         CONTEXT_WINDOW_SEMANTIC_INDEX: "~/indexes/local",
         CONTEXT_WINDOW_SEMANTIC_CANDIDATES: "24",
+        CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS: "768",
+        CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING: "last_token",
       },
     });
     assert.equal(overridden.archiveBackend, "sqlite");
@@ -194,6 +199,8 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.semanticModelCachePath, join(directory, "models", "local"));
     assert.equal(overridden.semanticIndexPath, join(directory, "indexes", "local"));
     assert.equal(overridden.semanticCandidates, 24);
+    assert.equal(overridden.semanticModelDimensions, 768);
+    assert.equal(overridden.semanticModelPooling, "last_token");
     assert.equal(overridden.hintSourceCooldownHours, 12);
     assert.equal(overridden.maxInlineUserTokens, 8_000);
     assert.equal(overridden.ephemeralAutoRetrievalDays, 3);
@@ -249,6 +256,21 @@ test("tool-result budget knobs resolve from env, settings, and defaults", () => 
   }
 });
 
+test("an unrecognized semanticModelPooling value fails closed to undefined instead of reaching the embedding worker", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-pooling-config-"));
+  try {
+    const invalid = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: { CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING: "not-a-real-pooling-mode" },
+    });
+    assert.equal(invalid.semanticModelPooling, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("dedupToolResults defaults on and resolves from settings, then environment", () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-dedup-"));
   try {
@@ -278,6 +300,44 @@ test("dedupToolResults defaults on and resolves from settings, then environment"
       home: directory,
     });
     assert.equal(envOverridesSettings.dedupToolResults, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("semanticModel resolves the installer's catalog tier aliases and picks up that model's pinned revision", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-semantic-alias-config-"));
+  try {
+    const resolved = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: { CONTEXT_WINDOW_SEMANTIC_MODEL: "quality" },
+    });
+    assert.equal(resolved.semanticModel, "onnx-community/Qwen3-Embedding-0.6B-ONNX");
+    assert.equal(resolved.semanticModelRevision, "main");
+
+    // An explicit revision still wins over the catalog's pinned one.
+    const explicitRevision = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: {
+        CONTEXT_WINDOW_SEMANTIC_MODEL: "quality",
+        CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION: "pinned-fork-revision",
+      },
+    });
+    assert.equal(explicitRevision.semanticModel, "onnx-community/Qwen3-Embedding-0.6B-ONNX");
+    assert.equal(explicitRevision.semanticModelRevision, "pinned-fork-revision");
+
+    // A literal model id that is not an alias passes through unchanged.
+    const literal = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: { CONTEXT_WINDOW_SEMANTIC_MODEL: "local/test-model" },
+    });
+    assert.equal(literal.semanticModel, "local/test-model");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

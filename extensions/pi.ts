@@ -701,6 +701,8 @@ export function createContextEpochWindow({
                   cachePath: (config as any).semanticModelCachePath,
                   indexPath: (config as any).semanticIndexPath,
                   candidates: (config as any).semanticCandidates,
+                  dimensions: (config as any).semanticModelDimensions,
+                  pooling: (config as any).semanticModelPooling,
                 },
               });
         nextSession = new EpochWindowSession({

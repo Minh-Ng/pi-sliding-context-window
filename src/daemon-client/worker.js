@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { workerData } from "node:worker_threads";
 import { StoreClient } from "../store-client.js";
 import { ensureSecureSocketDirectory } from "../daemon/paths.js";
+import { semanticLaunchArguments } from "./semantic-launch-arguments.js";
 import {
   appendDaemonLog,
   defaultDaemonLaunchLogPath,
@@ -231,14 +232,7 @@ async function tryConnect() {
 function launchDaemon() {
   // The adapter host may itself be Bun. RocksDB support is intentionally tied
   // to the package's declared Node runtime, so never inherit the host binary.
-  const semanticArguments = options.semantic?.enabled ? [
-    "--semantic",
-    "--semantic-model", options.semantic.model,
-    "--semantic-revision", options.semantic.revision,
-    "--semantic-cache", options.semantic.cachePath,
-    "--semantic-index", options.semantic.indexPath,
-    "--semantic-candidates", String(options.semantic.candidates),
-  ] : [];
+  const semanticArguments = semanticLaunchArguments(options.semantic);
   const logPath = options.daemonLogPath ?? defaultDaemonLogPath(options.storePath);
   const child = spawn(nodeExecutable, [
     daemonPath,

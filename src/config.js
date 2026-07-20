@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { defaultSocketPath } from "./daemon/paths.js";
+import { SEMANTIC_TIER_ALIASES, semanticModelProfile } from "./semantic/model-catalog.js";
 
 export const DEFAULT_CONFIG = Object.freeze({
   rotationContextRatio: 0.65,
@@ -64,6 +65,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   semanticModelCachePath: join(homedir(), ".pi", "context-window", "models"),
   semanticIndexPath: join(homedir(), ".pi", "context-window", "semantic-index"),
   semanticCandidates: 40,
+  // Unset by default: dimensions/pooling are derived from `semanticModel`
+  // via the catalog in src/semantic/model-catalog.js. These are an escape
+  // hatch for a custom or self-hosted model the catalog does not recognize.
+  semanticModelDimensions: undefined,
+  semanticModelPooling: undefined,
   socketPath: undefined,
   // Existing archives remain here until an explicit offline cutover.
   dbPath: join(homedir(), ".pi", "context-window", "archive.db"),
@@ -155,6 +161,15 @@ function booleanValue(value, fallback) {
 
 function parseArchiveBackend(value) {
   return value === "rocksdb" || value === "sqlite" ? value : undefined;
+}
+
+// Mirrors the pooling strategies the pinned @huggingface/transformers
+// feature-extraction pipeline accepts; an unrecognized value fails closed at
+// config load rather than surfacing as an opaque worker-thread rejection
+// later, per-request.
+const POOLING_MODES = new Set(["mean", "cls", "first_token", "last_token", "eos", "none"]);
+function parsePoolingMode(value) {
+  return typeof value === "string" && POOLING_MODES.has(value) ? value : undefined;
 }
 
 function resolvedPath(value, home) {
@@ -406,6 +421,17 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     hardLimitContextRatio: environmentHardRatio !== undefined,
     rotationTurns: environmentRotationTurns !== undefined,
   };
+  // The installer accepts the catalog's tier aliases (small/quality/default —
+  // see model-catalog.js) as a convenience for `semanticModel`; resolve them
+  // here too so setting semanticModel to an alias the installer just printed
+  // does not silently miss the catalog and fall back to 384/mean.
+  const rawSemanticModel = String(env.CONTEXT_WINDOW_SEMANTIC_MODEL ?? merged.semanticModel);
+  const resolvedSemanticModel = SEMANTIC_TIER_ALIASES[rawSemanticModel] ?? rawSemanticModel;
+  const explicitSemanticModelRevision = firstValid(
+    (value) => (typeof value === "string" && value.trim().length > 0 ? value : undefined),
+    env.CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION,
+    ...values("semanticModelRevision"),
+  );
   const activeHintBudgetTokens = aliasedNumeric(
     "activeHintBudgetTokens",
     "epochHintBudgetTokens",
@@ -499,9 +525,15 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
       env.CONTEXT_WINDOW_SEMANTIC_RETRIEVAL ?? merged.semanticRetrieval,
       DEFAULT_CONFIG.semanticRetrieval,
     ),
-    semanticModel: String(env.CONTEXT_WINDOW_SEMANTIC_MODEL ?? merged.semanticModel),
+    semanticModel: resolvedSemanticModel,
+    // An explicit revision always wins (custom/self-hosted models). Otherwise,
+    // when the resolved model has a catalog entry, its pinned revision wins
+    // over the settings default so switching semanticModel to a different
+    // catalog model doesn't keep the previous model's pinned revision.
     semanticModelRevision: String(
-      env.CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION ?? merged.semanticModelRevision,
+      explicitSemanticModelRevision
+        ?? semanticModelProfile(resolvedSemanticModel)?.revision
+        ?? merged.semanticModelRevision,
     ),
     semanticModelCachePath: resolvedPath(
       env.CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
@@ -519,6 +551,17 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
       "semanticCandidates",
       parsePositiveInteger,
       env.CONTEXT_WINDOW_SEMANTIC_CANDIDATES,
+    ),
+    // Left undefined unless explicitly set: LocalSemanticIndex derives both
+    // from `semanticModel` via the catalog when these are absent.
+    semanticModelDimensions: explicitNumeric(
+      "semanticModelDimensions",
+      env.CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS,
+    ),
+    semanticModelPooling: firstValid(
+      parsePoolingMode,
+      env.CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING,
+      ...values("semanticModelPooling"),
     ),
     // Existing SQLite users stay on SQLite until they explicitly complete the
     // offline migration and opt into RocksDB. Fresh installations use RocksDB.

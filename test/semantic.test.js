@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -112,4 +113,160 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
   const reloaded = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
   assert.equal((await reloaded.search(request))[0].documentId, "semantic-cat");
   await reloaded.close();
+});
+
+test("local semantic index derives dimensions and pooling from the configured model's catalog entry", async (t) => {
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const shippedDefault = new LocalSemanticIndex(store, {
+    model: "Xenova/all-MiniLM-L6-v2",
+    revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(shippedDefault.dimensions, 384);
+  assert.equal(shippedDefault.pooling, "mean");
+  await shippedDefault.close();
+
+  // embeddinggemma-300m is 768-dim, mean-pooled; verifying dimensions are
+  // derived from the model (not the 384 literal that matches only MiniLM).
+  const smallTier = new LocalSemanticIndex(store, {
+    model: "onnx-community/embeddinggemma-300m-ONNX",
+    revision: "main",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(smallTier.dimensions, 768);
+  assert.equal(smallTier.pooling, "mean");
+  await smallTier.close();
+
+  // Qwen3-Embedding-0.6B is 1024-dim, last-token-pooled: both the dimension
+  // count and the pooling strategy must come from the model, since neither
+  // matches the encoder-model defaults above.
+  const qualityTier = new LocalSemanticIndex(store, {
+    model: "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+    revision: "main",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(qualityTier.dimensions, 1024);
+  assert.equal(qualityTier.pooling, "last_token");
+  await qualityTier.close();
+
+  // An explicit override always wins over the catalog, covering a custom or
+  // self-hosted model the catalog does not recognize.
+  const overridden = new LocalSemanticIndex(store, {
+    model: "some-org/custom-model",
+    revision: "v1",
+    dimensions: 512,
+    pooling: "cls",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(overridden.dimensions, 512);
+  assert.equal(overridden.pooling, "cls");
+  await overridden.close();
+
+  // An unrecognized model with no explicit override falls back to the
+  // historical MiniLM-shaped default rather than throwing or guessing.
+  const unknown = new LocalSemanticIndex(store, {
+    model: "some-org/unknown-model",
+    revision: "v1",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(unknown.dimensions, 384);
+  assert.equal(unknown.pooling, "mean");
+  await unknown.close();
+});
+
+test("local semantic index sanitizes an invalid dimensions/pooling override instead of surfacing NaN or an unrecognized string", async (t) => {
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  // Number(null) is the exact failure mode a raw `Number()` cast of a missing
+  // env var (e.g. CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS unset) produces.
+  const invalidDimensions = new LocalSemanticIndex(store, {
+    model: "Xenova/all-MiniLM-L6-v2",
+    dimensions: Number(null),
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(invalidDimensions.dimensions, 384);
+  assert.equal(Number.isNaN(invalidDimensions.dimensions), false);
+  await invalidDimensions.close();
+
+  const invalidPooling = new LocalSemanticIndex(store, {
+    model: "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+    pooling: "not-a-real-pooling-mode",
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(invalidPooling.pooling, "last_token");
+  await invalidPooling.close();
+});
+
+test("local semantic index fingerprint changes with pooling, dimensions, model, or revision", async (t) => {
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const base = new LocalSemanticIndex(store, {
+    model: "test/model",
+    revision: "rev-1",
+    dimensions: 3,
+    embedder: fakeEmbedder(),
+  });
+  const samePooling = new LocalSemanticIndex(store, {
+    model: "test/model",
+    revision: "rev-1",
+    dimensions: 3,
+    pooling: "mean",
+    embedder: fakeEmbedder(),
+  });
+  const differentPooling = new LocalSemanticIndex(store, {
+    model: "test/model",
+    revision: "rev-1",
+    dimensions: 3,
+    pooling: "cls",
+    embedder: fakeEmbedder(),
+  });
+  const differentDimensions = new LocalSemanticIndex(store, {
+    model: "test/model",
+    revision: "rev-1",
+    dimensions: 4,
+    embedder: fakeEmbedder(),
+  });
+  assert.equal(base.fingerprint, samePooling.fingerprint);
+  assert.notEqual(base.fingerprint, differentPooling.fingerprint);
+  assert.notEqual(base.fingerprint, differentDimensions.fingerprint);
+  await Promise.all([base, samePooling, differentPooling, differentDimensions].map((index) => index.close()));
+});
+
+test("a mean-pooled index's fingerprint stays byte-identical to the pre-pooling formula, so upgrading does not abandon existing indexes", async (t) => {
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const meanPooled = new LocalSemanticIndex(store, {
+    model: "Xenova/all-MiniLM-L6-v2",
+    revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+    dimensions: 384,
+    embedder: fakeEmbedder(),
+  });
+  t.after(() => meanPooled.close());
+  // Every index built before pooling existed as a knob was fingerprinted with
+  // this 3-field, pooling-less formula. A deployment that was already
+  // mean-pooled (every deployment, historically) must reproduce it exactly.
+  const historicalFingerprint = createHash("sha256")
+    .update("Xenova/all-MiniLM-L6-v2\x00751bff37182d3f1213fa05d7196b954e230abad9\x00384")
+    .digest("hex")
+    .slice(0, 32);
+  assert.equal(meanPooled.fingerprint, historicalFingerprint);
+
+  const clsPooled = new LocalSemanticIndex(store, {
+    model: "Xenova/all-MiniLM-L6-v2",
+    revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+    dimensions: 384,
+    pooling: "cls",
+    embedder: fakeEmbedder(),
+  });
+  t.after(() => clsPooled.close());
+  assert.notEqual(clsPooled.fingerprint, historicalFingerprint);
 });

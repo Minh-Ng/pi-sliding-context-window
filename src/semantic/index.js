@@ -11,6 +11,7 @@ import { KEYSPACE } from "../rocksdb/keys.js";
 import { manifestKeys } from "../rocksdb/manifests.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { LocalEmbedder } from "./embedder-client.js";
+import { semanticModelProfile } from "./model-catalog.js";
 import { createSemanticSpans } from "./spans.js";
 
 const require = createRequire(import.meta.url);
@@ -23,6 +24,9 @@ const DEFAULT_CANDIDATES = 40;
 const DEFAULT_MINIMUM_SCORE = 0.35;
 export const DEFAULT_SEMANTIC_MODEL = "Xenova/all-MiniLM-L6-v2";
 export const DEFAULT_SEMANTIC_MODEL_REVISION = "751bff37182d3f1213fa05d7196b954e230abad9";
+// Mirrors config.js's POOLING_MODES: the pooling strategies the pinned
+// @huggingface/transformers feature-extraction pipeline accepts.
+const POOLING_MODES = new Set(["mean", "cls", "first_token", "last_token", "eos", "none"]);
 
 function digest(value, length = 24) {
   return createHash("sha256").update(value).digest("hex").slice(0, length);
@@ -60,7 +64,13 @@ export class LocalSemanticIndex {
     revision = DEFAULT_SEMANTIC_MODEL_REVISION,
     cachePath = ".context-window/models",
     indexPath = ".context-window/semantic-index",
-    dimensions = 384,
+    // Dimensions and pooling are properties of the configured model, not
+    // independent knobs: default to the catalog entry for `model` (see
+    // model-catalog.js) and only fall back to the historical MiniLM/mean
+    // literals for a model the catalog does not recognize. An explicit
+    // caller-supplied value always wins, covering custom/self-hosted models.
+    dimensions: dimensionsOption = semanticModelProfile(model)?.dimensions ?? 384,
+    pooling: poolingOption = semanticModelProfile(model)?.pooling ?? "mean",
     batchSize = DEFAULT_BATCH_SIZE,
     candidates = DEFAULT_CANDIDATES,
     minimumScore = DEFAULT_MINIMUM_SCORE,
@@ -73,7 +83,18 @@ export class LocalSemanticIndex {
     this.revision = revision;
     this.cachePath = cachePath;
     this.indexPath = indexPath;
+    // A caller (e.g. the daemon CLI/env plumbing) may pass through an
+    // unsanitized override; fail closed to the catalog/default rather than
+    // letting NaN or an unrecognized pooling string reach the wire contract
+    // or the usearch index constructor.
+    const dimensions = Number.isSafeInteger(dimensionsOption) && dimensionsOption > 0
+      ? dimensionsOption
+      : semanticModelProfile(model)?.dimensions ?? 384;
+    const pooling = typeof poolingOption === "string" && POOLING_MODES.has(poolingOption)
+      ? poolingOption
+      : semanticModelProfile(model)?.pooling ?? "mean";
     this.dimensions = dimensions;
+    this.pooling = pooling;
     this.batchSize = Number.isSafeInteger(batchSize) && batchSize > 0 ? batchSize : DEFAULT_BATCH_SIZE;
     this.candidates = Number.isSafeInteger(candidates) && candidates > 0
       ? candidates
@@ -91,7 +112,16 @@ export class LocalSemanticIndex {
     this.queue = Promise.resolve();
     this.closed = false;
     this.unavailable = false;
-    this.fingerprint = digest(`${model}\0${revision}\0${dimensions}`, 32);
+    // Pooling changes the vectors a model produces for the same text, so it
+    // versions the derived index exactly like model/revision/dimensions do.
+    // "mean" was the implicit, undigested pooling for every index built
+    // before pooling became an explicit knob, so it is omitted here too:
+    // upgrading to this catalog-driven derivation must not invalidate (and
+    // force a full re-embed of) every already-built mean-pooled index for a
+    // deployment whose effective config hasn't changed.
+    this.fingerprint = pooling === "mean"
+      ? digest(`${model}\0${revision}\0${dimensions}`, 32)
+      : digest(`${model}\0${revision}\0${dimensions}\0${pooling}`, 32);
   }
 
   initialize() {
@@ -105,6 +135,7 @@ export class LocalSemanticIndex {
       model: this.model,
       revision: this.revision,
       cachePath: this.cachePath,
+      pooling: this.pooling,
     });
     return this.embedder;
   }
@@ -317,6 +348,8 @@ export class LocalSemanticIndex {
       projects: this.states.size,
       model: this.model,
       revision: this.revision,
+      dimensions: this.dimensions,
+      pooling: this.pooling,
     };
   }
 

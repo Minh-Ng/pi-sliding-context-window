@@ -20,7 +20,10 @@ function extractor() {
 parentPort.on("message", async ({ id, texts }) => {
   try {
     const model = await extractor();
-    const output = await model(texts, { pooling: "mean", normalize: true });
+    // Pooling is a property of the configured model's architecture (mean for
+    // encoder models like MiniLM/EmbeddingGemma, last_token for
+    // decoder-derived models like Qwen3/Jina v5) — see model-catalog.js.
+    const output = await model(texts, { pooling: workerData.pooling ?? "mean", normalize: true });
     const dimensions = output.dims.at(-1);
     const vectors = Float32Array.from(output.data);
     parentPort.postMessage({ id, ok: true, dimensions, vectors }, [vectors.buffer]);

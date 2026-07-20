@@ -313,29 +313,85 @@ export function formatByteSize(bytes) {
   return `${(value / 1_073_741_824).toFixed(2)} GiB`;
 }
 
-export function formatPromotePacket(packet) {
+// Above this length, or once a decision spans multiple paragraphs, a single
+// AGENTS.md/CLAUDE.md bullet would truncate the recalled wording, so the
+// draft becomes a standalone ADR file body instead.
+const PROMOTE_SHORT_DECISION_MAX_CHARS = 320;
+
+function promoteSlug(text) {
+  const words = String(text)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/gu, "")
+    .split(/\s+/u)
+    .filter(Boolean)
+    .slice(0, 6);
+  return words.join("-") || "decision";
+}
+
+// One concrete draft, not a menu: short single-paragraph decisions become a
+// diff-hunk-shaped AGENTS.md/CLAUDE.md line to hand-apply (promote never
+// reads the target file, so it cannot supply real line numbers or context
+// for `git apply`); longer or multi-paragraph decisions become a
+// self-contained ADR file body. Either way the caller lands it with one
+// edit, not a checklist.
+function promoteDraft(packet, excerpt, created) {
+  const oneLine = excerpt.replace(/\s+/gu, " ").trim();
+  const isShort = oneLine.length > 0
+    && oneLine.length <= PROMOTE_SHORT_DECISION_MAX_CHARS
+    && !excerpt.includes("\n\n");
+  const documentRef = `${packet.documentId}${packet.kind ? ` (${packet.kind})` : ""}`;
+  if (isShort) {
+    const body = [
+      "--- a/AGENTS.md",
+      "+++ b/AGENTS.md",
+      "@@",
+      `+- ${oneLine} (decided ${created}; archived ${documentRef})`,
+    ].join("\n");
+    return { label: "AGENTS.md / CLAUDE.md diff hunk", targetPath: "AGENTS.md (or CLAUDE.md)", body };
+  }
+  const slug = promoteSlug(oneLine.slice(0, 60) || packet.documentId);
+  const targetPath = `docs/adr/${created}-${slug}.md`;
+  const body = [
+    `# ${slug.replace(/-/gu, " ")}`,
+    "",
+    "## Status",
+    "Accepted",
+    "",
+    "## Decision",
+    excerpt,
+    "",
+    "## Provenance",
+    `- Archived document: ${documentRef}`,
+    `- Session: ${packet.sessionId ?? "unknown"}`,
+    `- Date: ${created}`,
+  ].join("\n");
+  return { label: "ADR file body", targetPath, body };
+}
+
+export function formatPromotePacket(packet, tokenLimit) {
   if (!packet) return "No archived document found to promote.";
   const created = Number.isSafeInteger(packet.createdAt)
     ? new Date(packet.createdAt).toISOString().slice(0, 10)
     : "unknown-date";
-  const excerpt = String(packet.text ?? "").trim();
+  const excerpt = String(packet.text ?? "").trim() || "(empty)";
+  const draft = promoteDraft(packet, excerpt, created);
   const lines = [
     "Promote to codebase (archive is not durable storage)",
     "",
     `Document: ${packet.documentId}${packet.kind ? ` (${packet.kind})` : ""}`,
-    `Excerpt (${created}):`,
-    excerpt || "(empty)",
+    `Session: ${packet.sessionId ?? "unknown"}`,
+    `Date: ${created}`,
     "",
-    "Suggested landings:",
-    "- AGENTS.md / CLAUDE.md — agent-facing constraint",
-    "- docs/adr/… — human decision record",
-    "- code/config — if it is already an implementation fact",
+    `Draft (${draft.label}) — target ${draft.targetPath}:`,
+    draft.body,
     "",
-    "Next: edit the repo (agent or you). Do not pin the archive.",
+    "Next: apply the draft above to the repo (agent or you). Do not pin the archive.",
     "Archive copy remains searchable until normal retention expires.",
   ];
   if (packet.subjectKey) lines.splice(3, 0, `Subject: ${packet.subjectKey}`);
-  return lines.join("\n");
+  const text = lines.join("\n");
+  return tokenLimit === undefined ? text : capText(text, tokenLimit);
 }
 
 export function formatRedactResult(result) {
@@ -480,6 +536,12 @@ export function formatStatusDetails(status) {
       : `Active epoch: ${status.activeTurns} user-role message(s), ~${status.activeTokens.toLocaleString()} tokens`,
     `Rotate at: ${status.rotationTokens.toLocaleString()} tokens or ${status.rotationTurns} user-role messages; retain: ${status.retainTurns} user-role messages`,
   ];
+  if (Number.isFinite(status.inputWindowTokens)
+    && Number.isFinite(status.piCompactionReserveTokens)) {
+    sections.push(
+      `Pi input budget: ${status.inputWindowTokens.toLocaleString()} tokens after ${status.piCompactionReserveTokens.toLocaleString()} tokens reserved for compaction and model output`,
+    );
+  }
   if (status.modelPattern) sections.push(`Model profile: ${status.modelPattern}`);
   if (status.lastRotationMode === "emergency-retention") {
     sections.push(`Last rotation: emergency ${status.lastRotationReason}; retained ${status.effectiveRetainTurns}/${status.retainTurns} user-role messages`);

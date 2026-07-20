@@ -9,6 +9,7 @@ import {
   formatAutomaticRetrievalDiagnostics,
   formatByteSize,
   formatGatherResults,
+  formatPromotePacket,
   formatRecalledDocument,
   formatSearchResults,
   formatStatusDetails,
@@ -44,6 +45,60 @@ test("archive search and recall outputs carry a concise staleness label", () => 
   assert.match(recall, /Exact earlier wording/);
   assert.match(recall, /legacy-unavailable/);
   assert.match(missingRecall, /No archived document with id missing-id\./);
+});
+
+test("promote packet renders a landable AGENTS.md diff hunk for a short decision", () => {
+  const output = formatPromotePacket({
+    documentId: "doc-decision",
+    kind: "turn",
+    createdAt: Date.parse("2026-02-01T00:00:00Z"),
+    text: "Use RocksDB as the sole archive backend.",
+    sessionId: "session-a",
+  }, 2_000);
+  assert.match(output, /Promote to codebase \(archive is not durable storage\)/);
+  assert.match(output, /Document: doc-decision \(turn\)/);
+  assert.match(output, /Session: session-a/);
+  assert.match(output, /Date: 2026-02-01/);
+  assert.match(output, /Draft \(AGENTS\.md \/ CLAUDE\.md diff hunk\) — target AGENTS\.md \(or CLAUDE\.md\)/);
+  assert.match(output, /--- a\/AGENTS\.md/);
+  assert.match(output, /\+\+\+ b\/AGENTS\.md/);
+  assert.match(output, /\+- Use RocksDB as the sole archive backend\. \(decided 2026-02-01; archived doc-decision \(turn\)\)/);
+  assert.match(output, /Do not pin the archive\./);
+  assert.doesNotMatch(output, /## Decision/);
+});
+
+test("promote packet renders a self-contained ADR body for a long or multi-paragraph decision", () => {
+  const decisionText = "We evaluated three storage backends.\n\n"
+    + "RocksDB won because it supports the single-owner daemon model and its "
+    + "LSM compaction reclaims tombstoned records without a maintenance window.";
+  const output = formatPromotePacket({
+    documentId: "doc-long",
+    kind: "turn",
+    createdAt: Date.parse("2026-02-02T00:00:00Z"),
+    text: decisionText,
+    sessionId: "session-b",
+    subjectKey: "storage-backend",
+  }, 2_000);
+  assert.match(output, /Subject: storage-backend/);
+  assert.match(output, /Draft \(ADR file body\) — target docs\/adr\/2026-02-02-/);
+  assert.match(output, /## Status\nAccepted/);
+  assert.match(output, /## Decision\nWe evaluated three storage backends\./);
+  assert.match(output, /## Provenance/);
+  assert.match(output, /- Archived document: doc-long \(turn\)/);
+  assert.match(output, /- Session: session-b/);
+});
+
+test("promote packet respects its token budget and reports a missing document", () => {
+  const longExcerpt = "This decision text repeats. ".repeat(200);
+  const capped = formatPromotePacket({
+    documentId: "doc-capped",
+    kind: "turn",
+    createdAt: Date.parse("2026-02-03T00:00:00Z"),
+    text: longExcerpt,
+    sessionId: "session-c",
+  }, 80);
+  assert.ok(estimateModelVisibleTokens(capped) <= 80);
+  assert.equal(formatPromotePacket(undefined, 80), "No archived document found to promote.");
 });
 
 test("time-sensitive archive searches receive bounded reconciliation guidance and source timestamps", () => {

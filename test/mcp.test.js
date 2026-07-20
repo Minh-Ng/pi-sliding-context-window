@@ -497,6 +497,144 @@ test("MCP recall renders archive, source-message, and tool-result provenance", a
   }
 });
 
+test("MCP promote returns a landable draft, not a checklist, and never edits the repo", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-promote-"));
+  const databasePath = join(directory, "archive.db");
+  const archive = new Archive(databasePath);
+  archive.put({
+    id: "short-decision",
+    sessionId: "promote-session",
+    project: "/project",
+    kind: "turn",
+    text: "Use RocksDB as the sole archive backend for context-window.",
+    createdAt: Date.parse("2026-01-15T00:00:00Z"),
+  });
+  archive.put({
+    id: "long-decision",
+    sessionId: "promote-session",
+    project: "/project",
+    kind: "turn",
+    text: "We evaluated three storage backends for the archive.\n\n"
+      + "After benchmarking, RocksDB was selected because it supports the "
+      + "single-owner daemon model without a network dependency, and because "
+      + "its LSM compaction reclaims tombstoned records without a maintenance window.",
+    createdAt: Date.parse("2026-01-16T00:00:00Z"),
+  });
+  archive.close();
+
+  const child = startServer(databasePath);
+  const responses = collectLines(child.stdout, 3);
+  try {
+    for (const [id, archiveId] of [[1, "short-decision"], [2, "long-decision"], [3, "missing-id"]]) {
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "context_window_promote", arguments: { id: archiveId } },
+      })}\n`);
+    }
+    const [short, long, missing] = await responses;
+
+    const shortText = short.result.content[0].text;
+    assert.equal(short.result.isError, false);
+    assert.match(shortText, /Document: short-decision \(turn\)/);
+    assert.match(shortText, /Session: promote-session/);
+    assert.match(shortText, /Date: 2026-01-15/);
+    assert.match(shortText, /Draft \(AGENTS\.md \/ CLAUDE\.md diff hunk\) — target AGENTS\.md/);
+    assert.match(shortText, /\+\+\+ b\/AGENTS\.md/);
+    assert.match(shortText, /\+- Use RocksDB as the sole archive backend for context-window\./);
+    assert.doesNotMatch(shortText, /Suggested landings:/);
+    assert.doesNotMatch(shortText, /Next: edit the repo/);
+    assert.match(shortText, /Do not pin the archive\./);
+
+    const longText = long.result.content[0].text;
+    assert.equal(long.result.isError, false);
+    assert.match(longText, /Draft \(ADR file body\) — target docs\/adr\/2026-01-16-/);
+    assert.match(longText, /## Decision/);
+    assert.match(longText, /After benchmarking, RocksDB was selected/);
+    assert.match(longText, /## Provenance/);
+    assert.match(longText, /Archived document: long-decision \(turn\)/);
+    assert.match(longText, /Session: promote-session/);
+
+    assert.equal(missing.result.isError, true);
+    assert.match(missing.result.content[0].text, /No archived document found to promote\./);
+
+    child.stdin.end();
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 0);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await stopServerAuthority(child);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP promote on the default RocksDB backend drafts the decision text, not the archived-evidence envelope", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-promote-rocks-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const project = join(directory, "project");
+  const child = startRocksServer({ directory, storePath, socketPath, project });
+  const rpc = rpcClient(child);
+  let daemonProcessId;
+
+  try {
+    const archived = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "manual",
+        text: "Use RocksDB as the sole archive backend for context-window.",
+      },
+    });
+    assert.equal(archived.error, undefined);
+
+    const searched = await rpc.request("tools/call", {
+      name: "context_window_search",
+      arguments: { query: "sole archive backend for context-window", scope: "project", limit: 3 },
+    });
+    assert.equal(searched.error, undefined);
+    const locator = searched.result.content[0].text.match(
+      /\b(cw1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/u,
+    )?.[1];
+    assert.ok(locator, "search must expose an opaque exact-version locator");
+
+    const promoted = await rpc.request("tools/call", {
+      name: "context_window_promote",
+      arguments: { id: locator },
+    });
+    assert.equal(promoted.error, undefined);
+    assert.equal(promoted.result.isError, false);
+    const promotedText = promoted.result.content[0].text;
+    assert.match(promotedText, /Draft \(AGENTS\.md \/ CLAUDE\.md diff hunk\) — target AGENTS\.md/);
+    assert.match(promotedText, /\+- Use RocksDB as the sole archive backend for context-window\./);
+    assert.doesNotMatch(promotedText, /ARCHIVED HISTORICAL EVIDENCE/u);
+    assert.doesNotMatch(promotedText, /untrusted-archived-data/u);
+
+    const storeClient = new StoreClient({ socketPath, project, requestTimeoutMs: 5_000 });
+    try {
+      daemonProcessId = (await storeClient.request("daemon.status", {})).processId;
+    } finally {
+      storeClient.close();
+    }
+
+    child.stdin.end();
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 0);
+  } finally {
+    rpc.close();
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    if (!daemonProcessId) {
+      try { daemonProcessId = (await daemonStatus(socketPath, project)).processId; } catch {}
+    }
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP negotiates its supported version and reports malformed JSON", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-"));
   const child = startServer(join(directory, "archive.db"));

@@ -424,7 +424,7 @@ export function createContextEpochWindow({
             label: "Context cap",
             currentValue: contextCapValue(active.config),
             values: contextCapOptions(active.config),
-            description: `Rotate at this estimated message-token cap. Adaptive uses ${Math.round(active.config.rotationContextRatio * 100)}% of the selected model; current effective cap is ${formatTokenCap(status.rotationTokens)}.`,
+            description: `Rotate at this estimated message-token cap. Adaptive uses ${Math.round(active.config.rotationContextRatio * 100)}% of the selected model's input budget after Pi's compaction reserve; current effective cap is ${formatTokenCap(status.rotationTokens)}.`,
           },
         ];
         let settingsList: SettingsList;
@@ -643,9 +643,6 @@ export function createContextEpochWindow({
     // The provider-context event may run without an active TUI context. Refresh
     // after each complete run so the footer reflects the latest measurement.
     pi.on("agent_settled", (_event, ctx) => {
-      let providerTokens: number | null | undefined;
-      try { providerTokens = ctx.getContextUsage?.()?.tokens; } catch { providerTokens = undefined; }
-      session?.clearReserveAwareRotation(providerTokens);
       session?.refreshArchiveProtection();
       updateStatus(ctx);
     });
@@ -663,46 +660,14 @@ export function createContextEpochWindow({
       updateStatus(ctx);
     });
 
-    pi.on("session_before_compact", (event, ctx) => {
+    pi.on("session_before_compact", (event) => {
       try {
         if (!session || !isCompactionEvent(event)) return { cancel: true };
 
-        // Pi's measurement includes the system prompt, tool schemas, provider
-        // framing, and any content our chars/4 estimate cannot see. Prefer the
-        // larger provider-aware signal so an optimistic epoch estimate can never
-        // suppress the compaction needed to avoid a real context overflow.
-        let contextUsage: ReturnType<ExtensionContext["getContextUsage"]>;
-        try { contextUsage = ctx.getContextUsage?.(); } catch { contextUsage = undefined; }
-        const preparationTokens = event.preparation.tokensBefore;
-        const providerTokens = contextUsage?.tokens;
-        const hasPreparationMeasurement = typeof preparationTokens === "number"
-          && Number.isFinite(preparationTokens)
-          && preparationTokens >= 0;
-        const hasProviderMeasurement = typeof providerTokens === "number"
-          && Number.isFinite(providerTokens)
-          && providerTokens >= 0;
-        const observedTokens = [event.preparation.tokensBefore, contextUsage?.tokens]
-          .filter((tokens): tokens is number => typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0)
-          .reduce((maximum, tokens) => Math.max(maximum, Number(tokens)), Number.NEGATIVE_INFINITY);
-
-        // Cancel only after the complete-turn rotation has been archived and
-        // its boundary state persisted. Any planning/admission/cleanup/persist
-        // failure falls through to archive-first custom compaction in this same
-        // awaited hook, before Pi can issue another provider request.
-        if (hasPreparationMeasurement && hasProviderMeasurement) {
-          try {
-            const rotation = session.rotateBeforeCompaction({
-              reason: event.reason,
-              observedContextTokens: observedTokens,
-              contextWindow: Number(ctx.model?.contextWindow ?? contextUsage?.contextWindow),
-              reserveTokens: Number(event.preparation.settings?.reserveTokens),
-            });
-            if (rotation.status === "rotated" || rotation.status === "already-rotated") {
-              return { cancel: true };
-            }
-          } catch { /* checkpoint fallback below remains authoritative */ }
-        }
-
+        // Aggregate provider usage cannot safely apportion tokenizer error
+        // between a removed prefix and retained suffix. Once Pi reaches its
+        // exact reserve-aware threshold, archive-first custom compaction remains
+        // authoritative rather than canceling on an estimated rotation.
         const result = session.checkpointCompaction(event.preparation, {
           // The checked-JS declaration infers the default `[]` as `never[]`,
           // while Pi correctly supplies SessionEntry[].
@@ -1031,7 +996,10 @@ export function createContextEpochWindow({
             return;
           }
           try {
-            ctx.ui.notify(formatPromotePacket(active.promoteArchive(id)), "info");
+            ctx.ui.notify(
+              formatPromotePacket(active.promoteArchive(id), active.config.searchResultTokens * 2),
+              "info",
+            );
           } catch (error) {
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
           }

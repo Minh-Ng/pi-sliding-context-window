@@ -410,6 +410,20 @@ test("custom archive factories can replace the SQLite backend", async () => {
   ]);
   assert.equal(daemonRestarts, 1);
 
+  await commands.get("window").handler("promote recall-id", ctx);
+  assert.equal(notifications[7].level, "info");
+  assert.match(notifications[7].message, /Document: recall-id \(turn\)/);
+  assert.match(notifications[7].message, /Session: custom/);
+  assert.match(notifications[7].message, /Draft \(AGENTS\.md \/ CLAUDE\.md diff hunk\) — target AGENTS\.md/);
+  assert.match(notifications[7].message, /\+- deterministic archived text that must remain model-visible/);
+  assert.doesNotMatch(notifications[7].message, /Suggested landings:/);
+
+  await commands.get("window").handler("promote missing-id", ctx);
+  assert.deepEqual(notifications[8], {
+    message: "No archived document found to promote.",
+    level: "info",
+  });
+
   handlers.get("session_start")({ reason: "new" }, ctx);
   const staleHandle = await tools.get("context_recall").execute("call", { id: "r1" });
   assert.equal(staleHandle.details.found, false);
@@ -1347,7 +1361,7 @@ test("a post-archive processing failure also aborts oversized provider input", a
   handlers.get("session_shutdown")({}, ctx);
 });
 
-test("threshold hook commits reserve-aware rotation before cancellation", async () => {
+test("threshold compaction always uses the archive-first custom result", async () => {
   const handlers = new Map();
   const appended = [];
   const archive = memoryCheckpointArchive();
@@ -1360,138 +1374,35 @@ test("threshold hook commits reserve-aware rotation before cancellation", async 
     registerCommand() {},
     appendEntry(...args) { appended.push(args); },
   });
-
-  let providerTokens = 250_404;
   const ctx = {
     cwd: "/project",
     hasUI: false,
-    model: { provider: "openai-codex", id: "gpt-test", contextWindow: 372_000 },
+    model: { provider: "provider", id: "model", contextWindow: 372_000, maxTokens: 128_000 },
     isProjectTrusted: () => false,
-    getContextUsage: () => ({ tokens: providerTokens, contextWindow: 372_000, percent: providerTokens / 3_720 }),
-    sessionManager: { getSessionId: () => "compaction-test", getBranch: () => [] },
+    getContextUsage: () => ({ tokens: 250_404, contextWindow: 372_000, percent: 67.3 }),
+    sessionManager: { getSessionId: () => "threshold-custom", getBranch: () => [] },
     ui: { setStatus() {} },
   };
   handlers.get("session_start")({ reason: "new" }, ctx);
-  const visibleEpoch = Array.from({ length: 12 }, (_, index) => ({
-    role: "user",
-    content: [{ type: "text", text: `${index + 1}:${"x".repeat(15_000)}` }],
-    timestamp: index + 1,
-  }));
-  handlers.get("context")({ messages: visibleEpoch }, ctx);
-
-  const preparation = compactionPreparation({ tokensBefore: 250_404 });
-  assert.deepEqual(
-    handlers.get("session_before_compact")(
-      compactionEvent("threshold", preparation),
-      ctx,
-    ),
-    { cancel: true },
-  );
-  assert.equal(appended.length, 1);
-  assert.equal(appended[0][1].reason, "forced");
-  assert.equal(appended[0][1].rotations, 1);
-  const putsAfterRotation = archive.puts.length;
-  assert.ok(putsAfterRotation > 0);
-
-  // Pi checks once after the completed response and again before the next
-  // prompt. A stricter reserve may reuse the committed rotation only when its
-  // provider-aware projection still fits the changed threshold.
-  assert.deepEqual(
-    handlers.get("session_before_compact")(
-      compactionEvent("threshold", compactionPreparation({
-        tokensBefore: 250_404,
-        reserveTokens: 128_000,
-      })),
-      ctx,
-    ),
-    { cancel: true },
-  );
-  assert.equal(archive.puts.length, putsAfterRotation);
-  assert.equal(appended.length, 1);
 
   for (const getContextUsage of [
+    ctx.getContextUsage,
     () => ({ tokens: null, contextWindow: 372_000, percent: null }),
     () => undefined,
     () => { throw new Error("provider usage unavailable"); },
   ]) {
-    const missingProviderUsage = handlers.get("session_before_compact")(
-      compactionEvent("threshold", preparation),
-      { ...ctx, getContextUsage },
-    );
-    assert.ok(missingProviderUsage.compaction);
-  }
-  assert.ok(archive.puts.length > 0);
-
-  // A materially larger repeated provider measurement invalidates the prior
-  // projection and must fall back to archive-first compaction.
-  providerTokens = 300_000;
-  const unsafe = handlers.get("session_before_compact")(
-    compactionEvent("threshold", compactionPreparation({
-      tokensBefore: 250_404,
-      reserveTokens: 128_000,
-    })),
-    ctx,
-  );
-  assert.ok(unsafe.compaction);
-  assert.ok(archive.puts.length > 0);
-  handlers.get("session_shutdown")({}, ctx);
-});
-
-test("rotation admission and persistence failures immediately use custom compaction", async () => {
-  for (const failure of ["archive", "persist"]) {
-    const handlers = new Map();
-    const archive = memoryCheckpointArchive();
-    let armed = false;
-    const put = archive.put.bind(archive);
-    archive.put = (document, options) => {
-      if (armed && failure === "archive" && document.kind === "turn") {
-        throw new Error("injected turn admission failure");
-      }
-      return put(document, options);
-    };
-    await createContextEpochWindow({
-      configLoader: () => compactionConfig(),
-      archiveFactory: () => archive,
-    })({
-      on(name, handler) { handlers.set(name, handler); },
-      registerTool() {},
-      registerCommand() {},
-      appendEntry(_type, state) {
-        if (armed && failure === "persist" && state.reason === "forced") {
-          throw new Error("injected rotation persistence failure");
-        }
-      },
-    });
-    const ctx = {
-      cwd: "/project",
-      hasUI: false,
-      model: { provider: "provider", id: "model", contextWindow: 372_000 },
-      isProjectTrusted: () => false,
-      getContextUsage: () => ({ tokens: 250_404, contextWindow: 372_000, percent: 67.3 }),
-      sessionManager: { getSessionId: () => `rotation-${failure}`, getBranch: () => [] },
-      ui: { setStatus() {} },
-    };
-    handlers.get("session_start")({ reason: "new" }, ctx);
-    handlers.get("context")({
-      messages: Array.from({ length: 12 }, (_, index) => ({
-        role: "user",
-        content: [{ type: "text", text: `${index + 1}:${"x".repeat(15_000)}` }],
-        timestamp: index + 1,
-      })),
-    }, ctx);
-    armed = true;
-
     const result = handlers.get("session_before_compact")(
       compactionEvent("threshold", compactionPreparation({
         tokensBefore: 250_404,
         reserveTokens: 128_000,
       })),
-      ctx,
+      { ...ctx, getContextUsage },
     );
-    assert.ok(result.compaction, failure);
-    assert.equal(result.cancel, undefined, failure);
-    handlers.get("session_shutdown")({}, ctx);
+    assert.ok(result.compaction);
+    assert.equal(result.cancel, undefined);
   }
+  assert.equal(appended.length, 0);
+  handlers.get("session_shutdown")({}, ctx);
 });
 
 test("unsafe threshold, overflow, and manual compaction return the same bounded archive catalog", async () => {
@@ -1843,6 +1754,7 @@ test("tree navigation restores the destination branch epoch boundary", async () 
     "CONTEXT_WINDOW_DB",
     "CONTEXT_WINDOW_ROCKSDB",
     "CONTEXT_WINDOW_SOCKET",
+    "CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS",
   ];
   const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   Object.assign(process.env, {
@@ -1850,6 +1762,7 @@ test("tree navigation restores the destination branch epoch boundary", async () 
     CONTEXT_WINDOW_DB: join(directory, "archive.db"),
     CONTEXT_WINDOW_ROCKSDB: storePath,
     CONTEXT_WINDOW_SOCKET: socketPath,
+    CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS: "0",
   });
   try {
     const handlers = new Map();
@@ -1908,6 +1821,7 @@ test("footer surfaces an over-limit retention floor", async () => {
     "CONTEXT_WINDOW_ROCKSDB",
     "CONTEXT_WINDOW_SOCKET",
     "CONTEXT_WINDOW_HARD_LIMIT_TOKENS",
+    "CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS",
     "CONTEXT_WINDOW_RETAIN_TURNS",
     "CONTEXT_WINDOW_ROTATION_TOKENS",
     "CONTEXT_WINDOW_ROTATION_TURNS",
@@ -1919,6 +1833,7 @@ test("footer surfaces an over-limit retention floor", async () => {
     CONTEXT_WINDOW_ROCKSDB: storePath,
     CONTEXT_WINDOW_SOCKET: socketPath,
     CONTEXT_WINDOW_HARD_LIMIT_TOKENS: "200",
+    CONTEXT_WINDOW_PI_COMPACTION_RESERVE_TOKENS: "0",
     CONTEXT_WINDOW_RETAIN_TURNS: "10",
     CONTEXT_WINDOW_ROTATION_TOKENS: "100",
     CONTEXT_WINDOW_ROTATION_TURNS: "20",

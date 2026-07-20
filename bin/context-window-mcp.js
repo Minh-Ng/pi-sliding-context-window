@@ -198,7 +198,7 @@ const tools = [
   },
   {
     name: "context_window_promote",
-    description: "Recall an archived document and return a promote-to-codebase checklist. Does not pin or edit the repo.",
+    description: "Recall an archived document and return a concrete promote-to-codebase draft (AGENTS.md/CLAUDE.md diff hunk or ADR file body) with provenance and a suggested target path. Does not pin or edit the repo.",
     inputSchema: {
       type: "object",
       properties: {
@@ -311,9 +311,13 @@ function callTool(name, args = {}) {
         documentId: document.documentId ?? document.id ?? args.id,
         kind: document.kind,
         createdAt: document.createdAt,
-        text: document.text,
+        // recalledText carries the raw decision text; text may be a rendered,
+        // JSON-framed evidence envelope on backends with a model-visible trust
+        // boundary (see recalledDocument in src/daemon-archive.js).
+        text: document.recalledText ?? document.text,
         subjectKey: document.subjectKey,
-      }));
+        sessionId: document.sessionId,
+      }, config.searchResultTokens * 2));
     }
     case "context_window_redact": {
       if (typeof archive.redact !== "function") {

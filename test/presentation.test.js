@@ -209,6 +209,39 @@ test("gather renders relevance band only for scored anchor evidence, not chronol
   assert.equal(Object.hasOwn(afterRecord, "relevanceBand"), false);
 });
 
+test("gather names an expired-match count and retention class without exposing content", () => {
+  const gather = {
+    status: "not-found",
+    mode: "lexical",
+    intent: "state",
+    anchorCount: 0,
+    candidateCount: 0,
+    truncated: false,
+    evidence: [],
+    expiredMatches: { count: 2, retentionClasses: ["conversation-source"] },
+  };
+  const output = formatGatherResults(gather, 500);
+  assert.match(output, /2 matching documents expired \(conversation-source retention 90d\)\./);
+});
+
+test("gather omits the expired-match notice when nothing expired", () => {
+  const gather = {
+    status: "not-found",
+    mode: "lexical",
+    intent: "state",
+    anchorCount: 0,
+    candidateCount: 0,
+    truncated: false,
+    evidence: [],
+    expiredMatches: { count: 0, retentionClasses: [] },
+  };
+  const withoutNotice = formatGatherResults(gather, 500);
+  const withoutField = formatGatherResults({ ...gather, expiredMatches: undefined }, 500);
+  assert.equal(withoutNotice.includes("expired"), false);
+  assert.equal(withoutField.includes("expired"), false);
+  assert.equal(withoutNotice, withoutField);
+});
+
 test("daemon-framed recall is never truncated into invalid JSON", () => {
   const recall = {
     status: "resolved",

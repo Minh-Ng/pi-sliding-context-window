@@ -946,6 +946,7 @@ export class DaemonArchive {
         truncated: false,
         hasMore: false,
         evidence: [],
+        expiredMatches: { count: 0, retentionClasses: [] },
       };
     }
     const intent = options.intent ?? "auto";
@@ -1000,6 +1001,7 @@ export class DaemonArchive {
       truncated: response.truncated,
       hasMore: response.hasMore,
       evidence,
+      expiredMatches: response.expiredMatches,
     };
   }
 

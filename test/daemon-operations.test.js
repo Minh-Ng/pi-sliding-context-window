@@ -7,6 +7,9 @@ import { MAX_STORE_ERROR_MESSAGE_LENGTH } from "../src/store-contract.js";
 import { createDaemonOperations, DaemonOperations } from "../src/daemon/operations.js";
 import { startStoreDaemon } from "../src/daemon/server.js";
 import { StoreClient } from "../src/store-client.js";
+import { IndexWorker } from "../src/rocksdb/indexer.js";
+import { createBm25IndexHandler } from "../src/rocksdb/index/bm25.js";
+import { createExactIndexHandler } from "../src/rocksdb/index/exact.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 import { admitDocument, manifestKeys } from "../src/rocksdb/manifests.js";
 import { outboxKeys } from "../src/rocksdb/outbox.js";
@@ -212,6 +215,89 @@ test("daemon protection authorizes the complete set before one atomic write", as
   }, { project });
   assert.equal(protectedResult.ownerId, "protect-owner");
   assert.equal(protectedResult.protectedDocuments, 1);
+});
+
+test("gather across an alias-widened readProjects union sums each project's expired-match count", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-gather-expired-merge-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+  const runtime = await createDaemonOperations(store, {});
+  t.after(() => runtime.close());
+
+  const canonical = "/workspace/gather-merge-canonical";
+  const alias = "/workspace/gather-merge-alias";
+  const marker = "GATHERMERGEEXPIREDANCHOR";
+
+  async function admitMarkerDocument(project, id, sessionId, createdAt) {
+    const sourceKey = `user:${id}`;
+    await admitDocument(store, {
+      idempotencyKey: `gather-merge:${id}`,
+      document: {
+        documentId: id,
+        version: 1,
+        sourceKey,
+        sessionId,
+        project,
+        kind: "turn",
+        createdAt,
+        text: `${marker} sensitive detail for ${id}.`,
+        metadata: { turnId: `turn-${id}` },
+        sourceMessageKeys: [sourceKey],
+      },
+      structuralMessages: [],
+      retentionClass: "conversation-source",
+    }, {
+      chunking: { maxChunkBytes: 128, minLineSplitBytes: 0 },
+      windows: { windowTokens: 16, overlapTokens: 2 },
+    });
+  }
+
+  await admitMarkerDocument(canonical, "canonical-doc", "canonical-session", 1_000);
+  await admitMarkerDocument(alias, "alias-doc", "alias-session", 2_000);
+
+  const worker = new IndexWorker(store, {
+    workerId: "gather-merge-worker",
+    maxDrainMs: 30_000,
+    handlers: [createExactIndexHandler(), createBm25IndexHandler()],
+  });
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  // Each aliased project's own document is tombstoned with no live
+  // replacement (the transient window the amnesia signal targets, before an
+  // index cleanup pass removes the stale postings entirely).
+  for (const documentId of ["canonical-doc", "alias-doc"]) {
+    await store.put([KEYSPACE.SUPERSESSION, documentId, 1], {
+      documentId,
+      documentVersion: 1,
+      status: "expired",
+      reason: "Retention class conversation-source expired.",
+      recordedAt: 3_000,
+    });
+  }
+
+  const gathered = await runtime.gather({
+    query: marker,
+    intent: "state",
+    scope: "project",
+    sessionIds: [],
+    limit: 3,
+    before: 0,
+    after: 0,
+    neighborhoodAnchors: 2,
+    maxEvidence: 8,
+    maxTokens: 2_000,
+    excludeVisibleSourceKeys: [],
+  }, { project: canonical, readProjects: [canonical, alias] });
+
+  assert.equal(gathered.status, "not-found");
+  assert.equal(gathered.evidence.length, 0);
+  assert.deepEqual(
+    gathered.expiredMatches,
+    { count: 2, retentionClasses: ["conversation-source"] },
+    "the merged expiredMatches count must sum both aliased projects' counts, not drop the field",
+  );
+  assert.equal(JSON.stringify(gathered).includes("sensitive detail"), false);
 });
 
 test("store.count scans the compact session-reference index across pages", async () => {

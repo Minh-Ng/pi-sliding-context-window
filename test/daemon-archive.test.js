@@ -955,6 +955,60 @@ test("searchDetailed forwards the store's expired-match summary instead of dropp
   }
 });
 
+test("gatherDetailed forwards the store's expired-match summary instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-gather-expired-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/gather-expired-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // gather.js already returns expiredMatches on store.gather (proven
+    // end-to-end in retrieval-gather.test.js); this test isolates the
+    // facade's own reshaping of that response, which previously rebuilt its
+    // return object with a fixed key set and silently dropped the field.
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.gather") return realRequest(operation, payload, options);
+      return {
+        status: "not-found",
+        mode: "lexical",
+        intent: payload.intent ?? "auto",
+        anchorCount: 0,
+        candidateCount: 0,
+        returnedTokens: 0,
+        truncated: false,
+        hasMore: false,
+        evidence: [],
+        expiredMatches: { count: 2, retentionClasses: ["conversation-source"] },
+      };
+    };
+    const gathered = archive.gatherDetailed("EXPIRED_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/gather-expired-wiring",
+      scope: "session",
+    });
+    assert.deepEqual(gathered.expiredMatches, { count: 2, retentionClasses: ["conversation-source"] });
+
+    const wrongProject = archive.gatherDetailed("EXPIRED_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      project: "/different/project",
+    });
+    assert.deepEqual(wrongProject.expiredMatches, { count: 0, retentionClasses: [] });
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("daemon facade gathers exact workflow successors in one bounded call", async () => {
   const paths = fixture("context-window-gather-facade-");
   const project = "/project/gather-facade";

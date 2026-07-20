@@ -737,6 +737,12 @@ export class DaemonOperations {
     let anchorCount = 0;
     let candidateCount = 0;
     let truncated = false;
+    // Each aliased project is a distinct namespace in the underlying store, so
+    // summing per-project counts (unlike the single-project exact/lexical
+    // dedup inside gather.js's own search call) never double-counts one
+    // document.
+    let expiredCount = 0;
+    const expiredRetentionClasses = new Set();
     for (const project of readProjects) {
       const result = await gatherArchive(this.store, payload, {
         project,
@@ -753,6 +759,10 @@ export class DaemonOperations {
       candidateCount += result.candidateCount;
       truncated ||= result.truncated;
       pooled.push(...result.evidence);
+      expiredCount += result.expiredMatches?.count ?? 0;
+      for (const retentionClass of result.expiredMatches?.retentionClasses ?? []) {
+        expiredRetentionClasses.add(retentionClass);
+      }
     }
     // Interleave by anchor rank then distance so a legacy top anchor outranks a
     // canonical deep neighbor, then fill the shared token budget in that order.
@@ -792,6 +802,10 @@ export class DaemonOperations {
       truncated,
       hasMore: truncated,
       evidence,
+      expiredMatches: Object.freeze({
+        count: expiredCount,
+        retentionClasses: Object.freeze([...expiredRetentionClasses].sort()),
+      }),
     });
   }
 

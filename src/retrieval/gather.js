@@ -149,6 +149,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       truncated: false,
       hasMore: false,
       evidence: [],
+      expiredMatches: search.expiredMatches,
     });
   }
 
@@ -262,5 +263,6 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     truncated,
     hasMore: truncated,
     evidence,
+    expiredMatches: search.expiredMatches,
   });
 }

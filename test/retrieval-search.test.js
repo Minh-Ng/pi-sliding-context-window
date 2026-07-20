@@ -1048,6 +1048,33 @@ test("search counts a tombstoned document with no live replacement as expired wi
   assert.equal(JSON.stringify(response).includes("sensitive prior detail"), false);
 });
 
+test("expiredMatches is not double-counted when the exact and lexical passes both independently detect the same tombstoned document", async (t) => {
+  const { store, worker } = await fixture(t, "search-expired-count-shared");
+  await admit(store, "expired-doc", "EXPIRED_COUNT_ANCHOR sensitive prior detail.");
+  await worker.drain();
+  await store.put([KEYSPACE.SUPERSESSION, "expired-doc", 1], {
+    documentId: "expired-doc",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+
+  // "EXPIRED_COUNT_ANCHOR" classifies as an exact-looking whole query
+  // (plan.anchors.length > 0), so lookupExact runs first; since its only
+  // match is tombstoned, exactResolved stays false and searchBm25 also runs
+  // over the same tokenized query and independently finds the same
+  // document. Both passes share one expiredRetentionClasses map, so the
+  // aggregate count must stay 1, not 2.
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("EXPIRED_COUNT_ANCHOR")),
+    { now: 3_000 },
+  );
+  assert.equal(response.status, "not-found");
+  assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+});
+
 test("a version-bump supersession is not counted among expired matches", async (t) => {
   const { store, worker } = await fixture(t, "search-superseded-not-expired");
   await admit(store, "superseded-doc", "SUPERSEDED_ONLY_ANCHOR original wording.");

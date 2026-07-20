@@ -790,6 +790,10 @@ export class Archive {
       truncated,
       hasMore: truncated,
       evidence: selected,
+      // Always zero on this backend (see searchDetailed above); carried
+      // through so presentation's expired-match notice behaves the same
+      // across backends instead of silently omitting the field here.
+      expiredMatches: search.expiredMatches,
     };
   }
 

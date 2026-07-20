@@ -70,8 +70,16 @@ export const BM25_FIELD_WEIGHTS = Object.freeze({
   neutral: 1,
 });
 const BM25_WORD = /[\p{L}\p{M}\p{N}_]+/gu;
-const EMPTY_EXPIRED_MATCHES = Object.freeze({ count: 0, retentionClasses: Object.freeze([]) });
 const MAX_BUFFERED_CROSS_SEGMENT_CODE_POINTS = 1_024;
+
+/** Summarize a retention-class-by-documentId map into the public count/class
+ * shape; never includes expired content, only a count and its class(es). */
+function summarizeExpiredMatches(expiredRetentionClasses) {
+  return Object.freeze({
+    count: expiredRetentionClasses.size,
+    retentionClasses: Object.freeze([...new Set(expiredRetentionClasses.values())].sort()),
+  });
+}
 
 function identifier(value, label) {
   if (typeof value !== "string" || value.length === 0) {
@@ -1857,6 +1865,12 @@ export async function searchBm25(view, request = {}, options = {}) {
       ...searchRequest.literalTerms,
     ]),
   ];
+  // A caller composing exact and lexical lookups for one request (see
+  // collectCandidates in retrieval/search.js) may supply a shared map so the
+  // same tombstoned document is never double-counted across both indexes.
+  const expiredRetentionClasses = options.expiredRetentionClasses instanceof Map
+    ? options.expiredRetentionClasses
+    : new Map();
   if (queryTerms.length === 0) {
     return Object.freeze({ generation: publishedGeneration, results: Object.freeze([]), work: Object.freeze({
       postingRecordsRead: 0,
@@ -1865,7 +1879,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks: 0,
       truncated: false,
       termsConsidered: Object.freeze([]),
-      expiredMatches: EMPTY_EXPIRED_MATCHES,
+      expiredMatches: summarizeExpiredMatches(expiredRetentionClasses),
     }) });
   }
   const statistics = await readBm25Statistics(view, {
@@ -1881,7 +1895,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks: 0,
       truncated: false,
       termsConsidered: Object.freeze([]),
-      expiredMatches: EMPTY_EXPIRED_MATCHES,
+      expiredMatches: summarizeExpiredMatches(expiredRetentionClasses),
     }) });
   }
   const activeTerms = queryTerms
@@ -1897,10 +1911,10 @@ export async function searchBm25(view, request = {}, options = {}) {
   let supersessionChecks = 0;
   let truncated = false;
   const supersession = new Map();
-  // Retention class of each matched-but-retired document, keyed by
-  // documentId so the same expired document is never double-counted across
-  // its stale windows/terms or a later retired-without-manifest hit below.
-  const expiredRetentionClasses = new Map();
+  // expiredRetentionClasses (declared above, possibly shared with a sibling
+  // exact lookup) is keyed by documentId so the same expired document is
+  // never double-counted across its stale windows/terms or a later
+  // retired-without-manifest hit below.
 
   for (const term of activeTerms) {
     const remaining = normalized.maxPostingRecords - postingRecordsRead;
@@ -2112,10 +2126,7 @@ export async function searchBm25(view, request = {}, options = {}) {
       supersessionChecks,
       truncated,
       termsConsidered: Object.freeze(activeTerms),
-      expiredMatches: Object.freeze({
-        count: expiredRetentionClasses.size,
-        retentionClasses: Object.freeze([...new Set(expiredRetentionClasses.values())].sort()),
-      }),
+      expiredMatches: summarizeExpiredMatches(expiredRetentionClasses),
     }),
   });
 }

@@ -591,8 +591,6 @@ function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, s
   return "lexical";
 }
 
-const EMPTY_EXPIRED_MATCHES = Object.freeze({ count: 0, retentionClasses: Object.freeze([]) });
-
 async function collectCandidates(view, request, options) {
   const generation = await publishedGeneration(view);
   const plan = planExactQuery(request.query);
@@ -602,8 +600,11 @@ async function collectCandidates(view, request, options) {
   let lexicalAttempted = false;
   let structuralAttempted = false;
   let structuralStatus;
-  // Bounded by what the lexical pass already touched; never a separate scan.
-  let expiredMatches = EMPTY_EXPIRED_MATCHES;
+  // Shared by the exact and lexical passes below so a document tombstoned
+  // without a live replacement is counted once even when both indexes
+  // independently retain a stale posting for it; bounded by what those
+  // passes already scan, never a separate lookup.
+  const expiredRetentionClasses = new Map();
 
   if (plan.anchors.length > 0) {
     exactAttempted = true;
@@ -615,6 +616,7 @@ async function collectCandidates(view, request, options) {
       excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
       limit: candidateLimit,
       generation,
+      expiredRetentionClasses,
       ...widenedSnippetOptions("exact", options.exact ?? {}, request, options),
     });
     candidates.push(...exactCandidates(exact));
@@ -634,10 +636,13 @@ async function collectCandidates(view, request, options) {
       excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
       limit: candidateLimit,
       ...(generation > 0 ? { generation } : {}),
-    }, widenedSnippetOptions("bm25", options.bm25 ?? {}, request, options));
+    }, { ...widenedSnippetOptions("bm25", options.bm25 ?? {}, request, options), expiredRetentionClasses });
     candidates.push(...lexicalCandidates(lexical));
-    expiredMatches = lexical.work.expiredMatches;
   }
+  const expiredMatches = Object.freeze({
+    count: expiredRetentionClasses.size,
+    retentionClasses: Object.freeze([...new Set(expiredRetentionClasses.values())].sort()),
+  });
 
   if (request.relation !== null) {
     structuralAttempted = true;

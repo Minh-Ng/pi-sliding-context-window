@@ -593,6 +593,13 @@ const gatherResponse = object({
   truncated: boolean(),
   hasMore: boolean(),
   evidence: array(gatheredEvidence, { maxItems: 24 }),
+  // Matching documents that retention already expired/tombstoned without a
+  // live replacement, surfaced from gather's internal search call so an
+  // agent learns evidence existed and aged out instead of concluding a topic
+  // was never discussed. Never includes expired content itself. Optional
+  // (not in the required list below) so older daemons/clients that predate
+  // this field do not fail validation.
+  expiredMatches: expiredMatchesSummary,
 }, [
   "status",
   "mode",

@@ -1,9 +1,10 @@
 import { encodeKey, KEYSPACE } from "../keys.js";
 import { readDocumentRange } from "../document-range.js";
-import { manifestKeys } from "../manifests.js";
+import { manifestKeys, retiredDocumentStatus } from "../manifests.js";
 import { windowForByteRange } from "../windows.js";
 import { semanticIdentifier } from "../../semantic-identifiers.js";
 import { assertVisibleSourceKeys } from "../../store-contract.js";
+import { DEFAULT_RETENTION_CLASS_BY_KIND } from "../../daemon/retention-policy.js";
 import {
   MAX_EXACT_INDEX_ANCHORS,
   MAX_EXACT_POSTING_MUTATIONS,
@@ -77,6 +78,12 @@ function identifier(value, label) {
 
 function compareText(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** Best-effort retention-class label for an honesty count only; the manifest
+ * that recorded the real class is exactly what already went missing. */
+function fallbackRetentionClass(kind) {
+  return DEFAULT_RETENTION_CLASS_BY_KIND[kind] ?? "conversation-source";
 }
 
 /** Normalize one exact value without discarding punctuation or identifier boundaries. */
@@ -781,15 +788,44 @@ export function exactSnippet(
   return `${prefix}${bytes.subarray(start, end).toString("utf8")}${suffix}`;
 }
 
-async function materializeResult(store, candidate, plan, options) {
+async function materializeResult(store, candidate, plan, options, expiredRetentionClasses) {
   const posting = candidate.posting;
-  if (store.scan([
+  // Same bounded scan the prior existence check already performed; reading
+  // its payload adds no extra I/O, only a status inspection.
+  const marker = store.scan([
     KEYSPACE.SUPERSESSION,
     posting.documentId,
     posting.documentVersion,
-  ], { limit: 1 }).length > 0) return undefined;
+  ], { limit: 1 })[0]?.payload;
+  if (marker !== undefined) {
+    // A tombstone with no live replacement is the silent-amnesia case; a
+    // version-bump marker always carries "superseded" and must not inflate
+    // this count, since that document still resolves live under a newer version.
+    if (marker.status === "expired" && !expiredRetentionClasses.has(posting.documentId)) {
+      const manifest = await store.get(manifestKeys.document(posting.documentId, posting.documentVersion));
+      expiredRetentionClasses.set(
+        posting.documentId,
+        manifest?.retentionClass ?? fallbackRetentionClass(posting.documentKind),
+      );
+    }
+    return undefined;
+  }
   const manifest = await store.get(manifestKeys.document(posting.documentId, posting.documentVersion));
-  if (manifest === undefined) return undefined;
+  if (manifest === undefined) {
+    // Retention may have removed canonical source and this document's own
+    // tombstone metadata before an index cleanup pass swept this stale
+    // posting; the compact ledger is the fallback source of truth.
+    if (!expiredRetentionClasses.has(posting.documentId)) {
+      const status = retiredDocumentStatus(
+        await store.get(manifestKeys.documentHistory(posting.documentId)),
+        posting.documentVersion,
+      )?.status;
+      if (status === "expired") {
+        expiredRetentionClasses.set(posting.documentId, fallbackRetentionClass(posting.documentKind));
+      }
+    }
+    return undefined;
+  }
   const current = store.scan([KEYSPACE.DOCUMENT, posting.documentId], { reverse: true, limit: 1 })[0]?.payload;
   if (current === undefined || current.version !== posting.documentVersion) return undefined;
   const match = candidate.bestMatch;
@@ -926,6 +962,13 @@ export async function lookupExact(store, request) {
     }
   }
 
+  // A caller composing exact and lexical lookups for one request (see
+  // collectCandidates in retrieval/search.js) may supply a shared map so the
+  // same tombstoned document is never double-counted across both indexes.
+  const expiredRetentionClasses = request?.expiredRetentionClasses instanceof Map
+    ? request.expiredRetentionClasses
+    : new Map();
+
   const ranked = [...candidates.values()].sort((left, right) =>
     candidateScore(right, plan.anchors.length) - candidateScore(left, plan.anchors.length)
       || right.queryEvidence.size - left.queryEvidence.size
@@ -934,7 +977,7 @@ export async function lookupExact(store, request) {
       || compareText(left.posting.documentId, right.posting.documentId));
   const results = [];
   for (const candidate of ranked) {
-    const result = await materializeResult(store, candidate, plan, options);
+    const result = await materializeResult(store, candidate, plan, options, expiredRetentionClasses);
     if (result !== undefined) results.push(result);
     if (results.length === options.limit) break;
   }
@@ -959,6 +1002,13 @@ export async function lookupExact(store, request) {
       workLimit: options.workLimit,
       bucketLimit: options.bucketLimit,
       caseFallbackUsed: results.some(({ explanation }) => explanation.caseMode === "folded"),
+      // Matching documents excluded above by the supersession/manifest checks
+      // that retention already tombstoned without a live replacement; never
+      // includes expired content, only a count and its retention class(es).
+      expiredMatches: Object.freeze({
+        count: expiredRetentionClasses.size,
+        retentionClasses: Object.freeze([...new Set(expiredRetentionClasses.values())].sort()),
+      }),
     }),
   });
 }

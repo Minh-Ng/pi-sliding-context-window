@@ -7,6 +7,7 @@ import { RETRIEVAL_REGRESSION_FIXTURE } from "../eval/retrieval/fixtures.js";
 import { runRetrievalEvaluation } from "../eval/retrieval/runner.js";
 import { RETRIEVAL_BACKEND_API_VERSION } from "../eval/retrieval/schema.js";
 import { scoreRetrievalSuite } from "../eval/retrieval/scoring.js";
+import { createBm25IndexHandler, searchBm25 } from "../src/rocksdb/index/bm25.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
 import {
   DEFAULT_EXACT_SNIPPET_BYTES,
@@ -299,6 +300,96 @@ test("lookup honors scope, visibility, newest buckets, work caps, and case fallb
   assert.equal(bounded.work.bucketsVisited, 1);
   assert.equal(bounded.work.truncated, true);
   assert.deepEqual(bounded.results.map(({ documentId }) => documentId), ["other-session"]);
+});
+
+test("exact lookup counts a tombstoned document with no live replacement as expired without exposing its content", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-expired-count"));
+  t.after(() => store.close());
+  await admit(store, document("expired-doc", "EXPIRED_EXACT_ANCHOR sensitive prior detail."));
+  await indexPending(store);
+  await store.put([KEYSPACE.SUPERSESSION, "expired-doc", 1], {
+    documentId: "expired-doc",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+
+  const result = await lookupExact(store, {
+    query: "EXPIRED_EXACT_ANCHOR",
+    project: "/workspace/exact",
+    scope: "session",
+    sessionId: "session-main",
+    limit: 3,
+  });
+  assert.equal(result.results.length, 0);
+  assert.deepEqual(result.work.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+  assert.equal(JSON.stringify(result).includes("sensitive prior detail"), false);
+});
+
+test("a version-bump supersession is not counted among exact expired matches", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-superseded-not-expired"));
+  t.after(() => store.close());
+  await admit(store, document("superseded-doc", "SUPERSEDED_EXACT_ANCHOR original wording."));
+  await indexPending(store);
+  // No further drain: the version-bump supersession marker on v1 is already
+  // durable from admitDocument itself, but v1's own postings have not been
+  // through an index cleanup pass yet, so the exact candidate loop must
+  // classify the marker itself.
+  await admit(store, { ...document("superseded-doc", "Replacement text without the old anchor."), version: 2 });
+
+  const result = await lookupExact(store, {
+    query: "SUPERSEDED_EXACT_ANCHOR",
+    project: "/workspace/exact",
+    scope: "session",
+    sessionId: "session-main",
+    limit: 3,
+  });
+  assert.equal(result.results.length, 0);
+  assert.deepEqual(result.work.expiredMatches, { count: 0, retentionClasses: [] });
+});
+
+test("exact and lexical passes sharing one map do not double-count the same expired document", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-shared-dedup"));
+  t.after(() => store.close());
+  await admit(store, document("shared-expired", "SHARED_EXPIRED_ANCHOR sensitive shared detail."));
+  const worker = new IndexWorker(store, {
+    workerId: "worker:exact-shared-dedup",
+    maxDrainMs: 30_000,
+    handlers: [createExactIndexHandler(), createBm25IndexHandler()],
+  });
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+  await store.put([KEYSPACE.SUPERSESSION, "shared-expired", 1], {
+    documentId: "shared-expired",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+
+  const expiredRetentionClasses = new Map();
+  const exact = await lookupExact(store, {
+    query: "SHARED_EXPIRED_ANCHOR",
+    project: "/workspace/exact",
+    scope: "session",
+    sessionId: "session-main",
+    limit: 3,
+    expiredRetentionClasses,
+  });
+  const lexical = await searchBm25(store, {
+    query: "SHARED_EXPIRED_ANCHOR",
+    project: "/workspace/exact",
+    scope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+    limit: 3,
+  }, { expiredRetentionClasses });
+  assert.equal(exact.results.length, 0);
+  assert.equal(lexical.results.length, 0);
+  assert.deepEqual({ count: expiredRetentionClasses.size, retentionClasses: [...new Set(expiredRetentionClasses.values())] }, {
+    count: 1,
+    retentionClasses: ["conversation-source"],
+  });
 });
 
 test("exact snippets stay UTF-8 safe and retain the match", () => {

@@ -6,6 +6,7 @@ import test from "node:test";
 import { createBm25IndexHandler } from "../src/rocksdb/index/bm25.js";
 import { createExactIndexHandler } from "../src/rocksdb/index/exact.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
+import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 import { gatherArchive } from "../src/retrieval/gather.js";
@@ -202,4 +203,52 @@ test("gather carries a search-ranked score only on anchor evidence, never on tra
   assert.equal(anchor.retrievalMode, "lexical");
   assert.equal(Object.hasOwn(after, "score"), false);
   assert.equal(Object.hasOwn(after, "retrievalMode"), false);
+});
+
+test("gather surfaces a tombstoned document with no live replacement as an expired-match count, never its content", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("expired-doc", "GATHER_EXPIRED_ANCHOR sensitive prior detail.", 100);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+  await store.put([KEYSPACE.SUPERSESSION, "expired-doc", 1], {
+    documentId: "expired-doc",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "GATHER_EXPIRED_ANCHOR",
+    scope: "session",
+    sessionIds: ["session-main"],
+  }), {
+    project: PROJECT,
+    now: 3_000,
+  });
+
+  assert.equal(gather.status, "not-found");
+  assert.equal(gather.evidence.length, 0);
+  assert.deepEqual(gather.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+  assert.equal(JSON.stringify(gather).includes("sensitive prior detail"), false);
+});
+
+test("gather omits an expiredMatches count when nothing expired", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("only-doc", "GATHER_LIVE_ANCHOR still current detail.", 100);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "GATHER_LIVE_ANCHOR",
+    scope: "session",
+    sessionIds: ["session-main"],
+    limit: 1,
+    neighborhoodAnchors: 1,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.equal(gather.status, "resolved");
+  assert.deepEqual(gather.expiredMatches, { count: 0, retentionClasses: [] });
 });

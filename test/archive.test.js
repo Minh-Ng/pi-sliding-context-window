@@ -75,6 +75,9 @@ test("SQLite gather expands exact workflow successors without crossing sessions"
       "verify",
     ]);
     assert.doesNotMatch(gathered.evidence.map(({ document }) => document.text).join("\n"), /personal identity/u);
+    // Same zero-value parity as searchDetailed above: this backend has no
+    // retention-expiry index, but the field must be present, not dropped.
+    assert.deepEqual(gathered.expiredMatches, { count: 0, retentionClasses: [] });
   } finally {
     archive.close();
     rmSync(directory, { recursive: true, force: true });

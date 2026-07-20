@@ -26,6 +26,7 @@ import {
   searchArchive,
 } from "../src/retrieval/search.js";
 import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
+import { LocalReranker } from "../src/semantic/reranker.js";
 import { perEvidenceSnippetBudget } from "../src/presentation.js";
 import { DEFAULT_EXACT_SNIPPET_BYTES, MAX_EXACT_SNIPPET_BYTES } from "../src/rocksdb/index/exact.js";
 import { DEFAULT_BM25_SEARCH_LIMITS, MAX_BM25_SNIPPET_CHARACTERS } from "../src/rocksdb/index/bm25.js";
@@ -1116,6 +1117,227 @@ test("a manifest missing with no tombstone marker yet is classified expired from
   assert.equal(response.status, "not-found");
   assert.equal(response.results.length, 0);
   assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+});
+
+// Cross-encoder rerank (deferred task #2): reorders the lexical/semantic tier
+// only, gated behind options.reranker (never set by preflightArchive's
+// internal searchArchive call, so automatic preflight can never reach it).
+function fakeRerankClient(scoreOf) {
+  const calls = [];
+  return {
+    calls,
+    metadata: Object.freeze({ id: "fake", revision: "test" }),
+    async score(query, passages) {
+      calls.push({ query, passages });
+      return passages.map((passage) => scoreOf(passage));
+    },
+    async close() {},
+  };
+}
+
+function throwingRerankClient() {
+  return {
+    metadata: Object.freeze({ id: "fake", revision: "test" }),
+    async score() {
+      throw new Error("pinned reranker model is not installed");
+    },
+    async close() {},
+  };
+}
+
+// Wide windows/chunks (unlike this file's tight default admit() sizing) keep
+// each short fixture document inside one window, so its whole sentence --
+// including the RERANK_TARGET marker near the end -- survives into the
+// match-centered BM25 snippet the reranker actually scores.
+const RERANK_FIXTURE_SIZING = { maxChunkBytes: 512, windowTokens: 64 };
+
+async function seedRerankFixture(store) {
+  // Five lexically dense distractors outrank the real target under plain
+  // BM25 (each repeats the query vocabulary several times); the target uses
+  // every query term only once inside a longer explanatory sentence, so it
+  // lands outside the fused top-3 at baseline -- a lexical top-3 miss (this
+  // hardness is asserted, not assumed, in the test below).
+  await admit(store, "distractor-1", "widget latency spike widget latency spike widget latency spike widget latency spike filler text", RERANK_FIXTURE_SIZING);
+  await admit(store, "distractor-2", "root cause root cause root cause widget latency spike analysis notes filed", { ...RERANK_FIXTURE_SIZING, createdAt: 200 });
+  await admit(store, "distractor-3", "widget latency widget latency widget latency root cause root cause root cause more filler text", { ...RERANK_FIXTURE_SIZING, createdAt: 210 });
+  await admit(store, "distractor-4", "widget latency spike root cause widget latency spike root cause filler more text again", { ...RERANK_FIXTURE_SIZING, createdAt: 220 });
+  await admit(store, "distractor-5", "root cause widget latency spike root cause widget latency spike extra filler words here too", { ...RERANK_FIXTURE_SIZING, createdAt: 230 });
+  await admit(store, "target", "Decision: the widget latency spike root cause was a retry storm; RERANK_TARGET marks the fix.", { ...RERANK_FIXTURE_SIZING, createdAt: 300 });
+}
+
+test("cross-encoder rerank promotes a lexical top-3 miss to rank 1 without changing presented scores", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-promote");
+  await seedRerankFixture(store);
+  await worker.drain();
+  const query = "widget latency spike root cause";
+
+  const baseline = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 6 })), { now: 1_000 });
+  assert.equal(baseline.mode, "lexical");
+  const baselineRank = baseline.results.findIndex(({ documentId }) => documentId === "target");
+  assert.ok(baselineRank >= 3, "fixture precondition: BM25 alone must rank the target outside the top-3");
+  const baselineTargetScore = baseline.results[baselineRank].score;
+
+  const client = fakeRerankClient((passage) => (passage.includes("RERANK_TARGET") ? 100 : 0));
+  const reranker = new LocalReranker({ enabled: true, client });
+  const reranked = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 6 })), {
+    now: 1_001,
+    reranker,
+  });
+  assert.equal(reranked.results[0].documentId, "target", "rerank promotes the true target above the BM25 distractors");
+  assert.equal(reranked.results[0].reranked, true);
+  // Rerank changes order, never the presented per-mode calibrated score.
+  const rerankedTargetScore = reranked.results.find(({ documentId }) => documentId === "target").score;
+  assert.equal(rerankedTargetScore, baselineTargetScore);
+  // Every candidate in the reranked window carries provenance; there is no
+  // result silently reordered without the flag.
+  for (const result of reranked.results) {
+    assert.equal(result.retrievalMode, "lexical");
+    assert.equal(result.reranked, true);
+  }
+});
+
+// A fused rank deep enough (past the un-widened, limit-scaled candidate pool
+// -- min(100, max(limit, limit*3)), i.e. 9 candidates at the default
+// searchResults limit of 3) that only actually widening the pool up to the
+// reranker's own candidateWindow (default 40, matching
+// eval/retrieval/reranker-verdict.json's 40-candidate pools) lets the
+// cross-encoder ever see it. Each distractor repeats the query vocabulary a
+// strictly decreasing number of times so BM25 ranks them 1..N in order, with
+// "target" landing dead last: a single mention of each term inside a longer
+// explanatory sentence, exactly like seedRerankFixture's lone target.
+async function seedDeepRerankFixture(store, distractorCount) {
+  for (let index = 1; index <= distractorCount; index += 1) {
+    const repeats = distractorCount - index + 2;
+    const phrase = `${"widget latency spike root cause ".repeat(repeats)}filler variant ${index} text tokens`;
+    await admit(store, `distractor-${index}`, phrase, { ...RERANK_FIXTURE_SIZING, createdAt: 200 + index * 10 });
+  }
+  await admit(
+    store,
+    "target",
+    "Decision: the widget latency spike root cause was a retry storm; RERANK_TARGET marks the fix.",
+    { ...RERANK_FIXTURE_SIZING, createdAt: 200 + (distractorCount + 1) * 10 },
+  );
+}
+
+test("cross-encoder rerank widens the fused candidate pool to the reranker's window, reaching a candidate past the small per-request pool", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-deepen-pool");
+  const distractorCount = 11;
+  await seedDeepRerankFixture(store, distractorCount);
+  await worker.drain();
+  const query = "widget latency spike root cause";
+
+  const wide = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 20 })), { now: 1_000 });
+  const wideRank = wide.results.findIndex(({ documentId }) => documentId === "target");
+  assert.equal(
+    wideRank,
+    distractorCount,
+    "fixture precondition: target must be the single lowest-fused-rank candidate, one past every distractor",
+  );
+  assert.ok(
+    wideRank >= 9,
+    "fixture precondition: target's fused rank must fall outside the un-widened 9-candidate pool at the default limit=3",
+  );
+
+  const client = fakeRerankClient((passage) => (passage.includes("RERANK_TARGET") ? 100 : 0));
+  const reranker = new LocalReranker({ enabled: true, client });
+  const reranked = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 3 })), {
+    now: 1_001,
+    reranker,
+  });
+  assert.equal(
+    reranked.results[0]?.documentId,
+    "target",
+    "the reranker's candidate window must reach a fused-rank candidate beyond the small per-request pool",
+  );
+  assert.equal(reranked.results[0]?.reranked, true);
+});
+
+test("cross-encoder rerank degrades silently to the pre-rerank fused order when the model is unavailable", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-degraded");
+  await seedRerankFixture(store);
+  await worker.drain();
+  const query = "widget latency spike root cause";
+
+  const baseline = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 6 })), { now: 1_000 });
+
+  const recorded = [];
+  const reranker = new LocalReranker({
+    enabled: true,
+    client: throwingRerankClient(),
+    recordError: (error) => recorded.push(error),
+  });
+  const degraded = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 6 })), {
+    now: 1_001,
+    reranker,
+  });
+  assert.deepEqual(
+    degraded.results.map(({ documentId }) => documentId),
+    baseline.results.map(({ documentId }) => documentId),
+    "an unavailable reranker must never change the fused order",
+  );
+  assert.deepEqual(
+    degraded.results.map(({ score }) => score),
+    baseline.results.map(({ score }) => score),
+  );
+  assert.equal(degraded.results.every((result) => result.reranked === undefined), true);
+  assert.equal(recorded.length, 1);
+});
+
+test("cross-encoder rerank never runs when options.reranker is absent (the automatic preflight shape)", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-absent");
+  await seedRerankFixture(store);
+  await worker.drain();
+  const query = "widget latency spike root cause";
+
+  const withoutReranker = await searchArchive(store, withoutUndefined(searchRequest(query, { limit: 6 })), { now: 1_000 });
+  assert.equal(withoutReranker.results.every((result) => result.reranked === undefined), true);
+});
+
+test("expiredMatches is unaffected by an enabled cross-encoder reranker", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-expired");
+  await admit(store, "expired-doc", "EXPIRED_RERANK_ANCHOR sensitive prior detail.");
+  await worker.drain();
+  await store.put([KEYSPACE.SUPERSESSION, "expired-doc", 1], {
+    documentId: "expired-doc",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Retention class conversation-source expired.",
+    recordedAt: 2_000,
+  });
+  const reranker = new LocalReranker({
+    enabled: true,
+    client: fakeRerankClient(() => 1),
+  });
+  const response = await searchArchive(store, withoutUndefined(searchRequest("EXPIRED_RERANK_ANCHOR")), {
+    now: 3_000,
+    reranker,
+  });
+  assert.equal(response.status, "not-found");
+  assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+});
+
+test("automatic preflight never invokes an injected reranker, even one that would otherwise throw", async (t) => {
+  const { store, worker } = await fixture(t, "search-rerank-preflight-untouched");
+  await seedRerankFixture(store);
+  await worker.drain();
+  const poisoned = {
+    async rerank() {
+      throw new Error("preflight must never call the reranker");
+    },
+  };
+  // preflightArchive's own options shape has no `reranker` field in its
+  // contract; this proves that even if a caller mistakenly attaches one, its
+  // internal searchArchive call never forwards it, so frozen hints stay
+  // byte-identical regardless of what a caller passes.
+  const hint = await preflightArchive(store, preflightRequest(
+    "user:rerank-preflight",
+    "widget latency spike root cause",
+  ), {
+    now: 1_000,
+    epochId: "epoch:rerank-preflight",
+    reranker: poisoned,
+  });
+  assert.ok(hint);
 });
 
 // System-side RM3/Bo1 query expansion fixture: "weak" matches only one of

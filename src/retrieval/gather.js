@@ -244,7 +244,11 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       // score (chronological adjacency, not a ranked hit); only the anchor's
       // real search-ranked score is a relevance signal worth surfacing.
       ...(item.relation === "anchor"
-        ? { score: item.candidate.score, retrievalMode: item.candidate.retrievalMode }
+        ? {
+          score: item.candidate.score,
+          retrievalMode: item.candidate.retrievalMode,
+          ...(item.candidate.reranked === true ? { reranked: true } : {}),
+        }
         : {}),
     });
   }

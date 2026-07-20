@@ -7,6 +7,11 @@ import { defaultDaemonLogPath } from "../src/daemon/log-file.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import { SEMANTIC_TIER_ALIASES, semanticModelProfile } from "../src/semantic/model-catalog.js";
 import {
+  DEFAULT_RERANKER_CANDIDATE_WINDOW,
+  DEFAULT_RERANKER_MODEL,
+  DEFAULT_RERANKER_MODEL_REVISION,
+} from "../src/semantic/reranker-model.js";
+import {
   DaemonWatchdog,
   DEFAULT_SLOW_REQUEST_MS,
   DEFAULT_STALL_THRESHOLD_MS,
@@ -40,8 +45,12 @@ const VALUE_OPTIONS = new Set([
   "--semantic-candidates",
   "--semantic-dimensions",
   "--semantic-pooling",
+  "--reranker-model",
+  "--reranker-revision",
+  "--reranker-cache",
+  "--reranker-candidates",
 ]);
-const FLAG_OPTIONS = new Set(["--allow-shutdown", "--semantic", "--help"]);
+const FLAG_OPTIONS = new Set(["--allow-shutdown", "--semantic", "--reranker", "--help"]);
 
 function usage() {
   return [
@@ -68,6 +77,11 @@ function usage() {
     "  --semantic-candidates N            ANN candidates before filtering",
     "  --semantic-dimensions N            Override the model's catalog dimensions",
     "  --semantic-pooling MODE            Override the model's catalog pooling strategy",
+    "  --reranker                         Enable cross-encoder rerank for explicit search/gather",
+    "  --reranker-model ID                Local cross-encoder reranker model id",
+    "  --reranker-revision REVISION       Pinned reranker model revision",
+    "  --reranker-cache PATH              Library-managed local reranker model cache",
+    "  --reranker-candidates N            Fused candidates reranked per query",
     "  --help                             Show this help",
   ].join("\n");
 }
@@ -188,6 +202,21 @@ const semantic = {
   ...(semanticDimensions === undefined ? {} : { dimensions: Number(semanticDimensions) }),
   ...(semanticPooling === undefined ? {} : { pooling: semanticPooling }),
 };
+const reranker = {
+  enabled: parsed.flags.has("--reranker")
+    || ["1", "true", "yes", "on"].includes(String(process.env.CONTEXT_WINDOW_RERANKER_ENABLED).toLowerCase()),
+  model: argument("--reranker-model", process.env.CONTEXT_WINDOW_RERANKER_MODEL ?? DEFAULT_RERANKER_MODEL),
+  revision: argument(
+    "--reranker-revision",
+    process.env.CONTEXT_WINDOW_RERANKER_MODEL_REVISION ?? DEFAULT_RERANKER_MODEL_REVISION,
+  ),
+  cachePath: resolve(argument("--reranker-cache", process.env.CONTEXT_WINDOW_RERANKER_MODEL_CACHE
+    ?? ".context-window/reranker-models")),
+  candidateWindow: Number(argument(
+    "--reranker-candidates",
+    process.env.CONTEXT_WINDOW_RERANKER_CANDIDATES ?? DEFAULT_RERANKER_CANDIDATE_WINDOW,
+  )),
+};
 
 let daemon;
 let runtime;
@@ -261,7 +290,7 @@ try {
     createStore: async (path) => {
       const store = await RocksStore.open(path);
       try {
-        runtime = await createDaemonOperations(store, { maintenance, semantic });
+        runtime = await createDaemonOperations(store, { maintenance, semantic, reranker });
         return store;
       } catch (error) {
         store.close();

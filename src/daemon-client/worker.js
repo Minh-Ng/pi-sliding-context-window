@@ -13,6 +13,7 @@ import { workerData } from "node:worker_threads";
 import { StoreClient } from "../store/store-client.js";
 import { ensureSecureSocketDirectory } from "../daemon/paths.js";
 import { semanticLaunchArguments } from "./semantic-launch-arguments.js";
+import { rerankerLaunchArguments } from "./reranker-launch-arguments.js";
 import {
   appendDaemonLog,
   defaultDaemonLaunchLogPath,
@@ -236,6 +237,7 @@ function launchDaemon() {
   // The adapter host may itself be Bun. RocksDB support is intentionally tied
   // to the package's declared Node runtime, so never inherit the host binary.
   const semanticArguments = semanticLaunchArguments(options.semantic);
+  const rerankerArguments = rerankerLaunchArguments(options.reranker);
   const logPath = options.daemonLogPath ?? defaultDaemonLogPath(options.storePath);
   const child = spawn(nodeExecutable, [
     daemonPath,
@@ -247,6 +249,7 @@ function launchDaemon() {
     logPath,
     "--allow-shutdown",
     ...semanticArguments,
+    ...rerankerArguments,
   ], {
     // Worker.terminate() tears down subprocesses that remain in the worker's
     // process session on some Node/platform combinations. The store daemon

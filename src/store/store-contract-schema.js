@@ -417,6 +417,12 @@ const searchResult = object({
   historical: boolean(),
   superseded: boolean(),
   nearDuplicates: nonNegativeInteger,
+  // Cross-encoder rerank provenance (deferred task #2): present only when
+  // this result was actually reordered by the local reranker, mirroring the
+  // expandedTerms provenance pattern above. Absent on every automatic
+  // preflight result and on any explicit result the reranker left untouched
+  // (disabled, unavailable, or outside its candidate window).
+  reranked: boolean(),
   locator: identifier,
   source: SOURCE_REFERENCE_SCHEMA,
 }, [
@@ -553,6 +559,10 @@ const gatheredEvidence = object({
   // before/after neighbors are context, not ranked hits, so this stays optional.
   score: normalizedScore,
   retrievalMode: enumeration(["exact", "lexical", "semantic", "structural"]),
+  // Same cross-encoder rerank provenance as store.search's searchResult,
+  // carried onto anchor evidence only (see the score/retrievalMode comment
+  // above; before/after neighbors are never reranked).
+  reranked: boolean(),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({
@@ -1002,6 +1012,13 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
         revision: identifier,
         dimensions: nonNegativeInteger,
         pooling: identifier,
+      }),
+      reranker: optionalObject({
+        enabled: boolean(),
+        available: boolean(),
+        model: identifier,
+        revision: identifier,
+        candidateWindow: nonNegativeInteger,
       }),
       retention: retentionStats,
       rocksdb: metadata,

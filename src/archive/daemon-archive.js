@@ -486,6 +486,7 @@ export class DaemonArchive {
     retentionPolicy,
     migrationSourcePath,
     semantic,
+    reranker,
     daemonLogPath,
     daemonLaunchLogPath,
     autoUpgradeDaemon = true,
@@ -527,6 +528,7 @@ export class DaemonArchive {
       daemonRuntimeVersion: DAEMON_RUNTIME_VERSION,
       requiredCapabilities: DAEMON_REQUIRED_CAPABILITIES,
       ...(semantic === undefined ? {} : { semantic }),
+      ...(reranker === undefined ? {} : { reranker }),
       ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
       ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
     });
@@ -911,6 +913,12 @@ export class DaemonArchive {
         ...(candidate.expandedTerms === undefined || candidate.expandedTerms.length === 0
           ? {}
           : { expandedTerms: [...candidate.expandedTerms] }),
+        // Provenance for `/window recall why`-style explanations, matching
+        // the RM3 expandedTerms precedent above: present only when this
+        // specific result was actually reordered by the cross-encoder
+        // reranker (src/retrieval/search.js's rerankTierOne), never a
+        // blanket flag for every explicit search.
+        ...(candidate.reranked === true ? { reranked: true } : {}),
         historical: candidate.historical,
         superseded: candidate.superseded,
         source: structuredClone(candidate.source),

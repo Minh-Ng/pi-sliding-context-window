@@ -134,6 +134,26 @@ Semantic retrieval is opt-out. On a machine where its additional memory, CPU, or
 }
 ```
 
+A local cross-encoder reranker additionally reorders explicit search/gather's fused lexical/semantic results by (query, candidate) relevance — the same eval-validated configuration recorded in `eval/retrieval/reranker-verdict.json` (`Xenova/ms-marco-MiniLM-L-6-v2`, pinned revision, `q8`/CPU). It never touches automatic prompt insertion, never crosses the exact/structural priority tier, and degrades silently to the pre-rerank fused order whenever the pinned model is not installed. Install it once:
+
+```bash
+context-window-semantic install-reranker
+# From a source checkout where the package bin is not on PATH:
+node ./bin/context-window-semantic.js install-reranker
+```
+
+The installer is the only path that permits a model download; restart the shared daemon after installation. Only one reranker model is currently supported, so `install-reranker` takes no arguments. It is opt-out like semantic retrieval:
+
+```json
+{
+  "context-window": {
+    "rerankerEnabled": false
+  }
+}
+```
+
+`rerankerModel`/`rerankerModelRevision` override the pinned model (for a self-hosted mirror); `rerankerModelCachePath` overrides its local cache directory; `rerankerCandidates` overrides how many fused candidates are reranked per query (default 40, matching the eval's own candidate window).
+
 When an existing context-recovery trigger has no lexical anchor, `context_window_search` accepts a structural `relation` instead of a query:
 
 ```json
@@ -222,6 +242,11 @@ Use the `context-window` namespace in Pi's shared settings files:
     "semanticCandidates": 40,
     "semanticModelDimensions": null,
     "semanticModelPooling": null,
+    "rerankerEnabled": true,
+    "rerankerModel": "Xenova/ms-marco-MiniLM-L-6-v2",
+    "rerankerModelRevision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+    "rerankerModelCachePath": "~/.pi/context-window/reranker-models",
+    "rerankerCandidates": 40,
     "dbPath": "~/.pi/context-window/archive.db",
     "maxArchiveBytes": 1073741824,
     "targetArchiveBytes": 805306368,

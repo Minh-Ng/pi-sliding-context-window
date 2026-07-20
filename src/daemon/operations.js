@@ -42,6 +42,7 @@ import { searchArchive } from "../retrieval/search.js";
 import { traverseArchive } from "../retrieval/traverse.js";
 import { LocatorError } from "../retrieval/locator.js";
 import { LocalSemanticIndex } from "../semantic/index.js";
+import { LocalReranker } from "../semantic/reranker.js";
 import {
   recordRecalledLocator,
   recordShownResults,
@@ -276,6 +277,14 @@ export class DaemonOperations {
       ...(options.semantic ?? {}),
       recordError: (error) => this.recordBackgroundError(error),
     });
+    // Cross-encoder rerank for explicit search/gather (deferred task #2).
+    // Unlike this.semantic, it has no initialize()/warm step: the worker
+    // loads lazily on the first actual rerank() call (see LocalReranker), so
+    // constructing it here never adds daemon-start latency.
+    this.reranker = new LocalReranker({
+      ...(options.reranker ?? {}),
+      recordError: (error) => this.recordBackgroundError(error),
+    });
     // Experimental recall packet format; "json-v1" unless explicitly opted in.
     this.renderFormat = normalizeRenderFormat(
       options.renderFormat ?? process.env.CONTEXT_WINDOW_RECALL_FORMAT,
@@ -340,6 +349,7 @@ export class DaemonOperations {
     }
     await this.maintenance.close();
     await this.semantic.close();
+    await this.reranker.close();
     await this.idleDrainPromise?.catch(() => {});
     await this.drainPromise?.catch(() => {});
   }
@@ -598,6 +608,11 @@ export class DaemonOperations {
       // this, so frozen hints stay undecayed.
       return searchArchive(this.store, { ...payload, project: context.project }, {
         semantic: this.semantic,
+        // Cross-encoder rerank of the lexical/semantic tier, explicit search
+        // only (see src/retrieval/search.js rerankTierOne). preflightArchive's
+        // internal searchArchive call never sets this, so frozen hints stay
+        // byte-identical.
+        reranker: this.reranker,
         // RM3/Bo1 query expansion is only ever available on this explicit
         // store.search path, never from preflightArchive's internal call to
         // searchArchive (it does not set this option).
@@ -633,6 +648,7 @@ export class DaemonOperations {
       // not depend on which alias happened to answer.
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
+        reranker: this.reranker,
         allowExpansion: true,
         applyImportancePrior: true,
         now,
@@ -713,6 +729,10 @@ export class DaemonOperations {
       return gatherArchive(this.store, payload, {
         project: context.project,
         semantic: this.semantic,
+        // Forwarded into gather's internal searchArchive call the same way as
+        // semantic above (src/retrieval/gather.js), so gather's anchors get
+        // the same explicit-search-only rerank.
+        reranker: this.reranker,
         renderFormat: this.renderFormat,
         applyImportancePrior: true,
         now,
@@ -747,6 +767,7 @@ export class DaemonOperations {
       const result = await gatherArchive(this.store, payload, {
         project,
         semantic: this.semantic,
+        reranker: this.reranker,
         renderFormat: this.renderFormat,
         applyImportancePrior: true,
         now,
@@ -1274,6 +1295,7 @@ export class DaemonOperations {
       },
       index: { generation: publication?.generation ?? 0 },
       semantic: this.semantic.status(),
+      reranker: this.reranker.status(),
       retention,
       rocksdb: this.store.properties(),
       filesystem: filesystemStatus(this.store.path, retention.emergencyMode),

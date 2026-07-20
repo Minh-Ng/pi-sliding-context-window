@@ -611,3 +611,70 @@ test("daemon search and recall wiring records feedback and serves stats", async 
   assert.equal(stats.queries[0].recalled, 1);
   assert.deepEqual(runtime.backgroundErrors, []);
 });
+
+// Deferred task #2: a served search's shown/rank log must reflect the ranks
+// the agent actually saw (post-rerank), not the pre-rerank fused order.
+function fakeRerankerClient(boostMarker) {
+  return {
+    metadata: Object.freeze({ id: "fake", revision: "test" }),
+    async score(query, passages) {
+      return passages.map((passage) => (passage.includes(boostMarker) ? 100 : 0));
+    },
+    async close() {},
+  };
+}
+
+test("feedback log records post-rerank ranks, matching the order the agent was actually shown", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "rerank-feedback"));
+  t.after(() => store.close());
+  const baseline = await createDaemonOperations(store, {});
+  t.after(() => baseline.close());
+  const context = { project: PROJECT };
+  const query = "widget latency spike root cause";
+
+  // Two lexically dense distractors outrank the real target under plain BM25:
+  // each repeats the query vocabulary several times, while the target uses
+  // every query term only once inside a longer explanatory sentence.
+  await baseline.put(putRequest(
+    "distractor-1",
+    "widget latency spike widget latency spike widget latency spike filed as unrelated logging noise",
+  ), context);
+  await baseline.put(putRequest(
+    "distractor-2",
+    "root cause root cause widget latency spike analysis notes tracked separately from the fix",
+    { createdAt: 200 },
+  ), context);
+  await baseline.put(putRequest(
+    "target",
+    "Decision: the widget latency spike root cause was a retry storm; BOOSTME marks the actual fix.",
+    { createdAt: 300 },
+  ), context);
+  await baseline.drainIndex({ throwOnError: true, limit: 1_000, maxDurationMs: 30_000 });
+
+  const baselineSearch = await baseline.search(searchRequest(query, { limit: 5 }), context);
+  assert.equal(baselineSearch.mode, "lexical");
+  const baselineRank = baselineSearch.results.findIndex(({ documentId }) => documentId === "target");
+  assert.ok(baselineRank > 0, "fixture precondition: BM25 alone must not already rank the target first");
+
+  const reranked = await createDaemonOperations(store, {
+    reranker: { enabled: true, client: fakeRerankerClient("BOOSTME") },
+  });
+  t.after(() => reranked.close());
+  const rerankedSearch = await reranked.search(searchRequest(query, { limit: 5 }), context);
+  assert.equal(rerankedSearch.results[0].documentId, "target", "rerank promotes the true target to rank 1");
+  assert.equal(rerankedSearch.results[0].reranked, true);
+
+  // Both the baseline and reranked runs above log an event under the same
+  // queryKey; the reranked run's event is the later one.
+  const events = store.scan(feedbackKeys.eventPrefix(PROJECT))
+    .filter(({ payload }) => payload.queryKey === query);
+  assert.equal(events.length, 2);
+  const rerankEvent = events.at(-1).payload;
+  assert.equal(rerankEvent.shown[0].documentId, "target");
+  assert.equal(rerankEvent.shown[0].rank, 0, "the logged rank matches the presented (post-rerank) position");
+  assert.deepEqual(
+    rerankEvent.shown.map((entry) => entry.documentId),
+    rerankedSearch.results.map((result) => result.documentId),
+    "the feedback log's shown order must equal the results the agent actually saw",
+  );
+});

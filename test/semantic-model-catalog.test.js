@@ -8,6 +8,7 @@ import {
   semanticModelProfile,
 } from "../src/semantic/model-catalog.js";
 import { semanticLaunchArguments } from "../src/daemon-client/semantic-launch-arguments.js";
+import { rerankerLaunchArguments } from "../src/daemon-client/reranker-launch-arguments.js";
 
 const installerExecutable = new URL("../bin/context-window-semantic.js", import.meta.url).pathname;
 
@@ -94,6 +95,28 @@ test("semantic launch arguments are empty when semantic retrieval is disabled", 
   assert.deepEqual(semanticLaunchArguments(undefined), []);
 });
 
+test("reranker launch arguments include every --reranker-* flag when enabled", () => {
+  const args = rerankerLaunchArguments({
+    enabled: true,
+    model: "Xenova/ms-marco-MiniLM-L-6-v2",
+    revision: "rev",
+    cachePath: "/reranker-models",
+    candidateWindow: 40,
+  });
+  assert.deepEqual(args, [
+    "--reranker",
+    "--reranker-model", "Xenova/ms-marco-MiniLM-L-6-v2",
+    "--reranker-revision", "rev",
+    "--reranker-cache", "/reranker-models",
+    "--reranker-candidates", "40",
+  ]);
+});
+
+test("reranker launch arguments are empty when the reranker is disabled", () => {
+  assert.deepEqual(rerankerLaunchArguments({ enabled: false, model: "x" }), []);
+  assert.deepEqual(rerankerLaunchArguments(undefined), []);
+});
+
 test("installer CLI rejects a flag-like [model]/[revision] argument instead of attempting to download it", () => {
   // A stray --help after `install` (e.g. from muscle-memory `<cmd> install --help`)
   // must not be parsed as a literal model id and sent to the network.
@@ -108,4 +131,23 @@ test("installer CLI --help exits cleanly without touching the network", () => {
   const result = spawnSync(process.execPath, [installerExecutable, "--help"], { encoding: "utf8" });
   assert.equal(result.status, 0);
   assert.match(result.stdout, /^Usage: context-window-semantic install/u);
+  assert.match(result.stdout, /install-reranker/u);
+});
+
+test("installer CLI rejects an install-reranker call with stray arguments instead of attempting to download it", () => {
+  // Only one reranker model is currently supported (pinned revision); the
+  // subcommand takes no positional arguments at all.
+  const result = spawnSync(
+    process.execPath,
+    [installerExecutable, "install-reranker", "some/model"],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /^Usage: context-window-semantic install/u);
+});
+
+test("installer CLI rejects an unknown command instead of silently doing nothing", () => {
+  const result = spawnSync(process.execPath, [installerExecutable, "bogus"], { encoding: "utf8" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /^Usage: context-window-semantic install/u);
 });

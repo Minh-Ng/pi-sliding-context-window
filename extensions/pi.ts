@@ -704,6 +704,15 @@ export function createContextEpochWindow({
                   dimensions: (config as any).semanticModelDimensions,
                   pooling: (config as any).semanticModelPooling,
                 },
+                // Cross-encoder rerank for explicit search/gather only
+                // (deferred task #2); never consulted by automatic preflight.
+                reranker: {
+                  enabled: (config as any).rerankerEnabled,
+                  model: (config as any).rerankerModel,
+                  revision: (config as any).rerankerModelRevision,
+                  cachePath: (config as any).rerankerModelCachePath,
+                  candidateWindow: (config as any).rerankerCandidates,
+                },
               });
         nextSession = new EpochWindowSession({
           archive,

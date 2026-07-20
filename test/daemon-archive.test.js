@@ -955,6 +955,84 @@ test("searchDetailed forwards the store's expired-match summary instead of dropp
   }
 });
 
+test("searchDetailed surfaces cross-encoder rerank provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-rerank-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/rerank-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    // The daemon's own store.search response can carry `reranked: true` on a
+    // result the cross-encoder reordered (proven end-to-end in
+    // retrieval-search.test.js and relevance-feedback.test.js); this test
+    // isolates the facade's own reshaping of that response, which built its
+    // result objects from a fixed key set (matching the RM3 expandedTerms
+    // provenance field, kept alongside it) and silently dropped `reranked`.
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.search") return realRequest(operation, payload, options);
+      return {
+        mode: "lexical",
+        status: "resolved",
+        indexGeneration: 0,
+        expiredMatches: { count: 0, retentionClasses: [] },
+        results: [
+          {
+            documentId: "reranked-doc",
+            version: 1,
+            kind: "note",
+            score: 0.9,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            reranked: true,
+            snippet: "reranked candidate",
+            locator: "cw1.reranked-doc",
+            source: { sessionId: "session-a" },
+          },
+          {
+            documentId: "untouched-doc",
+            version: 1,
+            kind: "note",
+            score: 0.5,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            snippet: "untouched candidate",
+            locator: "cw1.untouched-doc",
+            source: { sessionId: "session-a" },
+          },
+        ],
+      };
+    };
+    const detailed = archive.searchDetailed("anything", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/rerank-wiring",
+      scope: "session",
+    });
+    assert.equal(detailed.results[0].reranked, true);
+    assert.equal(
+      Object.hasOwn(detailed.results[1], "reranked"),
+      false,
+      "reranked is present only on the specific result the cross-encoder actually reordered",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("gatherDetailed forwards the store's expired-match summary instead of dropping it", async () => {
   const paths = fixture("context-window-daemon-gather-expired-wiring-");
   let archive;

@@ -43,6 +43,27 @@ import {
 } from "../daemon/retention-policy.js";
 
 const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, semantic: 1 });
+
+/**
+ * Candidate pool size to fetch per mode and fuse over. Explicit search/gather
+ * with an enabled cross-encoder reranker (options.reranker, never set by
+ * automatic preflight) widens this to at least the reranker's own candidate
+ * window: the eval that justified building the reranker
+ * (eval/retrieval/reranker-verdict.json) measured its Recall@3/MRR recovery
+ * over 40-candidate pools, so a caller-limit-scaled pool of 9-30 candidates
+ * (the default limit=3..10 without this widening) would starve the reranker
+ * of exactly the deeper, lower-fused-rank candidates it exists to promote.
+ * Automatic preflight and any explicit search with the reranker disabled or
+ * absent keep the original, cheaper limit-scaled pool.
+ */
+function resolveCandidateLimit(limit, reranker) {
+  const base = Math.min(100, Math.max(limit, limit * 3));
+  if (!reranker || reranker.enabled !== true) return base;
+  const window = Number.isSafeInteger(reranker.candidateWindow) && reranker.candidateWindow > 0
+    ? reranker.candidateWindow
+    : base;
+  return Math.max(base, window);
+}
 const WINDOW_SCAN_PAGE = 1_000;
 const MAX_LEGACY_STRUCTURAL_LOCATION_BYTES = 64 * 1_024;
 const MAX_STRUCTURAL_CANDIDATE_BYTES = 64 * 1_024;
@@ -594,7 +615,7 @@ function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, s
 async function collectCandidates(view, request, options) {
   const generation = await publishedGeneration(view);
   const plan = planExactQuery(request.query);
-  const candidateLimit = Math.min(100, Math.max(request.limit, request.limit * 3));
+  const candidateLimit = resolveCandidateLimit(request.limit, options.reranker);
   const candidates = [];
   let exactAttempted = false;
   let lexicalAttempted = false;
@@ -775,7 +796,7 @@ async function broadenWithExpansion(store, collected, request, options) {
     scope: request.effectiveScope,
     sessionIds: request.sessionIds,
     excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
-    limit: Math.min(100, Math.max(request.limit, request.limit * 3)),
+    limit: resolveCandidateLimit(request.limit, options.reranker),
     // No generation pin here: this requery opens its own snapshot after the
     // first pass has already closed, and searchBm25 only accepts a
     // generation equal to the currently published one. Pinning the
@@ -804,7 +825,7 @@ async function broadenWithExpansion(store, collected, request, options) {
       // implying every attempted expansion term was found here.
       expandedTerms: Object.freeze(result.matchedTerms.filter((term) => expandedTermSet.has(term))),
     }));
-  const limit = Math.min(100, Math.max(request.limit, request.limit * 3));
+  const limit = resolveCandidateLimit(request.limit, options.reranker);
   // Re-fuse over the pre-fusion pool, not the already-deduped `candidates`
   // view: fusing over the deduped view would only ever see one surviving
   // mode's copy per document and could never recompute cross-mode RRF credit
@@ -843,7 +864,7 @@ async function broadenWithSemantic(collected, request, options) {
     ...semanticCandidates(results, collected.generation),
   ]);
   const candidates = preserveCandidateMargins(
-    fuseCandidates(rawCandidates, Math.min(100, Math.max(request.limit, request.limit * 3))),
+    fuseCandidates(rawCandidates, resolveCandidateLimit(request.limit, options.reranker)),
   );
   return Object.freeze({
     ...collected,
@@ -907,6 +928,27 @@ async function rankByImportance(store, collected, project) {
     ...collected,
     candidates: Object.freeze(preserveCandidateMargins(ranked)),
   });
+}
+
+/**
+ * Cross-encoder rerank of the lexical/semantic tier only (deferred task #2;
+ * see eval/retrieval/reranker-verdict.json for the offline decision this
+ * reproduces through the real tool surface). Runs after the importance prior
+ * (so the reranker sees the same candidate order/text explicit search would
+ * otherwise present) and before near-duplicate dedup, so dedup's
+ * representative-per-cluster choice reflects the reranked order and
+ * diversity is preserved among what the reranker actually promoted. Exact and
+ * structural candidates never reach `reranker.rerank` (see LocalReranker),
+ * so they keep their absolute priority-tier precedence regardless of this
+ * step. A caller that never sets `options.reranker` (every automatic
+ * preflight call) skips this entirely -- `options.reranker` is undefined, so
+ * the ternary below never even constructs the ranked-candidates array.
+ */
+async function rerankTierOne(reranker, collected, request) {
+  if (!reranker || typeof reranker.rerank !== "function") return collected;
+  const reranked = await reranker.rerank(request.query, collected.candidates);
+  if (reranked === collected.candidates) return collected;
+  return Object.freeze({ ...collected, candidates: Object.freeze(reranked) });
 }
 
 /**
@@ -1019,6 +1061,11 @@ async function locateCandidates(store, collected, request, options, secret) {
       historical: true,
       superseded: false,
       ...(candidate.nearDuplicates > 0 ? { nearDuplicates: candidate.nearDuplicates } : {}),
+      // Provenance for `/window recall why`-style explanations, matching the
+      // RM3 expandedTerms precedent: present only when this specific result
+      // was actually reordered by the cross-encoder (LocalReranker.rerank),
+      // never a blanket flag for every explicit search.
+      ...(candidate.reranked === true ? { reranked: true } : {}),
       locator,
       source: {
         sessionId: candidate.source.sessionId,
@@ -1051,20 +1098,25 @@ export async function searchArchive(store, request, options = {}) {
   const expanded = await broadenWithExpansion(store, lexical, normalized, resolvedOptions);
   const undecayed = await broadenWithSemantic(expanded, normalized, resolvedOptions);
   const decay = recencyDecayContext(resolvedOptions, now);
-  const candidateLimit = Math.min(100, Math.max(normalized.limit, normalized.limit * 3));
+  const candidateLimit = resolveCandidateLimit(normalized.limit, resolvedOptions.reranker);
   const decayed = applyRecencyDecay(undecayed, decay, candidateLimit);
   const ranked = resolvedOptions.applyImportancePrior === true
     ? await rankByImportance(store, decayed, normalized.project)
     : decayed;
+  // Cross-encoder rerank of the lexical/semantic tier, explicit search/gather
+  // only (resolvedOptions.reranker, set by the daemon's store.search/gather
+  // operations -- see rerankTierOne above). Automatic preflight never sets
+  // this option, so frozen hints stay byte-identical.
+  const reranked = await rerankTierOne(resolvedOptions.reranker, ranked, normalized);
   // Dedup is an explicit-search affordance only (options.dedupe, set by the
   // daemon's store.search operation). The automatic preflight path never opts
   // in, so frozen hints stay byte-identical. Runs last, over the fully ranked
-  // set (semantic broadening + recency decay + importance prior all applied),
-  // so the representative kept per cluster is whichever member the final
-  // ranking actually prefers.
+  // set (semantic broadening + recency decay + importance prior + rerank all
+  // applied), so the representative kept per cluster is whichever member the
+  // final ranking actually prefers.
   const collected = resolvedOptions.dedupe === true
-    ? await annotateNearDuplicates(store, ranked, normalized, resolvedOptions.nearDuplicate ?? {})
-    : ranked;
+    ? await annotateNearDuplicates(store, reranked, normalized, resolvedOptions.nearDuplicate ?? {})
+    : reranked;
   const results = await locateCandidates(store, collected, normalized, resolvedOptions, secret);
   let status = results.length === 0 ? "not-found" : "resolved";
   if (results.length > 0 && collected.mode === "structural"

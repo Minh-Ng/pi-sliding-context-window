@@ -142,6 +142,11 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     // Unset by default: LocalSemanticIndex derives both from semanticModel.
     assert.equal(defaults.semanticModelDimensions, undefined);
     assert.equal(defaults.semanticModelPooling, undefined);
+    assert.equal(defaults.rerankerEnabled, true);
+    assert.equal(defaults.rerankerModel, "Xenova/ms-marco-MiniLM-L-6-v2");
+    assert.equal(defaults.rerankerModelRevision, "a09144355adeed5f58c8ed011d209bf8ee5a1fec");
+    assert.equal(defaults.rerankerModelCachePath, join(directory, ".pi", "context-window", "reranker-models"));
+    assert.equal(defaults.rerankerCandidates, 40);
 
     mkdirSync(join(directory, ".pi", "context-window"), { recursive: true });
     writeFileSync(defaults.dbPath, "legacy SQLite placeholder");
@@ -184,6 +189,11 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
         CONTEXT_WINDOW_SEMANTIC_CANDIDATES: "24",
         CONTEXT_WINDOW_SEMANTIC_MODEL_DIMENSIONS: "768",
         CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING: "last_token",
+        CONTEXT_WINDOW_RERANKER_ENABLED: "false",
+        CONTEXT_WINDOW_RERANKER_MODEL: "local/test-reranker",
+        CONTEXT_WINDOW_RERANKER_MODEL_REVISION: "reranker-revision-1",
+        CONTEXT_WINDOW_RERANKER_MODEL_CACHE: "~/models/reranker",
+        CONTEXT_WINDOW_RERANKER_CANDIDATES: "16",
       },
     });
     assert.equal(overridden.archiveBackend, "sqlite");
@@ -201,6 +211,11 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.semanticCandidates, 24);
     assert.equal(overridden.semanticModelDimensions, 768);
     assert.equal(overridden.semanticModelPooling, "last_token");
+    assert.equal(overridden.rerankerEnabled, false);
+    assert.equal(overridden.rerankerModel, "local/test-reranker");
+    assert.equal(overridden.rerankerModelRevision, "reranker-revision-1");
+    assert.equal(overridden.rerankerModelCachePath, join(directory, "models", "reranker"));
+    assert.equal(overridden.rerankerCandidates, 16);
     assert.equal(overridden.hintSourceCooldownHours, 12);
     assert.equal(overridden.maxInlineUserTokens, 8_000);
     assert.equal(overridden.ephemeralAutoRetrievalDays, 3);

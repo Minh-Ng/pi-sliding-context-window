@@ -16,11 +16,16 @@ import {
   RERANKER_MODEL,
   rerankerDownloadCommand,
 } from "./reranker-model.js";
+import { RerankerWorkerClient } from "../../src/semantic/reranker-client.js";
 
 function usage() {
   return [
     "Usage: node eval/retrieval/reranker-cli.js [options]",
     "  --download            Download the pinned cross-encoder into the local cache, then exit",
+    "  --production          Score through the production worker-thread client",
+    "                        (src/semantic/reranker-client.js) instead of this eval's own",
+    "                        main-thread loader, to revalidate the verdict against the exact",
+    "                        code path store.search/store.gather actually run.",
     "  --output PATH         Also write the eval artifact JSON to PATH",
     "  --cache-dir PATH      Model cache directory (default ~/.cache/context-window-reranker-eval)",
     "  --samples N           Latency samples per query (default 20)",
@@ -37,6 +42,7 @@ function parseArguments(argv) {
     const argument = argv[index];
     if (argument === "--help") options.help = true;
     else if (argument === "--download") options.download = true;
+    else if (argument === "--production") options.production = true;
     else if (["--output", "--cache-dir", "--samples", "--warmup"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new TypeError(`${argument} requires a value`);
@@ -80,6 +86,27 @@ function blockedArtifact(cacheDir, reason) {
   };
 }
 
+// The production client (src/semantic/reranker-client.js) defers loading the
+// model into its worker's first message instead of failing at construction
+// (see reranker-worker.js), unlike this eval's own main-thread loader. Probe
+// with one real score() call up front so a missing-model failure is caught
+// here and reported the same way as the main-thread loader's failure, rather
+// than surfacing mid-measurement.
+async function createProductionReranker({ cacheDir }) {
+  const client = new RerankerWorkerClient({
+    model: RERANKER_MODEL.id,
+    revision: RERANKER_MODEL.revision,
+    cachePath: cacheDir,
+  });
+  try {
+    await client.score("warmup query", ["warmup passage"]);
+  } catch (error) {
+    await client.close().catch(() => {});
+    throw error;
+  }
+  return client;
+}
+
 function emit(artifact, output) {
   const json = `${JSON.stringify(artifact, null, 2)}\n`;
   if (output) writeFileSync(resolve(output), json);
@@ -117,7 +144,9 @@ async function main(argv) {
   }
   let reranker;
   try {
-    reranker = await createCrossEncoderReranker({ cacheDir, allowRemote: false });
+    reranker = options.production
+      ? await createProductionReranker({ cacheDir })
+      : await createCrossEncoderReranker({ cacheDir, allowRemote: false });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const artifact = blockedArtifact(cacheDir, `pinned reranker weights are not cached locally: ${reason}`);
@@ -126,12 +155,20 @@ async function main(argv) {
     return 2;
   }
   try {
-    const artifact = await runRerankerEvaluation({
+    const measured = await runRerankerEvaluation({
       reranker,
       environment: collectEvaluationEnvironment(),
       samples: options.samples,
       warmup: options.warmup,
     });
+    // Traceable in the artifact itself which code path produced these
+    // numbers: this eval's own main-thread loader (the verdict's original
+    // basis), or the production worker-thread client search/gather actually
+    // run in the daemon (src/semantic/reranker-client.js).
+    const artifact = {
+      ...measured,
+      rerankerWiring: options.production ? "production" : "eval-reference",
+    };
     emit(artifact, options.output);
     process.stderr.write(`${summarize(artifact)}\n`);
     return 0;

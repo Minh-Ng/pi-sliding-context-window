@@ -43,6 +43,7 @@ export class SynchronousStoreBridge {
     requestTimeoutMs = 90_000,
     daemonStartTimeoutMs = 30_000,
     semantic,
+    reranker,
     daemonLogPath,
     autoUpgradeDaemon = false,
     daemonRuntimeVersion = DAEMON_RUNTIME_VERSION,
@@ -72,6 +73,7 @@ export class SynchronousStoreBridge {
       daemonRuntimeVersion,
       requiredCapabilities: [...new Set(requiredCapabilities)],
       ...(semantic === undefined ? {} : { semantic }),
+      ...(reranker === undefined ? {} : { reranker }),
       ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
       ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
     };

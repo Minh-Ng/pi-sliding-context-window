@@ -70,6 +70,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   // hatch for a custom or self-hosted model the catalog does not recognize.
   semanticModelDimensions: undefined,
   semanticModelPooling: undefined,
+  // Cross-encoder rerank for explicit search/gather (deferred task #2), never
+  // consulted by automatic preflight. Enabled by default like
+  // semanticRetrieval above: the worker degrades silently to the pre-rerank
+  // fused order when the pinned model is not installed (see
+  // `context-window-semantic install-reranker`), so leaving this on does not
+  // require the model to already be present.
+  rerankerEnabled: true,
+  rerankerModel: "Xenova/ms-marco-MiniLM-L-6-v2",
+  rerankerModelRevision: "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+  rerankerModelCachePath: join(homedir(), ".pi", "context-window", "reranker-models"),
+  rerankerCandidates: 40,
   socketPath: undefined,
   // Existing archives remain here until an explicit offline cutover.
   dbPath: join(homedir(), ".pi", "context-window", "archive.db"),
@@ -364,6 +375,7 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     rocksdbPath: join(home, ".pi", "context-window", "archive.rocks"),
     semanticModelCachePath: join(home, ".pi", "context-window", "models"),
     semanticIndexPath: join(home, ".pi", "context-window", "semantic-index"),
+    rerankerModelCachePath: join(home, ".pi", "context-window", "reranker-models"),
   };
   const merged = Object.assign({}, defaultConfig, ...layers);
   const values = (key) => layers.map((layer) => layer[key]).reverse();
@@ -562,6 +574,28 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
       parsePoolingMode,
       env.CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING,
       ...values("semanticModelPooling"),
+    ),
+    // Cross-encoder rerank for explicit search/gather only (deferred task
+    // #2); see DEFAULT_CONFIG.rerankerEnabled above for why this defaults on
+    // despite the model needing a separate installer step.
+    rerankerEnabled: booleanValue(
+      env.CONTEXT_WINDOW_RERANKER_ENABLED ?? merged.rerankerEnabled,
+      DEFAULT_CONFIG.rerankerEnabled,
+    ),
+    rerankerModel: String(env.CONTEXT_WINDOW_RERANKER_MODEL ?? merged.rerankerModel),
+    rerankerModelRevision: String(
+      env.CONTEXT_WINDOW_RERANKER_MODEL_REVISION ?? merged.rerankerModelRevision,
+    ),
+    rerankerModelCachePath: resolvedPath(
+      env.CONTEXT_WINDOW_RERANKER_MODEL_CACHE
+        ?? merged.rerankerModelCachePath
+        ?? defaultConfig.rerankerModelCachePath,
+      home,
+    ),
+    rerankerCandidates: numeric(
+      "rerankerCandidates",
+      parsePositiveInteger,
+      env.CONTEXT_WINDOW_RERANKER_CANDIDATES,
     ),
     // Existing SQLite users stay on SQLite until they explicitly complete the
     // offline migration and opt into RocksDB. Fresh installations use RocksDB.

@@ -1005,3 +1005,84 @@ test("automatic maintenance schedules background compaction while operator reque
   assert.equal(fullCompactions, 1);
   assert.equal(flushes, 2);
 });
+
+test("near-duplicate dedup applies uniformly whether or not the connection has verified read-aliases", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-alias-dedup-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  const runtime = await createDaemonOperations(store);
+  t.after(() => runtime.close());
+
+  const project = "/workspace/alias-dedup";
+  const sessionId = "session-alias-dedup";
+  const suiteBody = Array.from({ length: 40 }, (_, index) => (
+    `PASS src/module${index}/handler.spec.ts checkout billing integration assertion verified deterministic`
+  )).join("\n");
+  async function admitRun(documentId, tailSeconds, createdAt) {
+    await admitDocument(store, {
+      idempotencyKey: `alias-dedup:${documentId}`,
+      document: {
+        documentId,
+        version: 1,
+        sourceKey: `tool:${documentId}`,
+        sessionId,
+        project,
+        kind: "tool-result",
+        createdAt,
+        text: `${suiteBody}\nRun completed in ${tailSeconds} seconds with 312 assertions.`,
+        metadata: { turnId: `turn-${documentId}` },
+        sourceMessageKeys: [`tool:${documentId}`],
+      },
+      retentionClass: "conversation-source",
+    });
+  }
+  await admitRun("rerun-alpha", 8.21, 100);
+  await admitRun("rerun-beta", 9.07, 200);
+  await runtime.drainIndexUntilIdle();
+
+  const request = {
+    query: "checkout billing integration deterministic",
+    relation: null,
+    scope: "session",
+    sessionId,
+    limit: 10,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 0,
+    // Dedup is a per-request opt-in; without this, two genuinely distinct
+    // documents that merely share text would never be collapsed.
+    dedupe: true,
+  };
+  // No verified alias: readProjectsFor collapses to [project], taking the
+  // single-project branch of DaemonOperations#search.
+  const singleProject = await runtime.search(request, { project, readProjects: [project] });
+  // A verified read-alias (a symlink-widened connection) takes the
+  // #searchAcrossProjects branch instead, unioning over >1 read projects. The
+  // alias itself is empty here; only the branch taken differs.
+  const withAlias = await runtime.search(request, {
+    project,
+    readProjects: [project, "/workspace/alias-dedup-verified-alias"],
+  });
+
+  for (const result of [singleProject, withAlias]) {
+    const ids = result.results.map(({ documentId }) => documentId).sort();
+    // Explicit store.search also reranks by recency decay (recencyDecay:
+    // true), which runs before this dedup pass; the fresher run (rerun-beta,
+    // createdAt 200 vs 100) outranks the older one, so it is what survives as
+    // the cluster's representative -- the point under test is that both
+    // branches agree on which one, not which one specifically.
+    assert.deepEqual(ids, ["rerun-beta"], "the alias-union branch must collapse the same near-dup cluster");
+    assert.equal(result.results[0].nearDuplicates, 1);
+  }
+
+  // Without the opt-in, store.search must never collapse results by default:
+  // two genuinely distinct documents can legitimately share near-identical
+  // text (not just repeated tool output), so suppressing one is only ever
+  // correct when a caller explicitly asked for it.
+  const { dedupe: _dedupe, ...requestWithoutDedupe } = request;
+  const withoutOptIn = await runtime.search(requestWithoutDedupe, { project, readProjects: [project] });
+  assert.deepEqual(
+    withoutOptIn.results.map(({ documentId }) => documentId).sort(),
+    ["rerun-alpha", "rerun-beta"],
+  );
+  assert.ok(withoutOptIn.results.every((result) => !Object.hasOwn(result, "nearDuplicates")));
+});

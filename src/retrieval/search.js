@@ -12,6 +12,10 @@ import {
 import { tokenizeBm25Query } from "../rocksdb/index/tokenizer.js";
 import { lookupStructuralAsync } from "../rocksdb/index/structural.js";
 import { documentImportancePrior } from "../rocksdb/index/importance.js";
+import {
+  readNearDuplicateSignature,
+  selectNearDuplicateRepresentatives,
+} from "../rocksdb/index/simhash.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { semanticIdentifier } from "../semantic-identifiers.js";
@@ -699,6 +703,43 @@ async function rankByImportance(store, collected, project) {
   });
 }
 
+/**
+ * Collapse near-duplicate candidates (repeated test/build output) into one
+ * representative per cluster, reporting the suppressed count on the survivor.
+ * Runs after semantic broadening (not inside collectCandidates) so a semantic
+ * candidate added later still competes for the same cluster instead of always
+ * winning the slot silently, undetected. Signatures are a versioned derived
+ * index; a candidate without a "complete" one is never clustered, so evidence
+ * we cannot fully fingerprint is shown rather than hidden.
+ */
+async function annotateNearDuplicates(store, collected, request, options = {}) {
+  const { candidates } = collected;
+  if (candidates.length <= 1) return collected;
+  const signatures = await store.snapshot(async (view) => {
+    const map = new Map();
+    for (const candidate of candidates) {
+      const simhash = await readNearDuplicateSignature(
+        view,
+        request.project,
+        candidate.documentId,
+        candidate.version,
+      );
+      if (simhash !== undefined) map.set(candidate, simhash);
+    }
+    return map;
+  });
+  const representatives = selectNearDuplicateRepresentatives(candidates, {
+    ...(options.maxHammingDistance === undefined
+      ? {}
+      : { maxHammingDistance: options.maxHammingDistance }),
+    signatureOf: (candidate) => signatures.get(candidate),
+  });
+  const deduped = representatives.map(({ item, nearDuplicates }) => (
+    nearDuplicates > 0 ? { ...item, nearDuplicates } : item
+  ));
+  return Object.freeze({ ...collected, candidates: Object.freeze(deduped) });
+}
+
 async function candidateStillLive(store, candidate, request) {
   return store.snapshot(async (view) => {
     if (view.scan([KEYSPACE.SUPERSESSION, candidate.documentId, candidate.version], { limit: 1 }).length > 0) {
@@ -771,6 +812,7 @@ async function locateCandidates(store, collected, request, options, secret) {
       snippet: candidate.snippet,
       historical: true,
       superseded: false,
+      ...(candidate.nearDuplicates > 0 ? { nearDuplicates: candidate.nearDuplicates } : {}),
       locator,
       source: {
         sessionId: candidate.source.sessionId,
@@ -805,9 +847,18 @@ export async function searchArchive(store, request, options = {}) {
   const decay = recencyDecayContext(resolvedOptions, now);
   const candidateLimit = Math.min(100, Math.max(normalized.limit, normalized.limit * 3));
   const decayed = applyRecencyDecay(undecayed, decay, candidateLimit);
-  const collected = resolvedOptions.applyImportancePrior === true
+  const ranked = resolvedOptions.applyImportancePrior === true
     ? await rankByImportance(store, decayed, normalized.project)
     : decayed;
+  // Dedup is an explicit-search affordance only (options.dedupe, set by the
+  // daemon's store.search operation). The automatic preflight path never opts
+  // in, so frozen hints stay byte-identical. Runs last, over the fully ranked
+  // set (semantic broadening + recency decay + importance prior all applied),
+  // so the representative kept per cluster is whichever member the final
+  // ranking actually prefers.
+  const collected = resolvedOptions.dedupe === true
+    ? await annotateNearDuplicates(store, ranked, normalized, resolvedOptions.nearDuplicate ?? {})
+    : ranked;
   const results = await locateCandidates(store, collected, normalized, resolvedOptions, secret);
   let status = results.length === 0 ? "not-found" : "resolved";
   if (results.length > 0 && collected.mode === "structural"

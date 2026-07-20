@@ -412,6 +412,13 @@ const searchRequest = object({
   limit: integer({ minimum: 1, maximum: 100 }),
   excludeVisibleSourceKeys: visibleSourceKeys,
   hintBudgetTokens: integer({ minimum: 0, maximum: 100_000 }),
+  // Optional (not in the required list): a caller must opt in per request.
+  // Two genuinely distinct documents can share near-identical text (repeated
+  // boilerplate, not just repeated tool output), so collapsing near-dup
+  // clusters is never a safe default -- only a caller who wants coding-session
+  // noise reduction should ask for it. Absent entirely on the automatic
+  // preflight path.
+  dedupe: boolean(),
 }, ["query", "relation", "scope", "limit", "excludeVisibleSourceKeys", "hintBudgetTokens"]);
 
 const searchResult = object({
@@ -437,6 +444,7 @@ const searchResult = object({
   snippet: text,
   historical: boolean(),
   superseded: boolean(),
+  nearDuplicates: nonNegativeInteger,
   locator: identifier,
   source: SOURCE_REFERENCE_SCHEMA,
 }, [
@@ -568,6 +576,7 @@ const gatheredEvidence = object({
   distance: nonNegativeInteger,
   locator: identifier,
   document: resolvedRecall,
+  nearDuplicates: nonNegativeInteger,
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({
@@ -755,6 +764,10 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       maxEvidence: integer({ minimum: 1, maximum: 24 }),
       maxTokens: integer({ minimum: 39, maximum: MAX_RECALL_TOKENS }),
       excludeVisibleSourceKeys: visibleSourceKeys,
+      // Optional (not required): same explicit per-request opt-in as
+      // store.search's dedupe, for the same reason -- collapsing near-dup
+      // clusters is never a safe default.
+      dedupe: boolean(),
     }, [
       "query",
       "intent",

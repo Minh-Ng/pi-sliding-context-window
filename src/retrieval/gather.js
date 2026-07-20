@@ -2,6 +2,10 @@ import {
   assertStoreRequest,
   assertStoreResult,
 } from "../store-contract.js";
+import {
+  readNearDuplicateSignature,
+  selectNearDuplicateRepresentatives,
+} from "../rocksdb/index/simhash.js";
 import { recallArchive } from "./recall.js";
 import { searchArchive } from "./search.js";
 import { traverseArchive } from "./traverse.js";
@@ -77,6 +81,41 @@ export function chronological(left, right) {
 }
 
 /**
+ * Collapse near-duplicate gather candidates onto one representative per
+ * cluster, over the already-priority-sorted candidate list (anchors and
+ * their before/after traversal neighbors alike) rather than anchors alone.
+ * An anchor candidate may already carry a `nearDuplicates` count from
+ * search.js's own dedup pass; priorCount folds that into whichever
+ * representative ultimately absorbs it here, so a repeated-output anchor and
+ * a repeated-output neighbor collapsing together does not lose the anchor's
+ * already-suppressed count.
+ */
+async function dedupOrderedCandidates(store, orderedCandidates, project, options = {}) {
+  if (orderedCandidates.length <= 1) return orderedCandidates;
+  const signatures = await store.snapshot(async (view) => {
+    const map = new Map();
+    for (const entry of orderedCandidates) {
+      const simhash = await readNearDuplicateSignature(
+        view,
+        project,
+        entry.candidate.documentId,
+        entry.candidate.version,
+      );
+      if (simhash !== undefined) map.set(entry, simhash);
+    }
+    return map;
+  });
+  const representatives = selectNearDuplicateRepresentatives(orderedCandidates, {
+    ...(options.maxHammingDistance === undefined
+      ? {}
+      : { maxHammingDistance: options.maxHammingDistance }),
+    signatureOf: (entry) => signatures.get(entry),
+    priorCount: (entry) => entry.candidate.nearDuplicates ?? 0,
+  });
+  return representatives.map(({ item, nearDuplicates }) => ({ ...item, nearDuplicates }));
+}
+
+/**
  * Gather a bounded, provenance-preserving evidence packet in one store call.
  * Search discovers stable anchors; traversal expands only their authorized
  * branch neighborhood; recall materializes exact canonical source.
@@ -149,12 +188,17 @@ export async function gatherArchive(store, rawRequest, options = {}) {
 
   const orderedCandidates = [...candidates.values()]
     .sort((left, right) => left.priority - right.priority);
+  // Dedup is an explicit-gather affordance only (options.dedupe, set by the
+  // daemon's store.gather operation), mirroring search.js's opt-in.
+  const deduped = options.dedupe === true
+    ? await dedupOrderedCandidates(store, orderedCandidates, request.project, options.nearDuplicate ?? {})
+    : orderedCandidates;
   const selectableCount = Math.min(
-    orderedCandidates.length,
+    deduped.length,
     request.maxEvidence,
     Math.max(1, Math.floor(request.maxTokens / MIN_RECALL_TOKENS)),
   );
-  const selected = orderedCandidates.slice(0, selectableCount);
+  const selected = deduped.slice(0, selectableCount);
   const perEvidenceTokens = Math.max(
     MIN_RECALL_TOKENS,
     Math.floor(request.maxTokens / Math.max(1, selected.length)),
@@ -185,11 +229,12 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       distance: item.distance,
       locator: item.candidate.locator,
       document,
+      ...(item.nearDuplicates > 0 ? { nearDuplicates: item.nearDuplicates } : {}),
     });
   }
   evidence.sort(chronological);
 
-  const candidateOverflow = orderedCandidates.length > selected.length;
+  const candidateOverflow = deduped.length > selected.length;
   const searchMayHaveMore = search.results.length === request.limit;
   const truncated = traversalHasMore || candidateOverflow || recallIncomplete || searchMayHaveMore;
   return assertStoreResult("store.gather", {

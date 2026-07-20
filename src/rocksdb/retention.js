@@ -12,6 +12,7 @@ import { createBm25IndexHandler } from "./index/bm25.js";
 import { createExactIndexHandler } from "./index/exact.js";
 import { createStructuralIndexHandler } from "./index/structural.js";
 import { createImportanceIndexHandler } from "./index/importance.js";
+import { createNearDuplicateIndexHandler } from "./index/simhash.js";
 import { IndexWorker } from "./indexer.js";
 import { derivedKeys } from "./derived.js";
 import { KEYSPACE, keyFor } from "./keys.js";
@@ -905,6 +906,7 @@ function createRetentionIndexWorker(store) {
       createBm25IndexHandler(),
       createStructuralIndexHandler(),
       createImportanceIndexHandler(),
+      createNearDuplicateIndexHandler(),
     ],
   });
 }

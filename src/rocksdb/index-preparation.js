@@ -30,6 +30,13 @@ export const MAX_EXACT_POSTING_MUTATIONS = 1_000;
 export const MAX_STRUCTURAL_INDEX_MESSAGES = MAX_STRUCTURAL_MESSAGES_PER_DOCUMENT;
 export const MAX_STRUCTURAL_INDEX_BYTES_PER_DOCUMENT = MAX_STRUCTURAL_MESSAGE_BYTES_PER_DOCUMENT;
 export const MAX_STRUCTURAL_SOURCE_SCAN_BYTES_PER_DOCUMENT = 16 * 1_024 * 1_024;
+// Near-duplicate signatures fold the whole document into one bounded
+// fingerprint using the same subtoken-splitting tokenizer as BM25, so this
+// shares the 4x-raised, post-subtoken scale of MAX_BM25_ANALYZED_TOKENS_PER_DOCUMENT
+// above rather than the tokenizer's pre-subtoken scale. A document above the
+// budget yields a durable "partial" signature over its deterministic prefix
+// instead of being skipped.
+export const MAX_SIMHASH_TOKENS_PER_DOCUMENT = 80_000;
 
 export class IndexPreparationLimitError extends RangeError {
   constructor(handlerId, limitKind, limit, observed) {

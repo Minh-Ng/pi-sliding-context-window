@@ -14,6 +14,7 @@ import { createExactIndexHandler } from "../rocksdb/index/exact.js";
 import { createBm25IndexHandler } from "../rocksdb/index/bm25.js";
 import { createStructuralIndexHandler } from "../rocksdb/index/structural.js";
 import { createImportanceIndexHandler } from "../rocksdb/index/importance.js";
+import { createNearDuplicateIndexHandler } from "../rocksdb/index/simhash.js";
 import { IndexWorker } from "../rocksdb/indexer.js";
 import { outboxKeys, outboxMetrics } from "../rocksdb/outbox.js";
 import { scanStatusPrefix } from "../rocksdb/status-scan.js";
@@ -268,6 +269,7 @@ export class DaemonOperations {
         createBm25IndexHandler(options.bm25),
         createStructuralIndexHandler(),
         createImportanceIndexHandler(),
+        createNearDuplicateIndexHandler(options.nearDuplicate),
       ],
     });
     this.semantic = new LocalSemanticIndex(store, {
@@ -581,6 +583,12 @@ export class DaemonOperations {
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
     const readProjects = readProjectsFor(context);
+    // Dedup is a per-request opt-in on the explicit store.search surface
+    // (payload.dedupe), never a daemon-forced default: two genuinely distinct
+    // documents can share near-identical text, so collapsing near-dup clusters
+    // must be something a caller asks for, not something applied unasked. The
+    // automatic preflight path (preflightArchive) never sets this option
+    // regardless, so frozen hints stay byte-identical.
     if (readProjects.length <= 1) {
       // Explicit search is the "gather evidence" path: rerank with recency
       // decay. Automatic preflight calls searchArchive directly and never sets
@@ -591,6 +599,7 @@ export class DaemonOperations {
         // store.search path, never from preflightArchive's internal call to
         // searchArchive (it does not set this option).
         allowExpansion: true,
+        dedupe: payload.dedupe === true,
         recordShownResults: (event) => this.recordRelevanceFeedback(event),
         applyImportancePrior: true,
         now,
@@ -615,13 +624,16 @@ export class DaemonOperations {
     for (const project of readProjects) {
       // Same query-time recency decay as the single-project path, so an
       // alias-widened search ranks consistently with the results it merges by
-      // score against single-project search.
+      // score against single-project search. Every alias also gets the same
+      // dedupe opt-in as the single-project path, so the merged ranking does
+      // not depend on which alias happened to answer.
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
         allowExpansion: true,
         applyImportancePrior: true,
         now,
         recencyDecay: true,
+        dedupe: payload.dedupe === true,
       });
       modes.add(result.mode);
       indexGeneration = Math.max(indexGeneration, result.indexGeneration);
@@ -684,6 +696,7 @@ export class DaemonOperations {
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
     const readProjects = readProjectsFor(context);
+    // Dedup is a per-request opt-in (payload.dedupe), same as store.search.
     if (readProjects.length <= 1) {
       // gatherArchive forwards its options object to searchArchive as-is
       // (src/retrieval/gather.js), so recencyDecay/now rerank gather's search
@@ -695,6 +708,7 @@ export class DaemonOperations {
         applyImportancePrior: true,
         now,
         recencyDecay: true,
+        dedupe: payload.dedupe === true,
       });
     }
     return this.#gatherAcrossProjects(payload, readProjects, now);
@@ -722,6 +736,7 @@ export class DaemonOperations {
         applyImportancePrior: true,
         now,
         recencyDecay: true,
+        dedupe: payload.dedupe === true,
       });
       modes.add(result.mode);
       intent ??= result.intent;

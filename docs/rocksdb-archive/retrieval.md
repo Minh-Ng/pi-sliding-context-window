@@ -213,4 +213,5 @@ A project may hold at most one live document per explicitly assigned `subjectKey
 | Active-context budget, 24-hour exposure suppression, source-age limits, frozen bytes | `test/retrieval-hints.test.js` |
 | Historical/marker recall and every zero-violation gate | `test/retrieval-eval.test.js`; retrieval artifact `results.hints.scored.metrics` |
 | Exact/lexical/structural candidate behavior and visible-key exclusion | `test/retrieval-search.test.js` |
+| RM3/Bo1 expansion gating (weak-evidence-only, exact/strong-lexical/policy suppression, never on preflight) and expanded-term provenance | `test/retrieval-search.test.js` |
 | Locator scope, exact materialization, expiry, and supersession status | `test/retrieval-recall.test.js` |

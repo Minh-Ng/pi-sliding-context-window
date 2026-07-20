@@ -820,6 +820,75 @@ test("real daemon operations admit, index, search, recall, preflight, and enforc
   assert.match(status.backgroundErrors[2].message, /…$/u);
 });
 
+test("store.search over the daemon wire opts into RM3 expansion and shapes expandedTerms, gated by expansionPolicy", async (t) => {
+  const { socketPath } = await runningRuntime(t);
+  const project = "/workspace/daemon-rm3";
+  const client = new StoreClient({ socketPath, project });
+  t.after(() => client.close());
+
+  // The daemon's explicit store.search operation always sets
+  // options.allowExpansion:true (src/daemon/operations.js); this is the
+  // only production path where that opt-in matters, so it needs its own
+  // end-to-end coverage rather than relying on searchArchive-level tests.
+  const seed = [
+    ["weak", "gadget notes maintenance schedule zephyrindex updates important", 100],
+    ["expansion-target", "zephyrindex rotation cadence review important", 150],
+    ["filler-1", "maintenance notes for the archive process are important", 160],
+    ["filler-2", "schedule updates happen every maintenance cycle", 170],
+    ["filler-3", "important notes about schedule updates continue", 180],
+  ];
+  for (const [documentId, text, createdAt] of seed) {
+    await client.request("store.put", {
+      idempotencyKey: `daemon-rm3-put-${documentId}`,
+      document: {
+        documentId,
+        version: 1,
+        sourceKey: `user:${documentId}`,
+        sessionId: "session-1",
+        project,
+        kind: "turn",
+        createdAt,
+        text,
+        metadata: { turnId: documentId },
+        sourceMessageKeys: [`user:${documentId}`],
+      },
+      retentionClass: "conversation-source",
+    }, { retry: false });
+  }
+
+  const expanded = await client.request("store.search", {
+    query: "gadget widget contraption",
+    relation: null,
+    scope: "session",
+    sessionIds: ["session-1"],
+    project,
+    limit: 10,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 160,
+  });
+  const target = expanded.results.find((result) => result.documentId === "expansion-target");
+  assert.ok(target !== undefined, "the daemon's store.search should surface an RM3-expanded document");
+  assert.ok(target.expandedTerms.length > 0, "expandedTerms should be shaped through onto the wire result");
+  assert.ok(target.expandedTerms.every((term) => target.matchedTerms.includes(term)));
+
+  const disabledByPolicy = await client.request("store.search", {
+    query: "gadget widget contraption",
+    relation: null,
+    scope: "session",
+    sessionIds: ["session-1"],
+    project,
+    limit: 10,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 160,
+    expansionPolicy: "never",
+  });
+  assert.equal(
+    disabledByPolicy.results.some((result) => result.documentId === "expansion-target"),
+    false,
+    "expansionPolicy:'never' on the request must reach DaemonArchive/searchArchive and suppress expansion",
+  );
+});
+
 test("store.get reports ledger-retired exact versions without exposing them across projects", async (t) => {
   const { socketPath, runtime } = await runningRuntime(t);
   const project = "/workspace/retired-get";

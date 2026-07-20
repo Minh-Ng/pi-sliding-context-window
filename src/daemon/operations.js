@@ -587,6 +587,10 @@ export class DaemonOperations {
       // this, so frozen hints stay undecayed.
       return searchArchive(this.store, { ...payload, project: context.project }, {
         semantic: this.semantic,
+        // RM3/Bo1 query expansion is only ever available on this explicit
+        // store.search path, never from preflightArchive's internal call to
+        // searchArchive (it does not set this option).
+        allowExpansion: true,
         recordShownResults: (event) => this.recordRelevanceFeedback(event),
         applyImportancePrior: true,
         now,
@@ -614,6 +618,7 @@ export class DaemonOperations {
       // score against single-project search.
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
+        allowExpansion: true,
         applyImportancePrior: true,
         now,
         recencyDecay: true,

@@ -3,7 +3,13 @@ import {
   assertStoreResult,
 } from "../store-contract.js";
 import { lookupExact, planExactQuery } from "../rocksdb/index/exact.js";
-import { searchBm25 } from "../rocksdb/index/bm25.js";
+import {
+  bm25InverseDocumentFrequency,
+  readBm25Statistics,
+  readDocumentTermVocabulary,
+  searchBm25,
+} from "../rocksdb/index/bm25.js";
+import { tokenizeBm25Query } from "../rocksdb/index/tokenizer.js";
 import { lookupStructuralAsync } from "../rocksdb/index/structural.js";
 import { documentImportancePrior } from "../rocksdb/index/importance.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
@@ -477,6 +483,141 @@ async function collectCandidates(view, request, options) {
   });
 }
 
+// RM3/Bo1-style pseudo-relevance feedback. Fully deterministic and index-only
+// (no model call): the first BM25 pass already exposes per-term document
+// frequency, so "informative" expansion terms are just the top-k results'
+// own vocabulary ranked by corpus-wide IDF. Capped to bound the one allowed
+// requery's cost and keep the expanded query from drifting off-topic.
+const DEFAULT_EXPANSION_CANDIDATE_DOCUMENTS = 3;
+const DEFAULT_EXPANSION_TERM_LIMIT = 8;
+const DEFAULT_EXPANSION_MINIMUM_LEXICAL_SCORE = 0.55;
+const DEFAULT_EXPANSION_MINIMUM_TERM_COVERAGE = 0.5;
+
+// Query expansion never participates in automatic preflight: it is gated
+// behind an explicit `options.allowExpansion` opt-in that only the explicit
+// store.search path sets (see src/daemon/operations.js). preflightArchive
+// never sets it, so this predicate is unreachable from the automatic path
+// regardless of how weak the evidence looks.
+function shouldTryExpansion(collected, request, options) {
+  if (options.allowExpansion !== true) return false;
+  if (request.expansionPolicy === "never" || request.query.trim().length === 0) return false;
+  if (collected.candidates.some(({ retrievalMode }) => retrievalMode === "exact")) return false;
+  const lexical = collected.candidates.find(({ retrievalMode }) => retrievalMode === "lexical");
+  return lexical === undefined
+    || lexical.normalizedScore < (options.expansionMinimumLexicalScore ?? DEFAULT_EXPANSION_MINIMUM_LEXICAL_SCORE)
+    || lexical.termCoverage < (options.expansionMinimumTermCoverage ?? DEFAULT_EXPANSION_MINIMUM_TERM_COVERAGE);
+}
+
+/** Rank the top-k first-pass documents' own vocabulary by corpus-wide IDF. */
+async function selectExpansionTerms(view, collected, request, options) {
+  const documentLimit = options.expansionCandidateDocuments ?? DEFAULT_EXPANSION_CANDIDATE_DOCUMENTS;
+  const termLimit = options.expansionTermLimit ?? DEFAULT_EXPANSION_TERM_LIMIT;
+  const topDocuments = collected.candidates
+    .filter(({ retrievalMode }) => retrievalMode === "lexical")
+    .slice(0, documentLimit);
+  if (topDocuments.length === 0) return Object.freeze([]);
+  // Agent-supplied expansionTerms are already part of the effective first-pass
+  // query (see the lexicalAllowed branch above), so their stemmed forms must
+  // stay out of the candidate vocabulary too - otherwise a term the agent
+  // asked for can get re-selected and mislabeled as system RM3 provenance.
+  const queryTerms = new Set([
+    ...tokenizeBm25Query(request.query, { maxTerms: options.bm25?.maxQueryTerms }),
+    ...tokenizeBm25Query((request.expansionTerms ?? []).join(" "), { maxTerms: options.bm25?.maxQueryTerms }),
+  ]);
+  const vocabulary = new Set();
+  for (const candidate of topDocuments) {
+    const terms = await readDocumentTermVocabulary(view, {
+      project: request.project,
+      documentId: candidate.documentId,
+      version: candidate.version,
+    });
+    for (const term of terms) {
+      if (!queryTerms.has(term)) vocabulary.add(term);
+    }
+  }
+  if (vocabulary.size === 0) return Object.freeze([]);
+  const statistics = await readBm25Statistics(view, {
+    project: request.project,
+    terms: [...vocabulary],
+    generation: collected.generation,
+  });
+  if (!statistics.corpus || statistics.corpus.documentCount === 0) return Object.freeze([]);
+  const documentCount = statistics.corpus.documentCount;
+  const maximumIdf = bm25InverseDocumentFrequency(documentCount, 1);
+  const ranked = [...vocabulary]
+    .map((term) => {
+      const documentFrequency = statistics.terms[term]?.documentFrequency;
+      if (!documentFrequency || documentFrequency <= 0) return undefined;
+      const idf = bm25InverseDocumentFrequency(documentCount, documentFrequency);
+      return { term, normalizedIdf: maximumIdf === 0 ? 0 : idf / maximumIdf };
+    })
+    .filter((entry) => entry !== undefined)
+    .sort((left, right) => right.normalizedIdf - left.normalizedIdf || left.term.localeCompare(right.term))
+    .slice(0, termLimit);
+  return Object.freeze(ranked.map(({ term }) => term));
+}
+
+/** Run the one allowed requery with system-selected expansion terms merged into the query. */
+async function broadenWithExpansion(store, collected, request, options) {
+  if (!shouldTryExpansion(collected, request, options)) return collected;
+  const expansionTerms = await store.snapshot((view) => selectExpansionTerms(view, collected, request, options));
+  if (expansionTerms.length === 0) return collected;
+  const expandedRequest = {
+    // Carry agent-supplied expansionTerms into the requery too, matching the
+    // first pass (lexicalAllowed branch above): otherwise a document that
+    // only matches via an agent-supplied term would win the first pass but
+    // silently lose ranking/coverage once expansion decides to run.
+    query: [request.query, ...(request.expansionTerms ?? [])].join(" "),
+    // Already-stemmed index vocabulary goes in as literalTerms, not appended
+    // text: Porter stemming is not idempotent, so re-tokenizing an already
+    // stemmed term through the query-string path can rewrite it into a
+    // different term with zero postings (e.g. "univers" -> "univ").
+    literalTerms: expansionTerms,
+    project: request.project,
+    scope: request.effectiveScope,
+    sessionIds: request.sessionIds,
+    excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
+    limit: Math.min(100, Math.max(request.limit, request.limit * 3)),
+    // No generation pin here: this requery opens its own snapshot after the
+    // first pass has already closed, and searchBm25 only accepts a
+    // generation equal to the currently published one. Pinning the
+    // first-pass generation would throw whenever a publish lands between
+    // the two snapshots; letting it resolve to whatever is current keeps
+    // expansion best-effort instead of making explicit search racy.
+  };
+  const requeried = await store.snapshot((view) => searchBm25(view, expandedRequest, options.bm25));
+  const expandedTermSet = new Set(expansionTerms);
+  // A document the first pass already matched keeps its first-pass score,
+  // matchedTerms, and termCoverage: fuseCandidates otherwise prefers the
+  // higher-scoring requery copy (more terms matched against the same doc),
+  // which would silently restate that document's coverage against the
+  // system-expanded query instead of the user's actual query. Expansion only
+  // adds documents the first pass never surfaced.
+  const alreadyCollected = new Set(collected.candidates.map((candidate) => candidateIdentity(candidate)));
+  const expandedCandidates = requeried.results
+    .filter((result) => !alreadyCollected.has(candidateIdentity(result)))
+    .map((result) => ({
+      ...result,
+      retrievalMode: "lexical",
+      normalizedScore: normalizeModeScore("lexical", result.rawScore),
+      matchedAnchors: Object.freeze([]),
+      // Provenance: only the expansion terms this specific result actually
+      // matched, so `/window recall why` can explain the match without
+      // implying every attempted expansion term was found here.
+      expandedTerms: Object.freeze(result.matchedTerms.filter((term) => expandedTermSet.has(term))),
+    }));
+  const limit = Math.min(100, Math.max(request.limit, request.limit * 3));
+  const candidates = preserveCandidateMargins(fuseCandidates([
+    ...collected.candidates,
+    ...expandedCandidates,
+  ], limit));
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(candidates),
+    expansionTerms: Object.freeze(expansionTerms),
+  });
+}
+
 function shouldTrySemantic(collected, request, options) {
   if (!options.semantic
     || options.allowSemantic === false
@@ -626,6 +767,7 @@ async function locateCandidates(store, collected, request, options, secret) {
       termCoverage: candidate.termCoverage ?? 0,
       termIdf: candidate.termIdf ?? [],
       maxNormalizedIdf: candidate.maxNormalizedIdf ?? 0,
+      expandedTerms: candidate.expandedTerms ?? [],
       snippet: candidate.snippet,
       historical: true,
       superseded: false,
@@ -656,7 +798,10 @@ export async function searchArchive(store, request, options = {}) {
     now,
   });
   const lexical = await store.snapshot((view) => collectCandidates(view, normalized, resolvedOptions));
-  const undecayed = await broadenWithSemantic(lexical, normalized, resolvedOptions);
+  // Cheap, deterministic, index-only broadening runs before the heavier
+  // (and only conditionally available) semantic fallback.
+  const expanded = await broadenWithExpansion(store, lexical, normalized, resolvedOptions);
+  const undecayed = await broadenWithSemantic(expanded, normalized, resolvedOptions);
   const decay = recencyDecayContext(resolvedOptions, now);
   const candidateLimit = Math.min(100, Math.max(normalized.limit, normalized.limit * 3));
   const decayed = applyRecencyDecay(undecayed, decay, candidateLimit);

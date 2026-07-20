@@ -24,6 +24,7 @@ import {
   normalizeModeScore,
   searchArchive,
 } from "../src/retrieval/search.js";
+import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
 
 function temporaryStorePath(t, name) {
   const directory = mkdtempSync(join(tmpdir(), `context-window-${name}-`));
@@ -136,6 +137,7 @@ function searchRequest(query, overrides = {}) {
     limit: overrides.limit ?? 3,
     excludeVisibleSourceKeys: overrides.excludeVisibleSourceKeys ?? [],
     hintBudgetTokens: overrides.hintBudgetTokens ?? 160,
+    expansionPolicy: overrides.expansionPolicy,
   };
 }
 
@@ -755,4 +757,184 @@ test("a manifest missing with no tombstone marker yet is classified expired from
   assert.equal(response.status, "not-found");
   assert.equal(response.results.length, 0);
   assert.deepEqual(response.expiredMatches, { count: 1, retentionClasses: ["conversation-source"] });
+});
+
+// System-side RM3/Bo1 query expansion fixture: "weak" matches only one of
+// three query terms (low term coverage) but shares a rare, high-IDF term
+// ("zephyrindex") with "expansion-target", which matches none of the literal
+// query terms at all. The filler documents exist only to keep weak's other
+// vocabulary words at a higher document frequency (lower IDF) than
+// zephyrindex, so a deterministic IDF ranking always selects it.
+async function seedExpansionFixture(store) {
+  await admit(store, "weak", "gadget notes maintenance schedule zephyrindex updates important");
+  await admit(store, "expansion-target", "zephyrindex rotation cadence review important", { createdAt: 150 });
+  await admit(store, "filler-1", "maintenance notes for the archive process are important", { createdAt: 160 });
+  await admit(store, "filler-2", "schedule updates happen every maintenance cycle", { createdAt: 170 });
+  await admit(store, "filler-3", "important notes about schedule updates continue", { createdAt: 180 });
+}
+
+test("weak first-pass evidence gated behind allowExpansion pulls in RM3-expanded documents", async (t) => {
+  const { store, worker } = await fixture(t, "search-rm3-expansion");
+  await seedExpansionFixture(store);
+  await worker.drain();
+  const query = "gadget widget contraption";
+
+  const baseline = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10 })),
+    { now: 1_000 },
+  );
+  assert.equal(baseline.mode, "lexical");
+  assert.deepEqual(baseline.results.map(({ documentId }) => documentId), ["weak"]);
+  assert.ok(baseline.results[0].termCoverage < 0.5, "only one of three query terms matched");
+  assert.equal(baseline.results[0].expandedTerms.length, 0);
+
+  const expanded = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10 })),
+    { now: 1_001, allowExpansion: true },
+  );
+  const target = expanded.results.find(({ documentId }) => documentId === "expansion-target");
+  assert.ok(target !== undefined, "RM3 requery should surface a document sharing only expansion vocabulary");
+  assert.ok(target.expandedTerms.includes(normalizeBm25Term("zephyrindex")));
+  assert.ok(target.matchedTerms.includes(normalizeBm25Term("zephyrindex")));
+  assert.equal(target.historical, true);
+  assert.ok(target.locator);
+
+  // expansionPolicy: "never" opts back out even when the caller allows it.
+  const disabledByPolicy = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10, expansionPolicy: "never" })),
+    { now: 1_002, allowExpansion: true },
+  );
+  assert.equal(
+    disabledByPolicy.results.some(({ documentId }) => documentId === "expansion-target"),
+    false,
+  );
+});
+
+test("RM3 expansion never fires when an exact anchor already resolved the query", async (t) => {
+  const { store, worker } = await fixture(t, "search-rm3-exact-gate");
+  await seedExpansionFixture(store);
+  await admit(store, "exact-anchor", "EXACT_RM3_ANCHOR gadget notes", { createdAt: 190 });
+  await worker.drain();
+
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("EXACT_RM3_ANCHOR gadget widget contraption", { limit: 10 })),
+    { now: 1_000, allowExpansion: true },
+  );
+  assert.equal(response.mode, "exact");
+  assert.equal(response.results.some(({ documentId }) => documentId === "expansion-target"), false);
+});
+
+test("RM3 expansion never fires when first-pass lexical coverage is already strong", async (t) => {
+  const { store, worker } = await fixture(t, "search-rm3-strong-gate");
+  await seedExpansionFixture(store);
+  await worker.drain();
+
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("gadget", { limit: 10 })),
+    { now: 1_000, allowExpansion: true },
+  );
+  assert.deepEqual(response.results.map(({ documentId }) => documentId), ["weak"]);
+  assert.equal(response.results[0].termCoverage, 1);
+  assert.equal(response.results.some(({ documentId }) => documentId === "expansion-target"), false);
+});
+
+test("automatic preflight never triggers RM3 expansion regardless of how weak the evidence is", async (t) => {
+  const { store, worker } = await fixture(t, "search-rm3-preflight-gate");
+  await seedExpansionFixture(store);
+  await worker.drain();
+
+  const hint = await preflightArchive(
+    store,
+    preflightRequest("user:rm3-preflight", "gadget widget contraption status?"),
+    { now: 1_000, epochId: "epoch:rm3-preflight" },
+  );
+  assert.equal(hint.modelVisibleText.includes("expansion-target"), false);
+  assert.equal(hint.modelVisibleText.includes("zephyrindex"), false);
+  if (hint.diagnostics) {
+    assert.equal(hint.diagnostics.candidate?.documentId === "expansion-target", false);
+  }
+
+  // The identical query, explicitly opted in through the store.search path
+  // preflight never uses, does surface the expanded document — proving the
+  // preflight run above was actually gated, not merely unlucky with ranking.
+  const explicit = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("gadget widget contraption status", { limit: 10 })),
+    { now: 1_001, allowExpansion: true },
+  );
+  assert.ok(explicit.results.some(({ documentId }) => documentId === "expansion-target"));
+});
+
+test("RM3 expansion terms survive requery even when re-stemming the term would change it", async (t) => {
+  // Porter stemming is not idempotent: normalizeBm25Term("universities") is
+  // "univers", but normalizeBm25Term("univers") is "univ". If the requery
+  // ever routed the selected expansion term back through the query-string
+  // tokenizer/stemmer instead of matching postings by exact stemmed term,
+  // this document (which shares no other vocabulary with the query) would
+  // never surface, and no expandedTerms could ever legitimately name it.
+  assert.equal(normalizeBm25Term("universities"), "univers");
+  assert.equal(normalizeBm25Term(normalizeBm25Term("universities")), "univ");
+
+  const { store, worker } = await fixture(t, "search-rm3-stem-roundtrip");
+  await admit(store, "weak", "gadget notes maintenance schedule universities updates important");
+  await admit(store, "expansion-target", "universities rotation cadence review important", { createdAt: 150 });
+  await admit(store, "filler-1", "maintenance notes for the archive process are important", { createdAt: 160 });
+  await admit(store, "filler-2", "schedule updates happen every maintenance cycle", { createdAt: 170 });
+  await admit(store, "filler-3", "important notes about schedule updates continue", { createdAt: 180 });
+  await worker.drain();
+
+  const expanded = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("gadget widget contraption", { limit: 10 })),
+    { now: 1_001, allowExpansion: true },
+  );
+  const target = expanded.results.find(({ documentId }) => documentId === "expansion-target");
+  assert.ok(target !== undefined, "a non-stem-stable expansion term must still surface its target document");
+  assert.ok(target.expandedTerms.includes(normalizeBm25Term("universities")));
+  assert.ok(target.matchedTerms.includes(normalizeBm25Term("universities")));
+});
+
+test("RM3 requery does not throw when the published generation advances between the first pass and the requery", async (t) => {
+  const { store, worker } = await fixture(t, "search-rm3-generation-race");
+  await seedExpansionFixture(store);
+  await worker.drain();
+
+  // Simulate the daemon's index worker publishing a new generation
+  // concurrently with this explicit search: intercept store.snapshot to
+  // admit and index an unrelated document strictly between the RM3
+  // term-selection snapshot and the RM3 requery snapshot, so the requery
+  // observes a generation newer than the one the first pass captured.
+  let snapshotCalls = 0;
+  let bumped = false;
+  let suppressReentrancy = false;
+  const realSnapshot = store.snapshot.bind(store);
+  store.snapshot = async (fn) => {
+    if (suppressReentrancy) return realSnapshot(fn);
+    snapshotCalls += 1;
+    const result = await realSnapshot(fn);
+    if (snapshotCalls === 2 && !bumped) {
+      bumped = true;
+      suppressReentrancy = true;
+      await admit(store, "concurrent-publish", "unrelated document admitted mid-search", { createdAt: 500 });
+      await worker.drain();
+      suppressReentrancy = false;
+    }
+    return result;
+  };
+  t.after(() => {
+    store.snapshot = realSnapshot;
+  });
+
+  const expanded = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("gadget widget contraption", { limit: 10 })),
+    { now: 1_001, allowExpansion: true },
+  );
+  assert.equal(expanded.mode, "lexical");
+  assert.ok(expanded.results.some(({ documentId }) => documentId === "expansion-target"));
 });

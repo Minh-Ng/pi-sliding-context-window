@@ -1540,6 +1540,27 @@ export async function readBm25Statistics(view, { project, terms = [], generation
   });
 }
 
+/**
+ * Read the full indexed term vocabulary of one live document, for query
+ * expansion (RM3/Bo1-style pseudo-relevance feedback). Reuses the same
+ * sharded document-term metadata already written at index time; it never
+ * rescans or retokenizes source text.
+ */
+export async function readDocumentTermVocabulary(view, { project, documentId, version } = {}) {
+  if (view && typeof view.snapshot === "function") {
+    return view.snapshot((snapshot) => readDocumentTermVocabulary(snapshot, { project, documentId, version }));
+  }
+  requireView(view);
+  const stored = await view.get(bm25Keys.document(
+    identifier(project, "project"),
+    identifier(documentId, "documentId"),
+    positiveInteger(version, "version"),
+  ));
+  if (stored === undefined) return Object.freeze([]);
+  const hydrated = hydrateDocumentMetadata(view, stored);
+  return Object.freeze(hydrated.terms.map(({ term }) => term).sort());
+}
+
 function normalizeSearchOptions(options = {}) {
   const bounded = (value, fallback, label, maximum) => {
     const result = value ?? fallback;
@@ -1601,6 +1622,11 @@ function normalizeSearchRequest(request) {
     throw new TypeError("Session-scoped BM25 search requires sessionId or sessionIds.");
   }
   const excluded = assertVisibleSourceKeys(request.excludeVisibleSourceKeys ?? []);
+  const literalTerms = request.literalTerms ?? [];
+  if (!Array.isArray(literalTerms)
+    || literalTerms.some((term) => typeof term !== "string" || term.length === 0)) {
+    throw new TypeError("literalTerms must be an array of non-empty strings.");
+  }
   return Object.freeze({
     ...request,
     project: identifier(request.project, "project"),
@@ -1608,6 +1634,12 @@ function normalizeSearchRequest(request) {
     scope,
     sessionIds: Object.freeze([...new Set(sessionIds)]),
     excludeVisibleSourceKeys: Object.freeze([...new Set(excluded)]),
+    // Already-normalized terms (e.g. RM3 expansion vocabulary read straight
+    // from the index) that must query postings by exact match. Porter
+    // stemming is not idempotent, so routing these back through the
+    // query-string tokenizer/stemmer can turn a valid stemmed term into a
+    // different one with zero postings; literalTerms skips that round trip.
+    literalTerms: Object.freeze([...new Set(literalTerms)]),
   });
 }
 
@@ -1813,7 +1845,17 @@ export async function searchBm25(view, request = {}, options = {}) {
     && positiveInteger(searchRequest.generation, "generation") !== publishedGeneration) {
     throw new RangeError("BM25 search only supports the current published generation.");
   }
-  const queryTerms = tokenizeBm25Query(query, { maxTerms: normalized.maxQueryTerms });
+  // literalTerms (e.g. RM3 expansion vocabulary) bypass the tokenizer/stemmer
+  // entirely and are merged in as-is, so postings are looked up by the exact
+  // term the index stored them under, not a re-stem of it. They are exempt
+  // from maxQueryTerms: that cap bounds how much of the free-text query the
+  // tokenizer keeps, not the small, separately-capped expansion vocabulary.
+  const queryTerms = [
+    ...new Set([
+      ...tokenizeBm25Query(query, { maxTerms: normalized.maxQueryTerms }),
+      ...searchRequest.literalTerms,
+    ]),
+  ];
   if (queryTerms.length === 0) {
     return Object.freeze({ generation: publishedGeneration, results: Object.freeze([]), work: Object.freeze({
       postingRecordsRead: 0,

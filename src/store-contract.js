@@ -401,6 +401,13 @@ const searchRequest = object({
   expansionTerms: array(identifier, { maxItems: 16 }),
   relation: nullable(enumeration(STRUCTURAL_RELATIONS)),
   semanticPolicy: enumeration(["auto", "always", "never"]),
+  // Gates only the system-side RM3/Bo1 pseudo-relevance-feedback requery
+  // (distinct from the agent-supplied `expansionTerms` above); "never"
+  // disables it even where the server would otherwise allow it. It cannot
+  // enable expansion on its own — that also requires server-side opt-in
+  // (see options.allowExpansion in src/retrieval/search.js), which the
+  // automatic preflight path never sets.
+  expansionPolicy: enumeration(["auto", "never"]),
   ...scopeProperties,
   limit: integer({ minimum: 1, maximum: 100 }),
   excludeVisibleSourceKeys: visibleSourceKeys,
@@ -423,6 +430,10 @@ const searchResult = object({
   termCoverage: number({ minimum: 0, maximum: 1 }),
   termIdf: array(termIdfEvidence, { maxItems: 256 }),
   maxNormalizedIdf: number({ minimum: 0, maximum: 1 }),
+  // System-selected RM3/Bo1 expansion terms that this specific result
+  // matched (a subset of matchedTerms), so callers can explain why a
+  // document surfaced even though it did not match the literal query.
+  expandedTerms: array(identifier, { maxItems: 8 }),
   snippet: text,
   historical: boolean(),
   superseded: boolean(),

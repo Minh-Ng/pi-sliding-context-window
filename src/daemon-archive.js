@@ -846,6 +846,7 @@ export class DaemonArchive {
         : {}),
       relation: options.relation ?? null,
       semanticPolicy: options.semanticPolicy ?? "auto",
+      expansionPolicy: options.expansionPolicy ?? "auto",
       scope: options.scope ?? "session",
       ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
       sessionIds,
@@ -903,6 +904,9 @@ export class DaemonArchive {
         ...(candidate.maxNormalizedIdf === undefined
           ? {}
           : { maxNormalizedIdf: candidate.maxNormalizedIdf }),
+        ...(candidate.expandedTerms === undefined || candidate.expandedTerms.length === 0
+          ? {}
+          : { expandedTerms: [...candidate.expandedTerms] }),
         historical: candidate.historical,
         superseded: candidate.superseded,
         source: structuredClone(candidate.source),

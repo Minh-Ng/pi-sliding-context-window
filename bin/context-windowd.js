@@ -24,6 +24,7 @@ const VALUE_OPTIONS = new Set([
   "--log",
   "--stall-threshold-ms",
   "--slow-request-ms",
+  "--idle-shutdown-ms",
   "--maintenance-interval-ms",
   "--retention-batch-size",
   "--retention-waves",
@@ -48,6 +49,7 @@ function usage() {
     "  --stall-threshold-ms N             Event-loop watchdog threshold",
     "  --slow-request-ms N                Slow-operation logging threshold",
     "  --allow-shutdown                   Permit the remote shutdown operation",
+    "  --idle-shutdown-ms N               Exit after the last client is gone (default: 300000)",
     "  --maintenance-interval-ms N        Maintenance interval",
     "  --retention-batch-size N           Retention records per wave",
     "  --retention-waves N                Retention waves per tick",
@@ -114,6 +116,10 @@ const stallThresholdMs = Number(argument(
 const slowRequestMs = Number(argument(
   "--slow-request-ms",
   process.env.CONTEXT_WINDOW_SLOW_REQUEST_MS ?? DEFAULT_SLOW_REQUEST_MS,
+));
+const idleShutdownMs = Number(argument(
+  "--idle-shutdown-ms",
+  process.env.CONTEXT_WINDOW_IDLE_SHUTDOWN_MS ?? 5 * 60 * 1_000,
 ));
 const maintenance = {
   intervalMs: argument(
@@ -227,6 +233,7 @@ try {
     beforeStoreClose: closeRuntime,
     requestObserver: watchdog,
     slowRequestMs,
+    idleShutdownMs,
     createStore: async (path) => {
       const store = await RocksStore.open(path);
       try {

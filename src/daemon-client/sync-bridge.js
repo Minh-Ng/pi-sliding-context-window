@@ -54,31 +54,36 @@ export class SynchronousStoreBridge {
       30_000,
       "daemonStartTimeoutMs",
     );
+    this.workerOptions = {
+      storePath,
+      socketPath,
+      project,
+      clientVersion,
+      requestTimeoutMs: this.requestTimeoutMs,
+      daemonStartTimeoutMs: this.daemonStartTimeoutMs,
+      autoUpgradeDaemon: autoUpgradeDaemon === true,
+      daemonRuntimeVersion,
+      requiredCapabilities: [...new Set(requiredCapabilities)],
+      ...(semantic === undefined ? {} : { semantic }),
+      ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
+      ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
+    };
+    this.sequence = 0;
+    this.closed = false;
+    this.failed = false;
+    this.#initializeWorker();
+  }
+
+  #initializeWorker() {
     this.signal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
     const channel = new MessageChannel();
     this.port = channel.port1;
     this.port.start();
-    this.sequence = 0;
-    this.closed = false;
-    this.failed = false;
     this.worker = new Worker(new URL("./worker.js", import.meta.url), {
       workerData: {
         port: channel.port2,
         signal: this.signal.buffer,
-        options: {
-          storePath,
-          socketPath,
-          project,
-          clientVersion,
-          requestTimeoutMs: this.requestTimeoutMs,
-          daemonStartTimeoutMs: this.daemonStartTimeoutMs,
-          autoUpgradeDaemon: autoUpgradeDaemon === true,
-          daemonRuntimeVersion,
-          requiredCapabilities: [...new Set(requiredCapabilities)],
-          ...(semantic === undefined ? {} : { semantic }),
-          ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
-          ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
-        },
+        options: this.workerOptions,
       },
       transferList: [channel.port2],
       // Do not forward host/test-runner process flags. Several valid parent
@@ -99,6 +104,14 @@ export class SynchronousStoreBridge {
       void this.worker.terminate();
       throw error;
     }
+  }
+
+  #recoverFailedWorker() {
+    this.port.close();
+    void this.worker.terminate();
+    this.failed = false;
+    this.closed = false;
+    this.#initializeWorker();
   }
 
   call(method, payload = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
@@ -140,6 +153,16 @@ export class SynchronousStoreBridge {
     timeoutMs = this.requestTimeoutMs + this.daemonStartTimeoutMs + 5_000,
   } = {}) {
     return this.call("request", { operation, payload, requestId }, { timeoutMs });
+  }
+
+  restart(reason = "operator requested restart") {
+    if (typeof reason !== "string" || reason.length === 0 || reason.length > 4_096) {
+      throw new TypeError("restart reason must contain 1 to 4,096 characters.");
+    }
+    if (this.failed) this.#recoverFailedWorker();
+    return this.call("restart", { reason }, {
+      timeoutMs: this.requestTimeoutMs + this.daemonStartTimeoutMs + 10_000,
+    });
   }
 
   close() {

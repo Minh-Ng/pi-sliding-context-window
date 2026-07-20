@@ -48,12 +48,16 @@ async function stopProcess(processId) {
   if (processExists(processId)) process.kill(processId, "SIGKILL");
 }
 
-async function startStale(paths, { storePath = paths.storePath } = {}) {
+async function startStale(paths, {
+  storePath = paths.storePath,
+  compatible = false,
+} = {}) {
   const child = spawn(process.execPath, [
     staleFixture,
     storePath,
     paths.socketPath,
     "context-windowd:stale-fixture",
+    compatible ? "compatible" : "minimal",
   ], { stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -148,6 +152,29 @@ test("a current facade transparently replaces a verified stale daemon", async (t
       "daemon.ping",
     ].includes(capability)),
   );
+});
+
+test("a runtime mismatch alone does not replace a capability-compatible shared daemon", async (t) => {
+  const paths = fixture("context-window-upgrade-compatible-");
+  const stale = await startStale(paths, { compatible: true });
+  let archive;
+  t.after(async () => {
+    try { archive?.close({ releaseProtection: false }); } catch {}
+    await stopProcess(stale.processId);
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+
+  archive = new DaemonArchive({
+    ...paths,
+    requestTimeoutMs: 10_000,
+    daemonStartTimeoutMs: 10_000,
+  });
+  const status = archive.daemonStatus();
+  assert.equal(status.processId, stale.processId);
+  assert.equal(status.runtimeVersion, "context-windowd:stale-fixture");
+  assert.equal(status.runtimeMatches, false);
+  assert.equal(processExists(stale.processId), true);
+  assert.equal(upgradeEvents(paths.storePath).length, 0);
 });
 
 test("concurrent current clients converge on one replacement daemon", async (t) => {

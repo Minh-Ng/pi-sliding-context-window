@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import { startStoreDaemon } from "../src/daemon/server.js";
+import { STORE_OPERATIONS } from "../src/store-contract.js";
 
-const [storePath, socketPath, serverVersion = "context-windowd:stale-fixture"] = process.argv.slice(2);
+const [
+  storePath,
+  socketPath,
+  serverVersion = "context-windowd:stale-fixture",
+  mode = "minimal",
+] = process.argv.slice(2);
 if (!storePath || !socketPath) throw new Error("storePath and socketPath are required.");
 
 let daemon;
@@ -23,7 +29,11 @@ try {
       close() {},
       status() { return {}; },
     }),
-    operationHandlers: {},
+    operationHandlers: mode === "compatible"
+      ? Object.fromEntries(STORE_OPERATIONS
+          .filter((operation) => !operation.startsWith("daemon."))
+          .map((operation) => [operation, async () => ({})]))
+      : {},
   });
   process.stdout.write(`${JSON.stringify({ status: "ready", processId: process.pid })}\n`);
 } catch (error) {

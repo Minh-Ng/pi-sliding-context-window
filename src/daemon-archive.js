@@ -1288,6 +1288,20 @@ export class DaemonArchive {
     return this.request("retention.status", {}).liveLogicalBytes;
   }
 
+  daemonStatus() {
+    const status = this.request("daemon.status", {});
+    return {
+      ...status,
+      expectedRuntimeVersion: DAEMON_RUNTIME_VERSION,
+      runtimeMatches: status.runtimeVersion === DAEMON_RUNTIME_VERSION,
+    };
+  }
+
+  restartDaemon({ reason = "operator requested restart" } = {}) {
+    if (this.closed) throw new Error("Daemon archive is closed.");
+    return this.bridge.restart(reason);
+  }
+
   stats() {
     const status = this.request("daemon.status", {});
     // Daemon status deliberately returns a bounded, possibly approximate

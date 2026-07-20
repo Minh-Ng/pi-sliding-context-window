@@ -702,6 +702,14 @@ export class EpochWindowSession {
     return this.archive.stats?.();
   }
 
+  daemonStatus() {
+    return this.archive.daemonStatus?.();
+  }
+
+  restartDaemon(options) {
+    return this.archive.restartDaemon?.(options);
+  }
+
   pruneArchive(options) {
     return this.archive.prune?.({ ...options, force: true });
   }

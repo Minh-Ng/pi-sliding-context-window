@@ -155,6 +155,7 @@ test("custom archive factories can replace the SQLite backend", async () => {
   let openedPath;
   let openedOptions;
   let closed = false;
+  let daemonRestarts = 0;
   const tools = new Map();
   const sourceKeys = Array.from({ length: 200 }, (_, index) =>
     `user:${index}::${"long-source-key".repeat(12)}`,
@@ -225,6 +226,26 @@ test("custom archive factories can replace the SQLite backend", async () => {
       };
     },
     count() { return 0; },
+    daemonStatus() {
+      return {
+        processId: 41,
+        runtimeVersion: "context-windowd:test",
+        expectedRuntimeVersion: "context-windowd:test",
+        runtimeMatches: true,
+        clientConnections: 2,
+        activeRequests: 0,
+      };
+    },
+    restartDaemon() {
+      daemonRestarts += 1;
+      return {
+        previousProcessId: 41,
+        processId: 42,
+        runtimeVersion: "context-windowd:test",
+        graceful: true,
+        forced: false,
+      };
+    },
     close() { closed = true; },
   };
   const extension = createContextEpochWindow({
@@ -284,6 +305,22 @@ test("custom archive factories can replace the SQLite backend", async () => {
       minimumTurnsPerSession: 4,
     },
   });
+
+  const completeWindow = commands.get("window").getArgumentCompletions;
+  assert.ok(completeWindow("").some(({ value }) => value === "daemon status"));
+  assert.deepEqual(
+    completeWindow("daemon r").map(({ value }) => value),
+    ["daemon restart --force"],
+  );
+  assert.deepEqual(
+    completeWindow("archive redact session ").map(({ value }) => value),
+    ["archive redact session confirm custom"],
+  );
+  assert.deepEqual(
+    completeWindow("archive redact project ").map(({ value }) => value),
+    ["archive redact project confirm project"],
+  );
+  assert.equal(completeWindow("not-a-command"), null);
 
   const recalled = await tools.get("context_recall").execute("call", { id: "recall-id" });
   assert.equal(recalled.details.found, true);
@@ -353,6 +390,9 @@ test("custom archive factories can replace the SQLite backend", async () => {
   );
 
   await commands.get("window").handler("recall why", ctx);
+  await commands.get("window").handler("daemon status", ctx);
+  await commands.get("window").handler("daemon restart", ctx);
+  await commands.get("window").handler("daemon restart --force", ctx);
   await commands.get("window").handler("archive status", ctx);
   await commands.get("window").handler("archive prune", ctx);
   await commands.get("window").handler("archive reclaim", ctx);
@@ -360,11 +400,15 @@ test("custom archive factories can replace the SQLite backend", async () => {
     message: "No automatic retrieval decision has been observed in this process.",
     level: "info",
   });
-  assert.match(notifications[1].message, /metrics are unavailable/);
-  assert.deepEqual(notifications.slice(2), [
+  assert.match(notifications[1].message, /context-windowd pid 41/u);
+  assert.match(notifications[2].message, /Confirm with/u);
+  assert.match(notifications[3].message, /Restarted context-windowd 41 -> 42 \(graceful\)/u);
+  assert.match(notifications[4].message, /metrics are unavailable/u);
+  assert.deepEqual(notifications.slice(5), [
     { message: "Archive cleanup is unavailable for this backend.", level: "warning" },
     { message: "Archive reclamation is unavailable for this backend.", level: "warning" },
   ]);
+  assert.equal(daemonRestarts, 1);
 
   handlers.get("session_start")({ reason: "new" }, ctx);
   const staleHandle = await tools.get("context_recall").execute("call", { id: "r1" });

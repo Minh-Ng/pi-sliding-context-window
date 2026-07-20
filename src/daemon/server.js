@@ -42,6 +42,7 @@ const MAX_ACTIVE_REQUESTS = 32;
 const MAX_ACTIVE_REQUEST_BYTES = 256 * 1_024 * 1_024;
 const SHUTDOWN_SOCKET_DRAIN_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
+export const DEFAULT_IDLE_SHUTDOWN_MS = 5 * 60 * 1_000;
 const MAX_SLOW_REQUESTS = 100;
 const DEFAULT_SLOW_REQUEST_MS = 250;
 
@@ -150,6 +151,7 @@ export class StoreDaemon {
     maxActiveRequestBytes = MAX_ACTIVE_REQUEST_BYTES,
     shutdownSocketDrainMs = SHUTDOWN_SOCKET_DRAIN_MS,
     handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS,
+    idleShutdownMs = DEFAULT_IDLE_SHUTDOWN_MS,
     beforeStoreClose,
     requestObserver,
     slowRequestMs = DEFAULT_SLOW_REQUEST_MS,
@@ -242,6 +244,7 @@ export class StoreDaemon {
       "shutdownSocketDrainMs",
     );
     this.handshakeTimeoutMs = positiveLimit(handshakeTimeoutMs, "handshakeTimeoutMs");
+    this.idleShutdownMs = positiveLimit(idleShutdownMs, "idleShutdownMs");
     this.pauseQueuedInputBytes = Math.max(1, Math.floor(this.maxQueuedInputBytes / 2));
     this.resumeQueuedInputBytes = Math.floor(this.pauseQueuedInputBytes / 2);
     this.startedAt = Date.now();
@@ -249,6 +252,7 @@ export class StoreDaemon {
     this.store = undefined;
     this.connections = new Set();
     this.rejectingConnections = new Set();
+    this.handshakenConnections = 0;
     this.inflight = new Set();
     this.requestOutcomes = new Map();
     this.replayOutcomeBytes = 0;
@@ -269,6 +273,8 @@ export class StoreDaemon {
     this.ownerLockToken = 0;
     this.draining = false;
     this.storeClosePrepared = false;
+    this.idleShutdownTimer = undefined;
+    this.idleShutdownAt = undefined;
   }
 
   get capabilities() {
@@ -334,6 +340,7 @@ export class StoreDaemon {
       this.#assertStartActive();
       chmodSync(this.socketPath, 0o600);
       this.state = "running";
+      this.#scheduleIdleShutdown();
       return this;
     } catch (error) {
       let cleanupError;
@@ -365,6 +372,7 @@ export class StoreDaemon {
   close() {
     if (this.closing) return this.closing;
     if (this.state === "closed") return Promise.resolve();
+    this.#cancelIdleShutdown();
     this.closeRequested = true;
     this.state = "closing";
     this.closing = this.#closeLifecycle();
@@ -630,6 +638,7 @@ export class StoreDaemon {
   }
 
   #accept(socket) {
+    this.#cancelIdleShutdown();
     socket.once("close", () => this.#releaseSocketOutput(socket));
     if (this.connections.size >= this.maxConnections) {
       if (this.rejectingConnections.size >= this.maxConnections) {
@@ -637,7 +646,10 @@ export class StoreDaemon {
         return;
       }
       this.rejectingConnections.add(socket);
-      const cleanup = () => this.rejectingConnections.delete(socket);
+      const cleanup = () => {
+        this.rejectingConnections.delete(socket);
+        this.#scheduleIdleShutdown();
+      };
       socket.once("close", cleanup);
       socket.setTimeout(1_000, () => socket.destroy());
       // Read the handshake first so the client has installed its response
@@ -735,6 +747,8 @@ export class StoreDaemon {
       state.closing = true;
       this.#discardBufferedInput(state);
       this.connections.delete(socket);
+      if (state.handshaken) this.handshakenConnections -= 1;
+      this.#scheduleIdleShutdown();
     });
   }
 
@@ -771,10 +785,37 @@ export class StoreDaemon {
 
   #trackWork(work) {
     this.inflight.add(work);
-    work.then(
-      () => this.inflight.delete(work),
-      () => this.inflight.delete(work),
-    );
+    const settled = () => {
+      this.inflight.delete(work);
+      this.#scheduleIdleShutdown();
+    };
+    work.then(settled, settled);
+  }
+
+  #cancelIdleShutdown() {
+    if (this.idleShutdownTimer !== undefined) clearTimeout(this.idleShutdownTimer);
+    this.idleShutdownTimer = undefined;
+    this.idleShutdownAt = undefined;
+  }
+
+  #scheduleIdleShutdown() {
+    if (this.state !== "running" || this.closeRequested || this.draining
+      || this.connections.size > 0 || this.rejectingConnections.size > 0
+      || this.inflight.size > 0 || this.activeRequests > 0) return;
+    this.#cancelIdleShutdown();
+    this.idleShutdownAt = Date.now() + this.idleShutdownMs;
+    this.idleShutdownTimer = setTimeout(() => {
+      this.idleShutdownTimer = undefined;
+      this.idleShutdownAt = undefined;
+      if (this.state !== "running" || this.closeRequested || this.draining) return;
+      if (this.connections.size > 0 || this.rejectingConnections.size > 0
+        || this.inflight.size > 0 || this.activeRequests > 0) {
+        this.#scheduleIdleShutdown();
+        return;
+      }
+      void this.close();
+    }, this.idleShutdownMs);
+    this.idleShutdownTimer.unref?.();
   }
 
   #startNextLine(socket, state) {
@@ -829,6 +870,7 @@ export class StoreDaemon {
         clearTimeout(state.handshakeTimer);
         state.handshakeTimer = undefined;
         state.handshaken = true;
+        this.handshakenConnections += 1;
         state.project = handshake.project;
         await this.#writeFrame(socket, createHandshakeAccepted({
           serverVersion: this.serverVersion,
@@ -1046,6 +1088,9 @@ export class StoreDaemon {
       schemaVersion: STORE_SCHEMA_VERSION,
       protocolVersion: STORE_PROTOCOL_VERSION,
       capabilities: this.capabilities,
+      clientConnections: this.handshakenConnections,
+      activeRequests: this.activeRequests,
+      ...(this.idleShutdownAt === undefined ? {} : { idleShutdownAt: this.idleShutdownAt }),
       backgroundErrors: [
         ...this.backgroundErrors,
         ...(storeStatus.backgroundErrors ?? []),

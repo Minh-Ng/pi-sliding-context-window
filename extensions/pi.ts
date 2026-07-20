@@ -4,7 +4,12 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import {
+  type AutocompleteItem,
+  Container,
+  type SettingItem,
+  SettingsList,
+} from "@earendil-works/pi-tui";
 import { loadConfig, saveGlobalConfig } from "../src/config.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
@@ -33,9 +38,71 @@ const CONTEXT_PREPARATION_FAILURE_NOTICE =
   "Context preparation failed. The turn was aborted before provider submission.";
 const TURN_CAP_VALUES = Object.freeze([10, 20, 30, 40, 50, 75, 100]);
 const CONTEXT_CAP_VALUES = Object.freeze([64_000, 96_000, 128_000, 160_000, 192_000, 256_000]);
+const WINDOW_ARGUMENTS = Object.freeze([
+  { value: "status", label: "status", description: "Show context-window status" },
+  { value: "rotate", label: "rotate", description: "Queue rotation before the next provider request" },
+  { value: "search ", label: "search <query>", description: "Search archived evidence" },
+  { value: "recall why", label: "recall why", description: "Explain the last automatic retrieval decision" },
+  { value: "promote ", label: "promote <documentId>", description: "Show how to make an archived decision durable" },
+  { value: "supersede ", label: "supersede <documentId> [note]", description: "Supersede an archived decision" },
+  { value: "daemon status", label: "daemon status", description: "Inspect the shared archive daemon" },
+  { value: "daemon restart --force", label: "daemon restart --force", description: "Drain and replace the shared daemon" },
+  { value: "archive status", label: "archive status", description: "Show archive storage status" },
+  { value: "archive prune", label: "archive prune", description: "Run logical retention" },
+  { value: "archive reclaim", label: "archive reclaim", description: "Request physical compaction" },
+  { value: "archive redact session", label: "archive redact session", description: "Prepare session redaction confirmation" },
+  { value: "archive redact project", label: "archive redact project", description: "Prepare project redaction confirmation" },
+]);
+const WINDOW_COMMAND_USAGE = WINDOW_ARGUMENTS.map(({ label }) => label).join("|");
+
+function windowArgumentCompletions(
+  prefix: string,
+  active?: EpochWindowSession,
+): AutocompleteItem[] | null {
+  const items: AutocompleteItem[] = WINDOW_ARGUMENTS.map(({ value, label, description }) => ({
+    value,
+    label,
+    description,
+  }));
+  if (active) {
+    const sessionToken = String(active.sessionId).slice(-8);
+    const projectToken = String(active.project).replace(/[/\\]+$/u, "").split(/[/\\]/u).pop()
+      || String(active.project);
+    items.push(
+      {
+        value: `archive redact session confirm ${sessionToken}`,
+        label: `archive redact session confirm ${sessionToken}`,
+        description: "Confirm redaction for this session",
+      },
+      {
+        value: `archive redact project confirm ${projectToken}`,
+        label: `archive redact project confirm ${projectToken}`,
+        description: "Confirm redaction for this project",
+      },
+    );
+  }
+  const filtered = items.filter(({ value }) => value.startsWith(prefix));
+  return filtered.length > 0 ? filtered : null;
+}
 
 function formatTokenCap(tokens: number) {
   return tokens % 1_000 === 0 ? `${tokens / 1_000}k` : String(tokens);
+}
+
+function formatDaemonLifecycle(status: any) {
+  if (!status) return "The shared daemon is unavailable for this archive backend.";
+  const runtime = status.runtimeMatches === false
+    ? `${status.runtimeVersion} (loaded client expects ${status.expectedRuntimeVersion})`
+    : status.runtimeVersion;
+  const idle = status.idleShutdownAt === undefined
+    ? "not scheduled while clients or work remain"
+    : new Date(status.idleShutdownAt).toISOString();
+  return [
+    `context-windowd pid ${status.processId}`,
+    `runtime: ${runtime}`,
+    `clients: ${status.clientConnections ?? "unknown"}; active requests: ${status.activeRequests ?? "unknown"}`,
+    `idle shutdown: ${idle}`,
+  ].join("\n");
 }
 
 function parseTokenCap(value: string) {
@@ -889,7 +956,8 @@ export function createContextEpochWindow({
     });
 
     pi.registerCommand("window", {
-      description: "Context epoch controls: /window [status|rotate|search <query>|recall why|promote <id>|supersede <id>|archive status|archive prune|archive reclaim|archive redact session|project confirm <token>]",
+      description: `Context epoch controls: /window [${WINDOW_COMMAND_USAGE}]`,
+      getArgumentCompletions: (prefix) => windowArgumentCompletions(prefix, session),
       handler: async (args, ctx) => {
         const active = requireSession();
         updateStatus(ctx);
@@ -938,6 +1006,34 @@ export function createContextEpochWindow({
               note: match?.groups?.note?.trim(),
             });
             ctx.ui.notify(formatSupersedeResult(result), "info");
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
+          return;
+        }
+        if (input === "daemon status") {
+          ctx.ui.notify(formatDaemonLifecycle(active.daemonStatus()), "info");
+          return;
+        }
+        if (input === "daemon restart") {
+          ctx.ui.notify(
+            "A shared-daemon restart interrupts every connected Pi tab. Confirm with: /window daemon restart --force",
+            "warning",
+          );
+          return;
+        }
+        if (input === "daemon restart --force") {
+          try {
+            const result = active.restartDaemon({ reason: "operator forced restart from /window" });
+            if (!result) {
+              ctx.ui.notify("Shared-daemon restart is unavailable for this archive backend.", "warning");
+              return;
+            }
+            ctx.ui.notify(
+              `Restarted context-windowd ${result.previousProcessId} -> ${result.processId}`
+                + ` (${result.graceful && !result.forced ? "graceful" : "SIGTERM fallback"}).`,
+              "info",
+            );
           } catch (error) {
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
           }

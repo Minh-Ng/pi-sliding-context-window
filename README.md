@@ -23,7 +23,7 @@ This keeps provider policy testable without Pi and gives alternate hosts or stor
 
 ## Storage and Node requirement
 
-The packaged Pi extension and MCP server use `@harperfast/rocksdb-js` through `context-windowd`. Adapters never open RocksDB directly. The first client starts the daemon on demand; later clients share its Unix socket and closing one client does not close the store. Context Window currently supports macOS and Linux; Windows is unsupported because this release does not implement a named-pipe transport.
+The packaged Pi extension and MCP server use `@harperfast/rocksdb-js` through `context-windowd`. Adapters never open RocksDB directly. The first client starts the daemon on demand; later clients using the same resolved store share its Unix socket. Closing one client does not close the store while others remain. After the final client and request are gone, a five-minute reconnect grace expires before the daemon closes RocksDB and exits. Context Window currently supports macOS and Linux; Windows is unsupported because this release does not implement a named-pipe transport.
 
 The package requires Node **22.19–22.x or 24+** and is tested on Node 24. Node 23 is not supported. Fresh installations default to RocksDB. If an existing SQLite archive is detected and no backend was explicitly configured, SQLite remains authoritative until the offline migration procedure completes.
 
@@ -72,6 +72,8 @@ Restart Pi, then configure or inspect it:
 /window promote <documentId>
 /window supersede <documentId> [note]
 /window rotate
+/window daemon status
+/window daemon restart --force
 /window archive status
 /window archive prune
 /window archive reclaim
@@ -81,7 +83,7 @@ Restart Pi, then configure or inspect it:
 
 `/context-window` opens a TUI settings panel for the global turn cap and optional absolute context-token cap. Changes persist under the `context-window` namespace in `~/.pi/agent/settings.json` and apply to the active session immediately when no higher-precedence project or environment override wins. Choose `adaptive` for the context cap to use the configured model-relative rotation ratio instead of an absolute token ceiling.
 
-`/window recall why` explains the last automatic retrieval decision, including its suppression reason and sanitized match metrics. It never prints archived source text. `/window promote` prints a checklist for landing a durable decision in the repo (not an archive pin). `/window supersede` marks a prior archived decision as no longer live for search. Scoped redaction tombstones archive documents for one session or project after an explicit confirm token.
+`/window recall why` explains the last automatic retrieval decision, including its suppression reason and sanitized match metrics. It never prints archived source text. `/window promote` prints a checklist for landing a durable decision in the repo (not an archive pin). `/window supersede` marks a prior archived decision as no longer live for search. `/window daemon status` reports the shared process, runtime generation, client count, active requests, and idle-shutdown state. `/window daemon restart --force` deliberately drains and replaces that process after warning that every Pi tab sharing the store will reconnect. Scoped redaction tombstones archive documents for one session or project after an explicit confirm token.
 
 Agent tools:
 
@@ -259,6 +261,7 @@ CONTEXT_WINDOW_BACKEND
 CONTEXT_WINDOW_ROCKSDB
 CONTEXT_WINDOW_SOCKET
 CONTEXT_WINDOW_NODE
+CONTEXT_WINDOW_IDLE_SHUTDOWN_MS
 CONTEXT_WINDOW_MAX_ARCHIVE_BYTES
 CONTEXT_WINDOW_TARGET_ARCHIVE_BYTES
 CONTEXT_WINDOW_RECENT_DOCUMENT_PROTECTION_DAYS
@@ -272,7 +275,7 @@ The daemon is always launched with Node, even when the adapter host uses another
 
 The default Unix socket is placed in a per-user `0700` directory under the operating-system temporary directory. A custom socket must likewise have a real, current-user-owned parent directory with no group or other access, and its ancestor chain cannot be controlled by another user; paths directly under a shared `/tmp` are rejected before any client connects or store opens. The RocksDB directory is created or tightened to `0700` before storage opens so archive contents remain inside a current-user-only trust boundary.
 
-The daemon runs bounded maintenance once per minute. Operators can tune its host-wide policy with `CONTEXT_WINDOW_MAINTENANCE_INTERVAL_MS`, `CONTEXT_WINDOW_RETENTION_BATCH_SIZE`, `CONTEXT_WINDOW_RETENTION_WAVES`, `CONTEXT_WINDOW_COMPACTION_DELETED_KEYS`, `CONTEXT_WINDOW_COMPACTION_RECLAIMABLE_BYTES`, `CONTEXT_WINDOW_CRITICAL_FREE_BYTES`, and `CONTEXT_WINDOW_ADMISSION_RESERVE_BYTES`. The default critical free-space threshold is 2 GiB; set it to `0` to disable the admission guard.
+The daemon runs bounded maintenance once per minute. `CONTEXT_WINDOW_IDLE_SHUTDOWN_MS` changes the default 300,000 ms last-client grace. Operators can tune its host-wide policy with `CONTEXT_WINDOW_MAINTENANCE_INTERVAL_MS`, `CONTEXT_WINDOW_RETENTION_BATCH_SIZE`, `CONTEXT_WINDOW_RETENTION_WAVES`, `CONTEXT_WINDOW_COMPACTION_DELETED_KEYS`, `CONTEXT_WINDOW_COMPACTION_RECLAIMABLE_BYTES`, `CONTEXT_WINDOW_CRITICAL_FREE_BYTES`, and `CONTEXT_WINDOW_ADMISSION_RESERVE_BYTES`. The default critical free-space threshold is 2 GiB; set it to `0` to disable the admission guard.
 
 ## Portable MCP archive
 
@@ -303,7 +306,7 @@ Point any MCP-capable client at that command. This provides shared archival and 
 
 ## Daemon and migration operations
 
-The Pi and MCP adapters start `context-windowd` on demand. Each daemon advertises the fingerprint of the production code it actually loaded. After an extension/package update, a reloaded client verifies the daemon's store identity, runtime fingerprint, and required capabilities; if stale, it sends `SIGTERM` only to that verified owner and reconnects through the existing lock/socket startup arbitration. Concurrent clients reconnect automatically. In normal Pi use, `/reload` is therefore sufficient—manual PID lookup and `pkill` are neither required nor recommended. Upgrade requests are recorded as `daemon-upgrade-requested` in the bounded daemon launch log.
+The Pi and MCP adapters start `context-windowd` on demand. Each daemon advertises the fingerprint and capabilities of the production code it actually loaded. A runtime fingerprint mismatch alone is tolerated when the daemon still satisfies the client's required protocol capabilities; this prevents old and reloaded Pi tabs from repeatedly replacing one another's healthy shared process. A missing required capability is the only automatic upgrade path: the client signals the verified store owner and reconnects through the existing lock/socket arbitration. Operators decide when to load an otherwise compatible new runtime with `/window daemon restart --force`; manual PID lookup and `pkill` are neither required nor recommended. Automatic capability upgrades are recorded as `daemon-upgrade-requested` in the bounded daemon launch log.
 
 Daemon diagnostics are strictly size-bounded per physical store. The event log, launch log, and optional stall sample each retain one active file and one previous generation, with every file capped at 4 MiB (24 MiB maximum across all six files). Rotation occurs before a write can cross the cap; oversized JSON records are replaced by bounded metadata, concurrent lifecycle writers coordinate rotation, and external sample output is capped after collection. Files stay mode `0600`, symlinks are rejected, and daemon child stdio is never attached to an unbounded file.
 

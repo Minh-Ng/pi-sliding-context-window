@@ -99,13 +99,14 @@ function childPing(socketPath, project, nonce) {
   });
 }
 
-function startDaemonProcess(storePath, socketPath) {
+function startDaemonProcess(storePath, socketPath, extraArguments = []) {
   const child = spawn(process.execPath, [
     daemonExecutable,
     "--store",
     storePath,
     "--socket",
     socketPath,
+    ...extraArguments,
   ], { stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -310,6 +311,26 @@ async function settlesWithin(promise, milliseconds, message) {
   }
 }
 
+test("daemon CLI exits after its configured no-client grace", async (t) => {
+  const paths = fixture();
+  const process = startDaemonProcess(paths.storePath, paths.socketPath, [
+    "--idle-shutdown-ms",
+    "25",
+  ]);
+  t.after(() => {
+    process.stop();
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+  assert.equal((await process.ready).status, "ready");
+  const [code, signal] = await settlesWithin(
+    new Promise((resolve) => process.child.once("exit", (...details) => resolve(details))),
+    1_000,
+    "daemon CLI stayed alive after its no-client grace",
+  );
+  assert.equal(code, 0, `unexpected idle-shutdown signal: ${signal}`);
+  assert.equal(existsSync(paths.socketPath), false);
+});
+
 test("eight concurrent clients share one daemon and client close does not stop it", async (t) => {
   const paths = fixture();
   const store = fakeStore();
@@ -328,6 +349,74 @@ test("eight concurrent clients share one daemon and client close does not stop i
   clients[0].close();
   assert.equal((await clients[1].ping("still-live")).nonce, "still-live");
   assert.equal(store.closed, false);
+});
+
+test("daemon shuts down after the last client remains absent for the idle grace", async (t) => {
+  const paths = fixture();
+  const store = fakeStore();
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: () => store,
+    idleShutdownMs: 25,
+  });
+  t.after(() => daemon.close());
+  const client = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  await client.ping("idle-grace");
+  client.close();
+
+  await waitFor(() => daemon.closed, "daemon did not stop after its last client disconnected");
+  assert.equal(store.closed, true);
+});
+
+test("idle shutdown waits for work owned by a disconnected client", async (t) => {
+  const paths = fixture();
+  let releaseRequest;
+  let requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: fakeStore,
+    idleShutdownMs: 25,
+    operationHandlers: {
+      "store.count": async () => {
+        requestStarted();
+        await new Promise((resolve) => { releaseRequest = resolve; });
+        return { count: 1 };
+      },
+    },
+  });
+  t.after(() => daemon.close());
+  const client = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  const request = client.request("store.count", { scope: "project" }).catch(() => undefined);
+  await started;
+  client.close();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(daemon.closed, false);
+
+  releaseRequest();
+  await request;
+  await waitFor(() => daemon.closed, "daemon did not stop after disconnected work settled");
+});
+
+test("a reconnect cancels idle shutdown until the replacement client leaves", async (t) => {
+  const paths = fixture();
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: fakeStore,
+    idleShutdownMs: 100,
+  });
+  t.after(() => daemon.close());
+  const first = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  await first.ping("first");
+  first.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const replacement = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  await replacement.ping("replacement");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(daemon.closed, false);
+  replacement.close();
+  await waitFor(() => daemon.closed, "daemon did not re-arm idle shutdown after reconnect");
 });
 
 test("StoreClient.close rejects initial connection and handshake waits immediately", async (t) => {
@@ -984,6 +1073,62 @@ test("the launcher persists an abnormal daemon exit signal", async (t) => {
   assert.equal(lstatSync(daemonLaunchLogPath).mode & 0o077, 0);
 });
 
+test("an operator restart drains and replaces the shared daemon", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix process signals are required.");
+  const paths = fixture();
+  const bridge = new SynchronousStoreBridge({
+    ...paths,
+    project: paths.directory,
+    daemonLogPath: join(paths.directory, "daemon-events.jsonl"),
+    daemonLaunchLogPath: join(paths.directory, "daemon-launch.log"),
+  });
+  let processId = bridge.request("daemon.status", {}).processId;
+  t.after(async () => {
+    bridge.close();
+    try { process.kill(processId, "SIGKILL"); } catch { /* already stopped */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+
+  const peer = new SynchronousStoreBridge({ ...paths, project: paths.directory });
+  try {
+    assert.equal(bridge.request("daemon.status", {}).clientConnections, 2);
+    const result = bridge.restart("test operator restart");
+    assert.equal(result.previousProcessId, processId);
+    assert.notEqual(result.processId, processId);
+    assert.equal(result.graceful, true);
+    assert.equal(result.forced, false);
+    processId = result.processId;
+    assert.equal(bridge.request("daemon.status", {}).processId, processId);
+    assert.equal(peer.request("daemon.ping", { nonce: "after-restart" }).nonce, "after-restart");
+  } finally {
+    peer.close();
+  }
+});
+
+test("operator restart falls back to verified SIGTERM for a legacy daemon", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix process signals are required.");
+  const paths = fixture();
+  const legacy = startDaemonProcess(paths.storePath, paths.socketPath);
+  assert.equal((await legacy.ready).status, "ready");
+  const bridge = new SynchronousStoreBridge({ ...paths, project: paths.directory });
+  let processId = bridge.request("daemon.status", {}).processId;
+  t.after(async () => {
+    bridge.close();
+    legacy.stop();
+    try { process.kill(processId, "SIGKILL"); } catch { /* already stopped */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+
+  const result = bridge.restart("test legacy restart");
+  assert.equal(result.previousProcessId, processId);
+  assert.equal(result.graceful, false);
+  assert.equal(result.forced, true);
+  processId = result.processId;
+  assert.equal(bridge.request("daemon.status", {}).processId, processId);
+});
+
 test("a shared daemon outlives the bridge worker that launched it", async (t) => {
   if (process.platform === "win32") return t.skip("Detached Unix process sessions are required.");
   const paths = fixture();
@@ -1112,6 +1257,9 @@ test("status is schema-valid and shutdown is explicitly gated", async (t) => {
   const status = await client.request("daemon.status", {});
   assert.equal(status.ready, true);
   assert.equal(status.storePath, realpathSync(paths.storePath));
+  assert.equal(status.clientConnections, 1);
+  assert.equal(status.activeRequests, 1);
+  assert.equal(status.idleShutdownAt, undefined);
   assert.deepEqual(status.counts, { documents: 0, events: 0, chunks: 0, logicalBytes: 0 });
   await assert.rejects(
     client.request("daemon.shutdown", { reason: "test" }),

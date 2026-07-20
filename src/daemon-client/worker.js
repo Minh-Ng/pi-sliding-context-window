@@ -208,7 +208,8 @@ async function tryConnect() {
       throw error;
     }
     const incompatibility = daemonIncompatibility(server);
-    if (options.autoUpgradeDaemon === true && incompatibility) {
+    if (options.autoUpgradeDaemon === true
+      && incompatibility?.missingCapabilities.length > 0) {
       return retireStaleDaemon(candidate, server, incompatibility);
     }
     if (options.autoUpgradeDaemon === true) clearUpgradeMarker();
@@ -244,6 +245,7 @@ function launchDaemon() {
     options.socketPath,
     "--log",
     logPath,
+    "--allow-shutdown",
     ...semanticArguments,
   ], {
     // Worker.terminate() tears down subprocesses that remain in the worker's
@@ -371,6 +373,95 @@ async function request(operation, payload, requestId) {
   }
 }
 
+function signalTermination(processId) {
+  try {
+    process.kill(processId, "SIGTERM");
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function restartDaemon(reason) {
+  const active = await ensureClient();
+  const server = active.server;
+  const processId = Number(server.processId);
+  if (!Number.isSafeInteger(processId) || processId <= 1 || processId === process.pid) {
+    const error = new Error("Verified context-windowd reported an unsafe process identity.");
+    error.code = "DAEMON_RESTART_BLOCKED";
+    error.retryable = false;
+    error.details = { processId };
+    throw error;
+  }
+
+  const graceful = server.capabilities.includes("daemon.shutdown");
+  let forced = !graceful;
+  if (graceful) {
+    const shutdown = active.request("daemon.shutdown", { reason }, {
+      retry: false,
+      requestId: `daemon-restart:${processId}:${Date.now()}`,
+    }).then(
+      () => ({ accepted: true }),
+      (error) => ({ accepted: connectionFailure(error), error }),
+    );
+    const outcome = await Promise.race([
+      shutdown,
+      delay(2_000).then(() => undefined),
+    ]);
+    if (outcome?.error && !outcome.accepted) throw outcome.error;
+    if (outcome?.accepted !== true) {
+      discardClient();
+      signalTermination(processId);
+      forced = true;
+    }
+  } else {
+    discardClient();
+    signalTermination(processId);
+  }
+  discardClient();
+
+  const deadline = Date.now() + options.daemonStartTimeoutMs;
+  const gracefulDeadline = Math.min(deadline, Date.now() + 5_000);
+  let oldDaemonReachable = true;
+  while (Date.now() < gracefulDeadline) {
+    const outcome = await tryConnect();
+    if (outcome !== CONNECTED) {
+      oldDaemonReachable = false;
+      break;
+    }
+    if (Number(client.server.processId) !== processId) break;
+    discardClient();
+    await delay(25);
+  }
+  if (oldDaemonReachable && client && Number(client.server.processId) === processId) {
+    discardClient();
+    if (graceful) {
+      signalTermination(processId);
+      forced = true;
+    }
+  }
+
+  const replacement = client && Number(client.server.processId) !== processId
+    ? client
+    : await ensureClient({ deadline });
+  const replacementProcessId = Number(replacement.server.processId);
+  if (!Number.isSafeInteger(replacementProcessId) || replacementProcessId === processId) {
+    const error = new Error("context-windowd replacement did not acquire a new process identity.");
+    error.code = "DAEMON_RESTART_BLOCKED";
+    error.retryable = false;
+    error.details = { processId, replacementProcessId };
+    throw error;
+  }
+  return {
+    previousProcessId: processId,
+    processId: replacementProcessId,
+    runtimeVersion: replacement.server.serverVersion,
+    graceful,
+    forced,
+  };
+}
+
 function serializedError(error) {
   return {
     name: error instanceof Error ? error.name : "Error",
@@ -398,6 +489,11 @@ async function handle(message) {
     }
     if (method === "request") {
       const value = await request(message.operation, message.payload, message.requestId);
+      respond(id, { ok: true, value });
+      return;
+    }
+    if (method === "restart") {
+      const value = await restartDaemon(message.reason);
       respond(id, { ok: true, value });
       return;
     }

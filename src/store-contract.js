@@ -918,6 +918,9 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       schemaVersion: literal(STORE_SCHEMA_VERSION),
       protocolVersion: literal(STORE_PROTOCOL_VERSION),
       capabilities: array(identifier),
+      clientConnections: nonNegativeInteger,
+      activeRequests: nonNegativeInteger,
+      idleShutdownAt: timestamp,
       counts: optionalObject({
         documents: nonNegativeInteger,
         events: nonNegativeInteger,

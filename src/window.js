@@ -384,6 +384,74 @@ export function externalizeLargeToolResults(messages, {
   return { messages: changed ? output : messages, changed, archiveIds };
 }
 
+function toolCallArgumentField(part) {
+  return part?.arguments !== undefined ? "arguments" : "input";
+}
+
+function stringifyToolCallArguments(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Externalize oversized tool-call arguments symmetrically with
+ * externalizeLargeToolResults: the assistant's toolCall part's
+ * arguments/input field is replaced with an object carrying the archive id
+ * and a bounded head/tail preview (`{ archivedAs, preview }`), and the
+ * archived text is handed to `store` exactly as issued. Unlike tool results,
+ * whose content is text, tool_use/toolCall input must remain a JSON object
+ * for every provider (Anthropic tool_use.input, Bedrock Converse
+ * toolUse.input, Gemini functionCall.args), so the replacement stays
+ * object-shaped rather than becoming a bare string. This only rewrites the
+ * provider-facing transcript already produced after the tool executed; the
+ * historical call itself (and any live dispatch, which reads from the host's
+ * own message state, not this filtered copy) is never mutated.
+ */
+export function externalizeLargeToolArguments(messages, {
+  maxTokens,
+  store,
+  previewTokens = Math.min(800, Math.floor(maxTokens / 2)),
+} = {}) {
+  const maxChars = Math.max(1, maxTokens) * 4;
+  const previewChars = Math.max(1, previewTokens) * 4;
+  let changed = false;
+  const archiveIds = [];
+  const output = messages.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
+    let messageChanged = false;
+    const nextContent = message.content.map((part) => {
+      if (!part || typeof part !== "object") return part;
+      if (part.type !== "toolCall" && part.type !== "tool_call") return part;
+      const field = toolCallArgumentField(part);
+      const value = part[field];
+      if (value === undefined) return part;
+      const text = stringifyToolCallArguments(value);
+      if (text.length <= maxChars) return part;
+
+      const id = store(message, part, text);
+      if (!id) return part;
+      archiveIds.push(id);
+      const head = text.slice(0, Math.floor(previewChars * 0.7));
+      const tail = text.slice(-Math.floor(previewChars * 0.3));
+      const preview = `${head}\n\n[… ${text.length - head.length - tail.length} characters archived as ${id}; use context_recall …]\n\n${tail}`;
+      messageChanged = true;
+      // Providers require tool_use/toolCall input to be a JSON object
+      // (Anthropic tool_use.input, Bedrock Converse toolUse.input, Gemini
+      // functionCall.args), so the externalized field must stay object-shaped
+      // rather than becoming a bare preview string.
+      return { ...part, [field]: { archivedAs: id, preview } };
+    });
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, content: nextContent };
+  });
+  return { messages: changed ? output : messages, changed, archiveIds };
+}
+
 export const TOC_TERMS_PER_ENTRY = 8;
 export const TOC_TOPIC_CHARS = 80;
 export const TOC_TOKEN_BUDGET = 1_000;

@@ -13,6 +13,7 @@ import {
   estimateTokens,
   extractDecisionCandidates,
   extractSalientTerms,
+  externalizeLargeToolArguments,
   externalizeLargeToolResults,
   groupCompleteTurns,
   messageKey,
@@ -53,6 +54,11 @@ export const ROTATION_STATE_ENTRY = "context-epoch-window:rotation";
 function toolResultId(sessionId, message, text) {
   const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
   return `tool-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
+}
+
+function toolArgumentId(sessionId, part, text) {
+  const toolCallId = String(part?.id ?? part?.toolCallId ?? part?.tool_call_id ?? "");
+  return `tool-arg-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
 }
 
 function structuralText(message) {
@@ -593,6 +599,16 @@ export class EpochWindowSession {
     });
     active = externalized.messages;
     for (const id of externalized.archiveIds) this.activeArchiveIds.add(id);
+    const configuredArgumentLimit = Number(this.config.maxToolArgumentTokens);
+    const maxToolArgumentTokens = Number.isSafeInteger(configuredArgumentLimit) && configuredArgumentLimit > 0
+      ? configuredArgumentLimit
+      : 4_000;
+    const externalizedArguments = externalizeLargeToolArguments(active, {
+      maxTokens: maxToolArgumentTokens,
+      store: (message, part, text) => this.storeToolArgument(message, part, text),
+    });
+    active = externalizedArguments.messages;
+    for (const id of externalizedArguments.archiveIds) this.activeArchiveIds.add(id);
     this.refreshArchiveProtection();
     this.archive.prune?.();
 
@@ -1389,6 +1405,29 @@ export class EpochWindowSession {
       metadata: {
         toolCallId,
         toolName: message.toolName ?? message.name,
+        sourceMessageKey: messageKey(message),
+      },
+    }, { deferPrune: true, protect: true });
+    if (storedId) {
+      this.activeArchiveIds.add(storedId);
+      this.refreshArchiveProtection();
+    }
+    return storedId;
+  }
+
+  storeToolArgument(message, part, text) {
+    const toolCallId = String(part.id ?? part.toolCallId ?? part.tool_call_id ?? "");
+    const id = toolArgumentId(this.sessionId, part, text);
+    const storedId = this.archive.put({
+      id,
+      sessionId: this.sessionId,
+      project: this.project,
+      kind: "tool-argument",
+      text,
+      createdAt: Number(message.timestamp) || Date.now(),
+      metadata: {
+        toolCallId,
+        toolName: part.name ?? part.toolName,
         sourceMessageKey: messageKey(message),
       },
     }, { deferPrune: true, protect: true });

@@ -33,10 +33,10 @@ function unavailableSourceMessages(document, metadata) {
       reason: "Ordered source message keys were not recorded for this legacy archived turn.",
     };
   }
-  if (document.kind === "tool-result") {
+  if (document.kind === "tool-result" || document.kind === "tool-argument") {
     return {
       status: "legacy-unavailable",
-      reason: "A source message key was not recorded for this legacy tool-result archive; it is not an archived turn.",
+      reason: `A source message key was not recorded for this legacy ${document.kind} archive; it is not an archived turn.`,
     };
   }
   return {
@@ -87,7 +87,7 @@ export function archiveDocumentProvenance(document) {
     && metadata.sourceLastKey === keys.at(-1)
     && !Object.hasOwn(metadata, "sourceMessageKey");
   const toolSourceKey = metadata.sourceMessageKey;
-  const completeToolSourceMetadata = document.kind === "tool-result"
+  const completeToolSourceMetadata = (document.kind === "tool-result" || document.kind === "tool-argument")
     && typeof toolSourceKey === "string"
     && toolSourceKey.length > 0
     && !SOURCE_METADATA_FIELDS.some((field) => field !== "sourceMessageKey" && Object.hasOwn(metadata, field));
@@ -126,6 +126,14 @@ export function archiveDocumentProvenance(document) {
 
   if (document.kind === "tool-result") {
     provenance.toolResult = {
+      ...(metadata.toolCallId ? { toolCallId: String(metadata.toolCallId) } : {}),
+      ...(metadata.toolName ? { toolName: String(metadata.toolName) } : {}),
+      ...(completeToolSourceMetadata ? { sourceMessageKey: toolSourceKey, archivedTurn: false } : {}),
+    };
+  }
+
+  if (document.kind === "tool-argument") {
+    provenance.toolArgument = {
       ...(metadata.toolCallId ? { toolCallId: String(metadata.toolCallId) } : {}),
       ...(metadata.toolName ? { toolName: String(metadata.toolName) } : {}),
       ...(completeToolSourceMetadata ? { sourceMessageKey: toolSourceKey, archivedTurn: false } : {}),

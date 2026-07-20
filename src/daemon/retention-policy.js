@@ -10,6 +10,7 @@ export const DEFAULT_RETENTION_LIFETIMES_MS = Object.freeze({
 
 export const DEFAULT_RETENTION_CLASS_BY_KIND = Object.freeze({
   "tool-result": "ephemeral-payload",
+  "tool-argument": "ephemeral-payload",
   "decision-candidate": "derived-evidence",
   manual: "durable-evidence",
 });

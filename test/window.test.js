@@ -7,6 +7,7 @@ import {
   ESTIMATED_IMAGE_CHARS,
   estimateMessageTokens,
   estimateTokens,
+  externalizeLargeToolArguments,
   externalizeLargeToolResults,
   extractDecisionCandidates,
   extractSalientTerms,
@@ -29,6 +30,13 @@ function assistant(text, timestamp) {
 }
 function tool(text, timestamp, id = `t-${timestamp}`) {
   return { role: "toolResult", content: [{ type: "text", text }], timestamp, toolCallId: id, toolName: "bash" };
+}
+function toolCall(argumentsValue, timestamp, id = `call-${timestamp}`, name = "write") {
+  return {
+    role: "assistant",
+    content: [{ type: "toolCall", id, name, arguments: argumentsValue }],
+    timestamp,
+  };
 }
 
 test("removes persisted empty retry errors without changing the successful turn", () => {
@@ -267,6 +275,79 @@ test("failed tool-result archival leaves the original provider content intact", 
   assert.equal(result.changed, false);
   assert.equal(result.messages, original);
   assert.equal(result.messages[1].content[0].text, "x".repeat(10_000));
+});
+
+test("externalizes large tool-call arguments deterministically without disturbing other content", () => {
+  const stored = [];
+  const original = [
+    user("run", 1),
+    toolCall({ path: "/tmp/big.txt", content: "x".repeat(10_000) }, 2, "call-big"),
+  ];
+  const result = externalizeLargeToolArguments(original, {
+    maxTokens: 100,
+    previewTokens: 40,
+    store(message, part, text) {
+      stored.push([message.timestamp, part.id, text]);
+      return "tool-arg-archive-id";
+    },
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0][0], 2);
+  assert.equal(stored[0][1], "call-big");
+  assert.match(stored[0][2], /"path":"\/tmp\/big\.txt"/);
+  const [call] = result.messages[1].content;
+  assert.equal(call.type, "toolCall");
+  assert.equal(call.id, "call-big");
+  // Providers require tool_use/toolCall input to stay a JSON object, so the
+  // externalized field must be object-shaped, not a bare preview string.
+  assert.equal(typeof call.arguments, "object");
+  assert.equal(call.arguments.archivedAs, "tool-arg-archive-id");
+  assert.match(call.arguments.preview, /tool-arg-archive-id/);
+  assert.ok(estimateTokens(result.messages) < estimateTokens(original));
+  // The original message array is untouched; only the returned copy changed.
+  assert.equal(typeof original[1].content[0].arguments, "object");
+});
+
+test("small tool-call arguments are left untouched", () => {
+  const original = [toolCall({ path: "a.txt" }, 1, "call-small")];
+  const result = externalizeLargeToolArguments(original, { maxTokens: 100, store() { return "unused"; } });
+  assert.equal(result.changed, false);
+  assert.equal(result.messages, original);
+});
+
+test("failed tool-argument archival leaves the original provider content intact", () => {
+  const original = [toolCall({ content: "x".repeat(10_000) }, 1, "call-fail")];
+  const result = externalizeLargeToolArguments(original, {
+    maxTokens: 100,
+    previewTokens: 40,
+    store() { return undefined; },
+  });
+
+  assert.equal(result.changed, false);
+  assert.equal(result.messages, original);
+  assert.deepEqual(result.messages[0].content[0].arguments, { content: "x".repeat(10_000) });
+});
+
+test("tool-call arguments carried under `input` are externalized in place", () => {
+  const original = [{
+    role: "assistant",
+    content: [{ type: "tool_call", id: "call-input", name: "write", input: { content: "y".repeat(10_000) } }],
+    timestamp: 1,
+  }];
+  const result = externalizeLargeToolArguments(original, {
+    maxTokens: 100,
+    previewTokens: 40,
+    store: () => "input-archive-id",
+  });
+
+  assert.equal(result.changed, true);
+  const [call] = result.messages[0].content;
+  assert.equal(call.arguments, undefined);
+  assert.equal(typeof call.input, "object");
+  assert.equal(call.input.archivedAs, "input-archive-id");
+  assert.match(call.input.preview, /input-archive-id/);
 });
 
 test("message keys hash the complete deterministic serialization", () => {

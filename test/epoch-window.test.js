@@ -24,6 +24,7 @@ const config = {
   retainTurns: 1,
   maxInlineUserTokens: 16_000,
   maxToolResultTokens: 4_000,
+  maxToolArgumentTokens: 4_000,
   searchResults: 3,
   searchResultTokens: 1_500,
   preventAutoCompaction: true,
@@ -601,6 +602,98 @@ test("externalized tool results retain their one original source message key", (
     sourceMessageKey: sourceKey,
     archivedTurn: false,
   });
+});
+
+test("externalized tool-call arguments retain their one original source message key", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-1",
+    project: "/project",
+  });
+  const originalToolCall = {
+    role: "assistant",
+    content: [{
+      type: "toolCall",
+      id: "call-large-write",
+      name: "write",
+      arguments: { path: "/tmp/big.txt", content: "x".repeat(20_000) },
+    }],
+    timestamp: 2,
+  };
+
+  session.process([user("write a big file", 1), originalToolCall]);
+
+  const [document] = [...archive.documents.values()];
+  const sourceKey = messageKey(originalToolCall);
+  assert.equal(document.kind, "tool-argument");
+  assert.equal(document.metadata.sourceMessageKey, sourceKey);
+  assert.match(document.text, /"path":"\/tmp\/big\.txt"/);
+  assert.deepEqual(archiveDocumentProvenance(document).sourceMessages, {
+    status: "available",
+    keys: [sourceKey],
+    firstKey: sourceKey,
+    lastKey: sourceKey,
+    count: 1,
+    archivedTurn: false,
+  });
+  assert.deepEqual(archiveDocumentProvenance(document).toolArgument, {
+    toolCallId: "call-large-write",
+    toolName: "write",
+    sourceMessageKey: sourceKey,
+    archivedTurn: false,
+  });
+});
+
+test("oversized tool-call arguments are archived while the dispatched call keeps its full arguments", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-1",
+    project: "/project",
+  });
+  const fullContent = "line of file content\n".repeat(2_000);
+  // Simulate the host's own record of the already-dispatched tool call: this
+  // exact object is what a real tool execution reads its arguments from, and
+  // it must never be touched by context-window's provider-facing filtering.
+  const dispatchedToolCall = {
+    role: "assistant",
+    content: [{
+      type: "toolCall",
+      id: "call-dispatched-write",
+      name: "write",
+      arguments: { path: "/tmp/dispatched.txt", content: fullContent },
+    }],
+    timestamp: 2,
+  };
+  const dispatchedContentSnapshot = structuredClone(dispatchedToolCall.content);
+
+  const providerMessages = session.process([user("write the file", 1), dispatchedToolCall]);
+
+  // The tool already executed against dispatchedToolCall before this filter
+  // ever ran; that record must remain byte-identical afterward so a caller
+  // that already dispatched it (or would dispatch it again from its own
+  // untouched session state) always sees the real arguments.
+  assert.deepEqual(dispatchedToolCall.content, dispatchedContentSnapshot);
+  assert.equal(dispatchedToolCall.content[0].arguments.content, fullContent);
+
+  const providerCall = providerMessages[1].content[0];
+  assert.equal(providerCall.id, "call-dispatched-write");
+  // Anthropic tool_use.input, Bedrock Converse toolUse.input, and Gemini
+  // functionCall.args all require a JSON object, so the externalized field
+  // must stay object-shaped rather than becoming a bare preview string.
+  assert.equal(typeof providerCall.arguments, "object");
+  assert.notEqual(providerCall.arguments.preview, fullContent);
+  assert.match(providerCall.arguments.preview, /use context_recall/);
+
+  const [document] = [...archive.documents.values()];
+  assert.equal(document.kind, "tool-argument");
+  // The archived copy — what context_recall reconstructs — holds the exact
+  // real arguments the tool executed with, not the bounded preview.
+  assert.equal(document.text, JSON.stringify(dispatchedContentSnapshot[0].arguments));
+  assert.match(document.text, /"path":"\/tmp\/dispatched\.txt"/);
 });
 
 test("tool-result previews retain every archive ID created in the same context batch", () => {

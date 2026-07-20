@@ -1012,6 +1012,10 @@ test("feedback.stats reports shown-vs-recalled usage over the daemon wire", asyn
     byMode: {},
     byRank: [],
     queries: [],
+    chainCount: 0,
+    chainRate: 0,
+    chains: [],
+    chainQueryKeys: [],
   });
 });
 

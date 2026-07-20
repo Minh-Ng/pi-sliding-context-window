@@ -685,6 +685,10 @@ export class DaemonOperations {
       mode: merged.mode,
       status: merged.status,
       results: merged.results,
+      // Mirror search.js's own sessionIds derivation: the alias-merged path
+      // builds its own feedback event rather than going through searchArchive's
+      // recordShownResults hook, so it must compute this itself.
+      sessionIds: payload.sessionIds ?? (payload.sessionId === undefined ? [] : [payload.sessionId]),
       now: Date.now(),
     });
     return merged;

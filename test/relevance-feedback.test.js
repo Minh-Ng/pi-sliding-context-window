@@ -128,6 +128,9 @@ test("search logs shown results and a later recall joins by locator fingerprint"
   const lexicalEvent = events.find(({ payload }) => payload.queryKey === "shutdown drain").payload;
   assert.equal(lexicalEvent.shown.length, lexical.results.length);
   assert.equal(lexicalEvent.shown[0].retrievalMode, "lexical");
+  // searchRequest() scopes to sessionId "session-main"; that session id must
+  // reach the stored event so reformulation-chain analysis can key on it.
+  assert.deepEqual(lexicalEvent.sessionIds, ["session-main"]);
   assert.equal(
     lexicalEvent.shown[0].locatorFingerprint,
     locatorFingerprint(lexical.results[0].locator),
@@ -258,6 +261,320 @@ test("the per-project event ring bounds retention and cleans up its locator inde
   const stats = await relevanceFeedbackStats(store, { project: PROJECT });
   assert.equal(stats.events, 3);
   assert.equal(stats.shownTotal, 3);
+});
+
+test("a zero-recall search followed by a differently-worded search that resolves is a reformulation chain", async (t) => {
+  const { store } = await fixture(t, "chain-detected");
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    sessionIds: ["session-chain"],
+    now: 1_000,
+    results: [{
+      documentId: "doc-foo",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.chain.foo",
+    }],
+  }); // shown, never recalled: a below-the-fold-candidate miss.
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "bar",
+    sessionIds: ["session-chain"],
+    now: 1_001,
+    results: [{
+      documentId: "doc-bar",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.chain.bar",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.chain.bar",
+    status: "resolved",
+    now: 1_002,
+  });
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  assert.equal(stats.chainCount, 1);
+  assert.equal(stats.chainRate, 1 / 2);
+  assert.deepEqual(stats.chains, [{
+    sessionId: "session-chain",
+    missQueryKey: "foo",
+    missSeq: 1,
+    hitQueryKey: "bar",
+    hitSeq: 2,
+  }]);
+  assert.deepEqual(new Set(stats.chainQueryKeys), new Set(["foo", "bar"]));
+});
+
+test("a same-queryKey retry that eventually resolves is not a reformulation chain", async (t) => {
+  const { store } = await fixture(t, "chain-retry");
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    sessionIds: ["session-retry"],
+    now: 1_000,
+    results: [{
+      documentId: "doc-foo-1",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.retry.foo-1",
+    }],
+  }); // shown, never recalled.
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    sessionIds: ["session-retry"],
+    now: 1_001,
+    results: [{
+      documentId: "doc-foo-2",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.retry.foo-2",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.retry.foo-2",
+    status: "resolved",
+    now: 1_002,
+  });
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  assert.equal(stats.chainCount, 0);
+  assert.deepEqual(stats.chains, []);
+  assert.deepEqual(stats.chainQueryKeys, []);
+});
+
+test("a miss in one session and a hit in another session are not linked into a chain", async (t) => {
+  const { store } = await fixture(t, "chain-cross-session");
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    sessionIds: ["session-a"],
+    now: 1_000,
+    results: [{
+      documentId: "doc-foo",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.cross.foo",
+    }],
+  }); // shown, never recalled, in session-a.
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "bar",
+    sessionIds: ["session-b"],
+    now: 1_001,
+    results: [{
+      documentId: "doc-bar",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.cross.bar",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.cross.bar",
+    status: "resolved",
+    now: 1_002,
+  }); // resolved, but in session-b: a different conversation than the miss.
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  assert.equal(stats.chainCount, 0);
+  assert.deepEqual(stats.chains, []);
+  assert.deepEqual(stats.chainQueryKeys, []);
+});
+
+test("a search recorded with no session id never participates in a chain", async (t) => {
+  const { store } = await fixture(t, "chain-no-session");
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    now: 1_000, // no sessionIds supplied: fails closed rather than joining by chance.
+    results: [{
+      documentId: "doc-foo",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.nosession.foo",
+    }],
+  });
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "bar",
+    now: 1_001,
+    results: [{
+      documentId: "doc-bar",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.nosession.bar",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.nosession.bar",
+    status: "resolved",
+    now: 1_002,
+  });
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  assert.equal(stats.chainCount, 0);
+});
+
+test("a multi-id session lineage counts one reformulation chain, not one per shared session id", async (t) => {
+  // Resumed/forked sessions report every ancestor id (pi.ts ancestorSessionIds,
+  // permitted up to 65 ids by the store.search request contract), so a miss and
+  // its resolving hit routinely share more than one session id. That must still
+  // be a single chain, not one per shared id.
+  const { store } = await fixture(t, "chain-multi-session-lineage");
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "foo",
+    sessionIds: ["session-root", "session-fork-1", "session-fork-2"],
+    now: 1_000,
+    results: [{
+      documentId: "doc-foo",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.multi.foo",
+    }],
+  }); // shown, never recalled, under a 3-id session lineage.
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "bar",
+    sessionIds: ["session-root", "session-fork-1", "session-fork-2"],
+    now: 1_001,
+    results: [{
+      documentId: "doc-bar",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.multi.bar",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.multi.bar",
+    status: "resolved",
+    now: 1_002,
+  });
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  // Before the dedupe fix this counted once per shared session id (3), pushing
+  // chainRate past the normalizedScore max of 1 and failing store-contract
+  // validation outright.
+  assert.equal(stats.chainCount, 1);
+  assert.equal(stats.chains.length, 1);
+  assert.equal(stats.chains[0].missSeq, 1);
+  assert.equal(stats.chains[0].hitSeq, 2);
+  assert.ok(stats.chainRate <= 1);
+});
+
+test("a miss resolved via one session of a lineage stays closed in a sibling session, not re-chained by a later hit", async (t) => {
+  // Reproduces a split-lineage double count: a miss recorded under
+  // [session-root, session-fork] resolves via a hit that only carries
+  // session-root. That must close the miss in session-fork too, or a later
+  // hit that does carry session-fork re-resolves the same miss under a new
+  // hitSeq, inflating chainCount past one chain per miss (and chainRate past
+  // the normalizedScore max of 1, which used to throw a ContractError out of
+  // relevanceFeedbackStats).
+  const { store } = await fixture(t, "chain-lineage-split");
+  for (const [query, locator] of [
+    ["foo", "cw1.split.foo"],
+    ["baz", "cw1.split.baz"],
+    ["qux", "cw1.split.qux"],
+  ]) {
+    await recordShownResults(store, {
+      project: PROJECT,
+      query,
+      sessionIds: ["session-root", "session-fork"],
+      now: 1_000,
+      results: [{
+        documentId: `doc-${query}`,
+        version: 1,
+        retrievalMode: "lexical",
+        calibratedScore: 0.5,
+        rawScore: 1.2,
+        locator,
+      }],
+    }); // shown, never recalled, under a 2-id session lineage.
+  }
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "bar",
+    sessionIds: ["session-root"],
+    now: 1_003,
+    results: [{
+      documentId: "doc-bar",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.split.bar",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.split.bar",
+    status: "resolved",
+    now: 1_004,
+  }); // resolves in session-root only: must close the miss in session-fork too.
+
+  await recordShownResults(store, {
+    project: PROJECT,
+    query: "quux",
+    sessionIds: ["session-root", "session-fork"],
+    now: 1_005,
+    results: [{
+      documentId: "doc-quux",
+      version: 1,
+      retrievalMode: "lexical",
+      calibratedScore: 0.5,
+      rawScore: 1.2,
+      locator: "cw1.split.quux",
+    }],
+  });
+  await recordRecalledLocator(store, {
+    project: PROJECT,
+    locator: "cw1.split.quux",
+    status: "resolved",
+    now: 1_006,
+  }); // resolves in both ids: must not re-chain the misses hit1 already closed.
+
+  const stats = await relevanceFeedbackStats(store, { project: PROJECT });
+  assert.equal(stats.events, 5);
+  assert.equal(stats.chainCount, 3);
+  assert.equal(stats.chains.length, 3);
+  assert.deepEqual(
+    stats.chains.map((chain) => `${chain.missSeq}:${chain.hitSeq}`).sort(),
+    ["1:4", "2:4", "3:4"],
+  );
+  assert.ok(stats.chainRate <= 1);
 });
 
 test("daemon search and recall wiring records feedback and serves stats", async (t) => {

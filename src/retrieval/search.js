@@ -1057,6 +1057,7 @@ export async function searchArchive(store, request, options = {}) {
       mode: result.mode,
       status: result.status,
       results: result.results,
+      sessionIds: normalized.sessionIds,
       now,
     });
   }

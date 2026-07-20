@@ -701,6 +701,18 @@ const migrationStatus = object({
 }, ["phase", "migratedCount", "failedCount", "comparisonFailures", "rollbackEligible"]);
 
 const shownRecalledStats = object({ shown: nonNegativeInteger, recalled: nonNegativeInteger });
+const queryKeyField = string({ maxLength: 512 });
+// Below-the-fold misses are never shown, so they cannot be measured directly;
+// a reformulation chain (an earlier zero-recall search followed, in the same
+// session, by a differently-worded search that resolves) is the read-only
+// proxy signal. See detectReformulationChains in relevance-feedback.js.
+const feedbackChainResponse = object({
+  sessionId: identifier,
+  missQueryKey: queryKeyField,
+  missSeq: nonNegativeInteger,
+  hitQueryKey: queryKeyField,
+  hitSeq: nonNegativeInteger,
+});
 const feedbackStatsResponse = object({
   events: nonNegativeInteger,
   shownTotal: nonNegativeInteger,
@@ -717,6 +729,10 @@ const feedbackStatsResponse = object({
     shown: nonNegativeInteger,
     recalled: nonNegativeInteger,
   })),
+  chainCount: nonNegativeInteger,
+  chainRate: normalizedScore,
+  chains: array(feedbackChainResponse),
+  chainQueryKeys: array(queryKeyField),
 });
 
 /**

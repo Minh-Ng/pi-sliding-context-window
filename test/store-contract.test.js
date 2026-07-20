@@ -378,6 +378,12 @@ const results = Object.freeze({
       { query: "reap drain", searches: 2, shown: 5, recalled: 2 },
       { query: "shutdown", searches: 1, shown: 2, recalled: 0 },
     ],
+    chainCount: 1,
+    chainRate: 1 / 3,
+    chains: [
+      { sessionId: "session-1", missQueryKey: "shutdown", missSeq: 1, hitQueryKey: "reap drain", hitSeq: 2 },
+    ],
+    chainQueryKeys: ["shutdown", "reap drain"],
   },
   "store.compact": { status: "complete", bytesBefore: 2_048, bytesAfter: 1_024 },
   "daemon.status": {

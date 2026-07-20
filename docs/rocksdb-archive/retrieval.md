@@ -60,6 +60,12 @@ Exact lookup runs before BM25. Exact-looking input must not be decomposed into b
 
 The normalized score is meaningful only within a retrieval mode until calibration proves cross-mode comparability. `matchType`, score margin, source scope, and supersession state remain visible to the gate.
 
+A relevance band travels alongside the presented score in rendered search and gather output (`>=0.8` high, `0.5–0.8` moderate, `0.2–0.5` some, `<0.2` low), computed from that same per-mode calibrated score. It is a stopping-criterion contract: an agent reading `low` on every remaining result knows to stop recalling rather than parsing the raw float. Chronological before/after gather neighbors carry no score or band — they are context, not a ranked hit.
+
+Cross-mode fusion keeps a hard priority tier (exact above structural above lexical/semantic); ordering *within* the lexical/semantic tier uses Reciprocal Rank Fusion over each mode's own rank order rather than comparing BM25's squashed score against embedding cosine similarity directly — the two curves are not calibrated against each other. A candidate found by more than one mode in that tier accumulates rank credit from each. The RRF component blends with the candidate's own normalized score, weighted 75% toward the rank fusion near the head of each mode's ranking (top 3), 60% in the next stretch (4–10), and 40% beyond — trusting rank order most where it is most reliable. This never changes the presented `score`, and it never moves a candidate across the exact/structural/lexical priority boundary.
+
+RRF's cross-mode credit is most useful when semantic search actually runs alongside lexical rather than only rescuing a weak lexical miss. Explicit `context_window_search`'s default `semanticPolicy` stays `auto` (rescue-only) rather than switching to hybrid-always: that default is an already-documented, tested behavior (this file's semantic-mode row; `test/semantic.test.js`), and flipping it changes result composition and latency for every explicit search, which wants its own evaluation evidence rather than riding in on a fusion-ordering change. `context_window_gather` already runs `semanticPolicy: "always"` unconditionally, so gather's fused evidence already benefits from this tier today.
+
 **Candidate generation**
 
 1. Preserve exact anchors and tokenize remaining prose.
@@ -214,4 +220,7 @@ A project may hold at most one live document per explicitly assigned `subjectKey
 | Historical/marker recall and every zero-violation gate | `test/retrieval-eval.test.js`; retrieval artifact `results.hints.scored.metrics` |
 | Exact/lexical/structural candidate behavior and visible-key exclusion | `test/retrieval-search.test.js` |
 | RM3/Bo1 expansion gating (weak-evidence-only, exact/strong-lexical/policy suppression, never on preflight) and expanded-term provenance | `test/retrieval-search.test.js` |
+| RRF tier fusion (rank-order preservation, cross-mode rank credit, priority-tier boundary) | `test/retrieval-search.test.js` |
+| Relevance-band thresholds and their rendering in search/gather output | `test/presentation.test.js` |
+| Anchor-only relevance score/mode propagation through gather | `test/retrieval-gather.test.js`; `test/daemon-archive.test.js` |
 | Locator scope, exact materialization, expiry, and supersession status | `test/retrieval-recall.test.js` |

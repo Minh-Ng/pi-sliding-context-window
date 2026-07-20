@@ -986,6 +986,8 @@ export class DaemonArchive {
         id: item.locator,
         locator: item.locator,
         document: recalledDocument(item.document, item.locator),
+        ...(item.score === undefined ? {} : { score: item.score }),
+        ...(item.retrievalMode === undefined ? {} : { retrievalMode: item.retrievalMode }),
       };
     });
     return {

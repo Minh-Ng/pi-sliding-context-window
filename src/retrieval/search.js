@@ -335,14 +335,130 @@ async function structuralCandidates(view, response, generation, request) {
   return candidates;
 }
 
+// Reciprocal Rank Fusion constant. 60 is the standard RRF default (Cormack
+// et al.); it flattens the gap between adjacent ranks so one system's noisy
+// tail cannot dominate the fused order.
+const RRF_K = 60;
+const TIER_ONE = 1;
+
+// Rank fusion is most trustworthy near the head of a mode's own ranking and
+// least trustworthy deep in its tail, so the RRF component's blend weight
+// decays with rank instead of applying uniformly.
+function rankFusionWeight(rank) {
+  if (rank <= 3) return 0.75;
+  if (rank <= 10) return 0.6;
+  return 0.4;
+}
+
+/**
+ * Cross-mode fusion keeps a hard tier boundary above lexical/semantic
+ * (exact outranks everything; structural outranks lexical/semantic), but
+ * BM25 and embedding-cosine scores are calibrated on unrelated curves, so
+ * ordering *within* that shared tier by squashed score alone is
+ * uncalibrated. RRF instead fuses each mode's own rank order — a candidate
+ * found by more than one mode in the tier accumulates rank credit from
+ * each — then blends the fused rank score with the candidate's own
+ * normalized score, trusting the rank fusion most where rank order is most
+ * reliable (near the head of each mode's list) and falling back toward the
+ * calibrated score deeper in the tail. This only reorders lexical/semantic
+ * candidates against each other; it never crosses the exact/structural tier
+ * boundary and never changes the presented `score`.
+ */
+function withTierOneFusionScores(candidates) {
+  const rankLists = new Map();
+  for (const candidate of candidates) {
+    if (MODE_PRIORITY[candidate.retrievalMode] !== TIER_ONE) continue;
+    const list = rankLists.get(candidate.retrievalMode);
+    if (list) list.push(candidate);
+    else rankLists.set(candidate.retrievalMode, [candidate]);
+  }
+  const sortedLists = new Map();
+  const fusionByIdentity = new Map();
+  let maxRrf = 0;
+  for (const [mode, rawList] of rankLists) {
+    // Rank assignment below assumes each mode's list arrives best-first, but
+    // re-fusion callers cannot guarantee that: broadenWithExpansion appends
+    // requery-only candidates after the already-fused first pass, and
+    // applyRecencyDecay re-fuses a list still ordered by pre-decay
+    // fusionScore while scores have just been decayed. Sort explicitly by
+    // this mode's own normalizedScore instead of trusting input order.
+    const sorted = [...rawList].sort((left, right) => right.normalizedScore - left.normalizedScore);
+    sortedLists.set(mode, sorted);
+    // A mode can return multiple entries for the same document (e.g. one
+    // per matched semantic span); those must collapse to a single rank
+    // here, or a document would self-accumulate RRF credit across its own
+    // spans as if it had been independently corroborated by another mode,
+    // and would inflate maxRrf against every other candidate.
+    const seenInMode = new Set();
+    let rank = 0;
+    let previousScore;
+    for (const candidate of sorted) {
+      const identity = candidateIdentity(candidate);
+      if (seenInMode.has(identity)) continue;
+      seenInMode.add(identity);
+      // A run of exactly tied normalizedScore candidates shares one rank
+      // instead of advancing per-candidate: a mode's own scan/insertion
+      // order among ties (e.g. BM25's recency-then-documentId tiebreak) is
+      // not a relevance signal, so treating it as one is exactly the kind
+      // of uncalibrated-position noise this fusion exists to avoid. Without
+      // this, two genuinely tied lexical candidates would get different RRF
+      // credit purely from arbitrary scan order, masking the documentId
+      // tiebreak that compareCandidates falls back to when scores tie.
+      if (previousScore === undefined || candidate.normalizedScore !== previousScore) rank += 1;
+      previousScore = candidate.normalizedScore;
+      const entry = fusionByIdentity.get(identity) ?? { rrf: 0, bestRank: rank };
+      entry.rrf += 1 / (RRF_K + rank);
+      entry.bestRank = Math.min(entry.bestRank, rank);
+      fusionByIdentity.set(identity, entry);
+      maxRrf = Math.max(maxRrf, entry.rrf);
+    }
+  }
+  const blendedFusionScore = (candidate) => {
+    const entry = fusionByIdentity.get(candidateIdentity(candidate));
+    const normalizedRrf = maxRrf > 0 ? entry.rrf / maxRrf : 0;
+    const weight = rankFusionWeight(entry.bestRank);
+    return (weight * normalizedRrf) + ((1 - weight) * candidate.normalizedScore);
+  };
+  // rankFusionWeight's rank-dependent blend trusts the RRF component most
+  // near a mode's own head and the calibrated score most in its tail. At the
+  // rank boundary where that trust shifts, the reallocation can hand a
+  // lower-scored candidate a higher blended score than a strictly
+  // higher-scored candidate earlier in that very same mode's own ranking.
+  // Clamp each mode's blended scores to be non-increasing along its own
+  // best-first order, so the blend can never invert an order the mode
+  // itself already established.
+  const clampedByModeIdentity = new Map();
+  for (const [mode, sorted] of sortedLists) {
+    const clampedForMode = new Map();
+    let ceiling = Infinity;
+    for (const candidate of sorted) {
+      const identity = candidateIdentity(candidate);
+      if (clampedForMode.has(identity)) continue;
+      const clamped = Math.min(blendedFusionScore(candidate), ceiling);
+      clampedForMode.set(identity, clamped);
+      ceiling = clamped;
+    }
+    clampedByModeIdentity.set(mode, clampedForMode);
+  }
+  return candidates.map((candidate) => {
+    if (MODE_PRIORITY[candidate.retrievalMode] !== TIER_ONE) {
+      return { ...candidate, fusionScore: candidate.normalizedScore };
+    }
+    const fusionScore = clampedByModeIdentity.get(candidate.retrievalMode).get(candidateIdentity(candidate));
+    return { ...candidate, fusionScore };
+  });
+}
+
 function compareCandidates(left, right) {
   return MODE_PRIORITY[right.retrievalMode] - MODE_PRIORITY[left.retrievalMode]
-    || right.normalizedScore - left.normalizedScore
+    || right.fusionScore - left.fusionScore
     || (right.source.sessionId === left.source.sessionId ? 0 : 0)
     || String(left.documentId).localeCompare(String(right.documentId));
 }
 
-function fuseCandidates(candidates, limit) {
+/** Exported for direct testing of RRF tier fusion against hand-built candidates. */
+export function fuseCandidates(rawCandidates, limit) {
+  const candidates = withTierOneFusionScores(rawCandidates);
   const best = new Map();
   for (const candidate of candidates) {
     const identity = candidateIdentity(candidate);
@@ -360,44 +476,83 @@ function compareRankedCandidates(left, right) {
 }
 
 /**
- * Re-rank fused candidates by a bounded query-independent importance prior. The
- * prior only multiplies the normalized relevance score, so it can reorder
- * near-ties but never overrule a strong relevance gap. Applied to explicit
- * search ranking only; the automatic preflight path never sets this flag, so
+ * Re-rank fused candidates by a bounded query-independent importance prior.
+ * IMPORTANCE_PRIOR_MAX_MULTIPLIER is calibrated against each candidate's own
+ * per-mode normalizedScore (a ~13% relevance-gap bound), not against
+ * fusionScore, whose RRF position blend already compresses adjacent-rank
+ * gaps within a mode — multiplying the prior directly onto fusionScore would
+ * let a bounded 1.15x prior overrule a relevance gap RRF's own blend had
+ * already narrowed, breaking the "prior can never overrule a strong
+ * relevance gap" contract. Instead, apply the prior to a shadow copy of the
+ * pre-fusion candidate pool's normalizedScore and re-run the same cross-mode
+ * RRF fusion over that shadow pool, so a document's ranking position
+ * reflects both the upstream cross-mode corroboration (the reason this
+ * fusion tier exists) and a prior bounded relative to the calibrated
+ * per-mode relevance scale, exactly as before. Every explicit search/gather
+ * caller (src/daemon/operations.js) sets `applyImportancePrior: true`
+ * unconditionally, so this ranking is what actually reaches results, not
+ * just an intermediate candidate-truncation step. Applied to explicit search
+ * ranking only; the automatic preflight path never sets this flag, so
  * frozen-hint scoring stays byte-identical.
  */
-async function applyImportancePriors(view, candidates, project) {
-  const ranked = [];
-  for (const candidate of candidates) {
-    const prior = await documentImportancePrior(view, {
-      documentId: candidate.documentId,
-      version: candidate.version,
-      project,
-    });
-    ranked.push({
-      ...candidate,
-      importancePrior: prior,
-      rankingScore: candidate.normalizedScore * prior,
-    });
+async function applyImportancePriors(view, collected, project) {
+  const priorByIdentity = new Map();
+  const shadowCandidates = [];
+  for (const candidate of collected.rawCandidates) {
+    const identity = candidateIdentity(candidate);
+    let prior = priorByIdentity.get(identity);
+    if (prior === undefined) {
+      prior = await documentImportancePrior(view, {
+        documentId: candidate.documentId,
+        version: candidate.version,
+        project,
+      });
+      priorByIdentity.set(identity, prior);
+    }
+    shadowCandidates.push({ ...candidate, normalizedScore: candidate.normalizedScore * prior });
   }
+  const refused = fuseCandidates(shadowCandidates, shadowCandidates.length);
+  const rankingScoreByIdentity = new Map(
+    refused.map((candidate) => [candidateIdentity(candidate), candidate.fusionScore]),
+  );
+  const ranked = collected.candidates.map((candidate) => {
+    const identity = candidateIdentity(candidate);
+    return {
+      ...candidate,
+      importancePrior: priorByIdentity.get(identity),
+      rankingScore: rankingScoreByIdentity.get(identity),
+    };
+  });
   return ranked.sort(compareRankedCandidates);
 }
 
 function preserveCandidateMargins(candidates) {
-  return candidates.map((candidate, index) => {
-    const sameModeNext = candidates.slice(index + 1)
-      .find(({ retrievalMode }) => retrievalMode === candidate.retrievalMode);
-    // The list may be ordered by rankingScore (importance-prior reordering)
-    // rather than normalizedScore, so the next same-mode candidate is not
-    // guaranteed to have a lower normalizedScore than this one. The contract
-    // requires a non-negative margin, so a prior-driven reorder reports a
-    // margin of 0 (no clear lead) instead of a negative confidence gap.
-    const margin = candidate.normalizedScore - (sameModeNext?.normalizedScore ?? 0);
-    return {
-      ...candidate,
-      margin: Number(Math.max(0, margin).toFixed(6)),
-    };
-  });
+  // Margin is the confidence gap to the next-best candidate *of the same
+  // mode*, an intrinsic property of the mode's own calibrated scores. It
+  // must not be read off the array's presentation order: both RRF fusion
+  // and importance-prior reordering can legitimately promote a candidate
+  // above a same-mode candidate with a higher normalizedScore, and margin
+  // computed against that position would go negative, violating its [0,1]
+  // contract. Sorting by normalizedScore within each mode first guarantees
+  // a non-negative margin regardless of how the caller's array is ordered.
+  const byMode = new Map();
+  for (const candidate of candidates) {
+    const list = byMode.get(candidate.retrievalMode);
+    if (list) list.push(candidate);
+    else byMode.set(candidate.retrievalMode, [candidate]);
+  }
+  const marginByIdentity = new Map();
+  for (const list of byMode.values()) {
+    const sorted = [...list].sort((left, right) => right.normalizedScore - left.normalizedScore);
+    sorted.forEach((candidate, index) => {
+      const margin = candidate.normalizedScore - (sorted[index + 1]?.normalizedScore ?? 0);
+      marginByIdentity.set(candidateIdentity(candidate), Number(margin.toFixed(6)));
+    });
+  }
+  return candidates.map((candidate) => ({
+    ...candidate,
+    margin: marginByIdentity.get(candidateIdentity(candidate)),
+  }));
 }
 
 function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, semanticAttempted }) {
@@ -478,6 +633,14 @@ async function collectCandidates(view, request, options) {
   return Object.freeze({
     generation,
     candidates: Object.freeze(preserveCandidateMargins(fused)),
+    // The pre-fusion pool, kept alongside the deduped `candidates` view.
+    // fuseCandidates collapses same-identity duplicates down to one
+    // surviving mode's copy per document; a later re-fusion pass (expansion,
+    // recency decay) that only had the already-collapsed `candidates` to
+    // work from would permanently lose whichever other mode's copy lost that
+    // collapse, so it could never recompute genuine cross-mode RRF credit
+    // for that document again. Re-fusion passes fuse over this pool instead.
+    rawCandidates: Object.freeze(candidates),
     mode: responseMode({ exactAttempted, lexicalAttempted, structuralAttempted }),
     exactAttempted,
     lexicalAttempted,
@@ -611,13 +774,16 @@ async function broadenWithExpansion(store, collected, request, options) {
       expandedTerms: Object.freeze(result.matchedTerms.filter((term) => expandedTermSet.has(term))),
     }));
   const limit = Math.min(100, Math.max(request.limit, request.limit * 3));
-  const candidates = preserveCandidateMargins(fuseCandidates([
-    ...collected.candidates,
-    ...expandedCandidates,
-  ], limit));
+  // Re-fuse over the pre-fusion pool, not the already-deduped `candidates`
+  // view: fusing over the deduped view would only ever see one surviving
+  // mode's copy per document and could never recompute cross-mode RRF credit
+  // for a document whose other-mode copy was already collapsed away.
+  const rawCandidates = Object.freeze([...collected.rawCandidates, ...expandedCandidates]);
+  const candidates = preserveCandidateMargins(fuseCandidates(rawCandidates, limit));
   return Object.freeze({
     ...collected,
     candidates: Object.freeze(candidates),
+    rawCandidates,
     expansionTerms: Object.freeze(expansionTerms),
   });
 }
@@ -638,13 +804,20 @@ function shouldTrySemantic(collected, request, options) {
 async function broadenWithSemantic(collected, request, options) {
   if (!shouldTrySemantic(collected, request, options)) return collected;
   const results = await options.semantic.search(request);
-  const candidates = preserveCandidateMargins(fuseCandidates([
-    ...collected.candidates,
+  // Fuse over the pre-fusion pool (see broadenWithExpansion) so a document
+  // whose lexical copy already lost the identity collapse still contributes
+  // its lexical rank to this pass's cross-mode RRF recomputation.
+  const rawCandidates = Object.freeze([
+    ...collected.rawCandidates,
     ...semanticCandidates(results, collected.generation),
-  ], Math.min(100, Math.max(request.limit, request.limit * 3))));
+  ]);
+  const candidates = preserveCandidateMargins(
+    fuseCandidates(rawCandidates, Math.min(100, Math.max(request.limit, request.limit * 3))),
+  );
   return Object.freeze({
     ...collected,
     candidates: Object.freeze(candidates),
+    rawCandidates,
     mode: responseMode({
       exactAttempted: collected.exactAttempted,
       lexicalAttempted: collected.lexicalAttempted,
@@ -661,12 +834,16 @@ async function broadenWithSemantic(collected, request, options) {
  * see the undecayed lexical score, or decay would change which requests pay
  * for an embedding-backed semantic search, an interaction the caller never
  * opted into via recencyDecay. It also runs before the importance prior
- * below, which re-fuses by whatever normalizedScore it is handed and must see
- * the decay-adjusted value to reorder consistently with the exposed score.
+ * below, which reads whatever fusionScore this re-fusion produces.
  */
 function applyRecencyDecay(collected, decay, candidateLimit) {
   if (decay === undefined) return collected;
-  const decayed = collected.candidates.map((candidate) => {
+  // Decay (and re-fuse) over the pre-fusion pool, not the already-deduped
+  // `candidates` view: see collectCandidates' rawCandidates comment. Fusing
+  // over the deduped view here would have permanently discarded whichever
+  // mode's copy lost the identity collapse in the prior pass, and could
+  // never recompute genuine cross-mode RRF credit for that document again.
+  const decayed = collected.rawCandidates.map((candidate) => {
     if (candidate.retrievalMode !== "lexical") return candidate;
     const multiplier = recencyDecayMultiplier({
       retentionClass: candidate.retentionClass,
@@ -683,20 +860,18 @@ function applyRecencyDecay(collected, decay, candidateLimit) {
     candidates: Object.freeze(preserveCandidateMargins(
       fuseCandidates(decayed, candidateLimit),
     )),
+    rawCandidates: Object.freeze(decayed),
   });
 }
 
 /**
  * Apply the importance prior to the final candidate set, after semantic
- * broadening and any recency decay. Semantic broadening re-fuses candidates by
- * normalizedScore (broadenWithSemantic), and recency decay does the same
- * (applyRecencyDecay), either of which would otherwise discard any
- * prior-driven reorder from an earlier pass — applying the prior once, last,
- * keeps it consistent regardless of whether semantic search engaged or decay
- * was requested.
+ * broadening and any recency decay. See applyImportancePriors for why this
+ * re-fuses over the pre-fusion pool (collected.rawCandidates) instead of
+ * ranking the already-deduped `candidates` view directly.
  */
 async function rankByImportance(store, collected, project) {
-  const ranked = await store.snapshot((view) => applyImportancePriors(view, collected.candidates, project));
+  const ranked = await store.snapshot((view) => applyImportancePriors(view, collected, project));
   return Object.freeze({
     ...collected,
     candidates: Object.freeze(preserveCandidateMargins(ranked)),

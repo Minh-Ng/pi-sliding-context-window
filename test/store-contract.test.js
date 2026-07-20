@@ -797,6 +797,34 @@ test("search response evidence rejects negative and out-of-range confidence valu
   }
 });
 
+test("gathered anchor evidence may carry an optional relevance score and mode, still bounded to [0, 1]", () => {
+  const scoredAnchor = {
+    ...results["store.gather"].evidence[0],
+    score: 0.62,
+    retrievalMode: "lexical",
+  };
+  const withScore = assertStoreResult("store.gather", {
+    ...results["store.gather"],
+    evidence: [scoredAnchor],
+  });
+  assert.equal(withScore.evidence[0].score, 0.62);
+  assert.equal(withScore.evidence[0].retrievalMode, "lexical");
+
+  // Chronological before/after evidence omitting score/retrievalMode remains
+  // valid — only anchors carry a search-ranked relevance signal.
+  assertStoreResult("store.gather", results["store.gather"]);
+
+  for (const value of [-0.01, 1.01]) {
+    expectContractError(
+      () => assertStoreResult("store.gather", {
+        ...results["store.gather"],
+        evidence: [{ ...scoredAnchor, score: value }],
+      }),
+      { code: "INVALID_RESPONSE", path: "$.result.evidence[0].score" },
+    );
+  }
+});
+
 test("unknown operations and fields fail with stable codes and paths", () => {
   expectContractError(
     () => assertStoreRequest("store.destroy", {}),

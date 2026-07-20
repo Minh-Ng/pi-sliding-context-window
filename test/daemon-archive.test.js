@@ -995,6 +995,10 @@ test("daemon facade gathers exact workflow successors in one bounded call", asyn
       "workflow-verify",
     ]);
     assert.match(gathered.evidence[1].document.recalledText, /service identity/u);
+    assert.equal(typeof gathered.evidence[0].score, "number");
+    assert.ok(gathered.evidence[0].score >= 0 && gathered.evidence[0].score <= 1);
+    assert.equal(Object.hasOwn(gathered.evidence[1], "score"), false);
+    assert.equal(Object.hasOwn(gathered.evidence[2], "score"), false);
   } finally {
     try { archive?.close(); } catch {}
     await stopProcess(daemonProcessId);

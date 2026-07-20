@@ -21,6 +21,7 @@ import { recallArchive } from "../src/retrieval/recall.js";
 import { preflightArchive } from "../src/retrieval/preflight.js";
 import {
   findStoredWindowForByteRange,
+  fuseCandidates,
   normalizeModeScore,
   searchArchive,
 } from "../src/retrieval/search.js";
@@ -65,6 +66,121 @@ test("structural byte mapping pages beyond 100000 stored windows", () => {
   );
   assert.equal(window.ordinal, finalOrdinal);
   assert.equal(scans, 101);
+});
+
+function tierOneCandidate(documentId, retrievalMode, normalizedScore, extra = {}) {
+  return {
+    documentId,
+    version: 1,
+    retrievalMode,
+    normalizedScore,
+    source: { sessionId: "session-fusion" },
+    ...extra,
+  };
+}
+
+test("RRF fusion preserves single-mode rank order across both weight-bucket boundaries", () => {
+  // One mode contributing means the RRF component and the normalized score
+  // both decrease with rank, so their position-aware blend can never invert
+  // a strictly decreasing per-mode ranking — including at the rank 3→4 and
+  // rank 10→11 boundaries where the blend weight itself steps down.
+  const decreasing = Array.from({ length: 11 }, (_, index) =>
+    tierOneCandidate(`rank-${index + 1}`, "lexical", 0.99 - (index * 0.02)));
+  const fused = fuseCandidates(decreasing, 20);
+  assert.deepEqual(
+    fused.map(({ documentId }) => documentId),
+    decreasing.map(({ documentId }) => documentId),
+  );
+});
+
+test("RRF fusion preserves single-mode rank order even with a near-zero gap at a weight-bucket boundary", () => {
+  // The boundary case the previous test's 0.02 gaps were too wide to catch:
+  // near a normalized score of ~0.9, a rank-10->11 gap of only 0.001 is
+  // small enough that the un-clamped weight step (0.6 -> 0.4) hands rank 11
+  // a higher blended score than rank 10 (0.88306 vs 0.88286 unclamped),
+  // inverting an ordering the lexical mode itself already established.
+  const scores = [0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92, 0.91, 0.9, 0.899];
+  const decreasing = scores.map((score, index) => tierOneCandidate(`rank-${index + 1}`, "lexical", score));
+  const fused = fuseCandidates(decreasing, 20);
+  assert.deepEqual(
+    fused.map(({ documentId }) => documentId),
+    decreasing.map(({ documentId }) => documentId),
+  );
+});
+
+test("RRF fusion assigns ranks by score, not array position, for an out-of-order mode list", () => {
+  // Re-fusion callers (broadenWithExpansion appending requery-only candidates
+  // after the already-fused first pass; applyRecencyDecay re-fusing a list
+  // still ordered by pre-decay fusionScore) can hand a single mode's
+  // candidates to fuseCandidates out of best-first order. A strictly
+  // stronger candidate appended last (as expansion does) must still rank
+  // ahead of weaker candidates that merely happen to appear earlier in the
+  // array, or it can be dropped at a downstream candidateLimit slice.
+  const outOfOrder = [
+    tierOneCandidate("weak-first", "lexical", 0.5),
+    tierOneCandidate("weak-second", "lexical", 0.4),
+    tierOneCandidate("weak-third", "lexical", 0.3),
+    // Appended last (as an expansion-found candidate would be), but the
+    // strongest score in the list.
+    tierOneCandidate("strong-appended-last", "lexical", 0.9),
+  ];
+  const fused = fuseCandidates(outOfOrder, 20);
+  assert.deepEqual(
+    fused.map(({ documentId }) => documentId),
+    ["strong-appended-last", "weak-first", "weak-second", "weak-third"],
+  );
+});
+
+test("RRF fusion credits a candidate found by both lexical and semantic ranking", () => {
+  // "boosted" ranks second lexically (0.3) and first semantically (0.4) — a
+  // lower single-mode score than "solo-lexical" (0.6, lexical rank 1, no
+  // semantic hit). Plain score comparison would rank solo-lexical first;
+  // RRF's cross-mode rank credit should promote boosted instead.
+  const fused = fuseCandidates([
+    tierOneCandidate("solo-lexical", "lexical", 0.6),
+    tierOneCandidate("boosted", "lexical", 0.3),
+    tierOneCandidate("boosted", "semantic", 0.4),
+  ], 10);
+  assert.deepEqual(fused.map(({ documentId }) => documentId), ["boosted", "solo-lexical"]);
+  // The stronger single-mode evidence (semantic, 0.4) survives as the
+  // rendered candidate for the fused identity, not the weaker lexical copy.
+  assert.equal(fused[0].retrievalMode, "semantic");
+});
+
+test("RRF fusion never crosses the exact/structural/lexical priority tiers", () => {
+  const fused = fuseCandidates([
+    tierOneCandidate("lex-winner", "lexical", 0.99),
+    tierOneCandidate("struct-winner", "structural", 0.01),
+    tierOneCandidate("exact-winner", "exact", 0.01),
+  ], 10);
+  assert.deepEqual(fused.map(({ documentId }) => documentId), [
+    "exact-winner",
+    "struct-winner",
+    "lex-winner",
+  ]);
+});
+
+test("RRF fusion does not let duplicate same-document ranks self-accumulate credit", () => {
+  // A backend can return more than one entry for the same document within a
+  // single mode's rank list (e.g. one per matched semantic span). Those must
+  // collapse to one rank, or the document accumulates RRF credit against
+  // itself as if independently corroborated, and inflates maxRrf enough to
+  // suppress a genuinely cross-mode-corroborated candidate's fused score.
+  const corroboratedFusionScore = (fused) =>
+    fused.find(({ documentId }) => documentId === "corroborated").fusionScore;
+  const withDuplicateSpans = fuseCandidates([
+    tierOneCandidate("long-doc", "semantic", 0.95),
+    tierOneCandidate("long-doc", "semantic", 0.94),
+    tierOneCandidate("corroborated", "semantic", 0.6),
+    tierOneCandidate("corroborated", "lexical", 0.6),
+  ], 10);
+  const withoutDuplicateSpans = fuseCandidates([
+    tierOneCandidate("long-doc", "semantic", 0.95),
+    tierOneCandidate("corroborated", "semantic", 0.6),
+    tierOneCandidate("corroborated", "lexical", 0.6),
+  ], 10);
+  assert.equal(corroboratedFusionScore(withDuplicateSpans), corroboratedFusionScore(withoutDuplicateSpans));
+  assert.deepEqual(withDuplicateSpans.map(({ documentId }) => documentId), ["corroborated", "long-doc"]);
 });
 
 function request(id, text, overrides = {}) {
@@ -303,6 +419,111 @@ test("explicit correction is excluded at commit across exact, lexical, structura
   assert.equal(automatic.hints[0].disclosureType, "historical-snippet");
   assert.match(automatic.modelVisibleText, /NEW_REPLACEMENT_ONLY/u);
   assert.doesNotMatch(automatic.modelVisibleText, /OLD_TARGET_ONLY|correction-target/u);
+});
+
+test("hybrid search with a corroborated candidate and duplicate semantic spans validates and ranks correctly", async (t) => {
+  // End-to-end regression for two defects in cross-mode RRF fusion once a real
+  // semantic backend is wired in: (1) a candidate promoted above a
+  // higher-normalizedScore same-mode candidate by fusion must still validate
+  // against the response schema's [0,1] margin bound; (2) a document with
+  // multiple semantic spans (duplicate candidateIdentity within the semantic
+  // rank list) must not self-accumulate RRF credit and displace a
+  // genuinely cross-mode-corroborated candidate.
+  const { store, worker } = await fixture(t, "search-hybrid-rrf");
+  await admit(store, "corroborated", "flow control settings for the gateway gauge adjust smoothly.");
+  await admit(store, "long-doc", "Unrelated padding content with no query terms at all.", { createdAt: 200 });
+  await worker.drain();
+
+  const semanticResult = (documentId, score, windowOrdinal) => ({
+    documentId,
+    version: 1,
+    kind: "turn",
+    createdAt: 100,
+    score,
+    text: "semantic span text",
+    project: "/workspace/search",
+    sessionId: "session-main",
+    sourceMessageKeys: [],
+    windowOrdinal,
+    startByte: 0,
+    endByte: 10,
+  });
+  const response = await searchArchive(store, {
+    ...withoutUndefined(searchRequest("flow control settings gateway gauge", { limit: 10 })),
+    semanticPolicy: "always",
+  }, {
+    now: 1_000,
+    semantic: {
+      search: async () => [
+        // Two spans of the same semantic-only document — must collapse to
+        // one rank rather than occupying ranks 1 and 2.
+        semanticResult("long-doc", 0.95, 0),
+        semanticResult("long-doc", 0.94, 1),
+        // Also found lexically (weaker) and semantically (stronger, so the
+        // semantic copy is the one that survives fusion's identity
+        // dedup) — genuinely cross-mode-corroborated, and rendered in the
+        // same mode ("semantic") as long-doc so a margin computed against
+        // presentation-order neighbors (instead of same-mode score order)
+        // would go negative here.
+        semanticResult("corroborated", 0.85, 0),
+      ],
+    },
+  });
+
+  assert.equal(response.status, "resolved");
+  assert.ok(response.results.length >= 2);
+  assert.ok(response.results.every(({ margin }) => margin >= 0 && margin <= 1));
+  assert.deepEqual(response.results.map(({ documentId }) => documentId), ["corroborated", "long-doc"]);
+});
+
+test("cross-mode RRF fusion order survives the daemon's actual explicit-search options", async (t) => {
+  // Same corroboration scenario as above, but through the options every real
+  // store.search/gather call actually sets (src/daemon/operations.js:
+  // applyImportancePrior: true, recencyDecay: true unconditionally). Without
+  // basing rankingScore on fusionScore, rankByImportance's final sort
+  // discards the RRF reorder computed above and falls back to plain
+  // normalizedScore, which would put the merely-unrelated-but-higher-scored
+  // "long-doc" ahead of the genuinely cross-mode-corroborated "corroborated".
+  const { store, worker } = await fixture(t, "search-hybrid-rrf-daemon-options");
+  await admit(store, "corroborated", "flow control settings for the gateway gauge adjust smoothly.");
+  await admit(store, "long-doc", "Unrelated padding content with no query terms at all.", { createdAt: 200 });
+  await worker.drain();
+
+  const semanticResult = (documentId, score, windowOrdinal) => ({
+    documentId,
+    version: 1,
+    kind: "turn",
+    createdAt: 100,
+    score,
+    text: "semantic span text",
+    project: "/workspace/search",
+    sessionId: "session-main",
+    sourceMessageKeys: [],
+    windowOrdinal,
+    startByte: 0,
+    endByte: 10,
+  });
+  const response = await searchArchive(store, {
+    ...withoutUndefined(searchRequest("flow control settings gateway gauge", { limit: 10 })),
+    semanticPolicy: "always",
+  }, {
+    now: 1_000,
+    semantic: {
+      search: async () => [
+        semanticResult("long-doc", 0.95, 0),
+        semanticResult("long-doc", 0.94, 1),
+        semanticResult("corroborated", 0.85, 0),
+      ],
+    },
+    // The daemon's actual explicit search/gather flags (operations.js `search`
+    // and `gather` handlers), not the bare defaults the test above uses.
+    applyImportancePrior: true,
+    recencyDecay: true,
+  });
+
+  assert.equal(response.status, "resolved");
+  assert.ok(response.results.length >= 2);
+  assert.deepEqual(response.results.map(({ documentId }) => documentId), ["corroborated", "long-doc"]);
 });
 
 test("oversized semantic metadata is omitted at the search result boundary", async (t) => {

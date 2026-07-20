@@ -174,3 +174,32 @@ test("gather reports continuation and obeys aggregate evidence bounds", async (t
   assert.ok(gather.returnedTokens <= 128);
   assert.deepEqual(gather.evidence.map(({ document }) => document.documentId), ["anchor", "step-1"]);
 });
+
+test("gather carries a search-ranked score only on anchor evidence, never on traversal neighbors", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("anchor", "Reusable migration procedure anchor.", 100);
+  await admit("step-1", "First continuation detail.", 110);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "Reusable migration procedure anchor",
+    intent: "workflow",
+    limit: 1,
+    before: 0,
+    after: 1,
+    neighborhoodAnchors: 1,
+    maxEvidence: 2,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.deepEqual(gather.evidence.map(({ relation }) => relation), ["anchor", "after"]);
+  const [anchor, after] = gather.evidence;
+  assert.equal(typeof anchor.score, "number");
+  assert.ok(anchor.score >= 0 && anchor.score <= 1);
+  assert.equal(anchor.retrievalMode, "lexical");
+  assert.equal(Object.hasOwn(after, "score"), false);
+  assert.equal(Object.hasOwn(after, "retrievalMode"), false);
+});

@@ -230,6 +230,12 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       locator: item.candidate.locator,
       document,
       ...(item.nearDuplicates > 0 ? { nearDuplicates: item.nearDuplicates } : {}),
+      // Traversal-derived before/after neighbors carry a fixed placeholder
+      // score (chronological adjacency, not a ranked hit); only the anchor's
+      // real search-ranked score is a relevance signal worth surfacing.
+      ...(item.relation === "anchor"
+        ? { score: item.candidate.score, retrievalMode: item.candidate.retrievalMode }
+        : {}),
     });
   }
   evidence.sort(chronological);

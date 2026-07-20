@@ -577,6 +577,10 @@ const gatheredEvidence = object({
   locator: identifier,
   document: resolvedRecall,
   nearDuplicates: nonNegativeInteger,
+  // Only anchor evidence carries a search-ranked relevance score; chronological
+  // before/after neighbors are context, not ranked hits, so this stays optional.
+  score: normalizedScore,
+  retrievalMode: enumeration(["exact", "lexical", "semantic", "structural"]),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({

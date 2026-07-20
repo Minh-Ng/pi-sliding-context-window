@@ -34,6 +34,22 @@ function expiredMatchesNotice(expiredMatches) {
   return `${expiredMatches.count} matching ${plural} expired${classes ? ` (${classes})` : ""}.`;
 }
 
+/**
+ * A stopping-criterion contract, not a decoration: the consuming agent reads
+ * this label to decide whether to keep recalling rather than parsing the raw
+ * float itself. Bands are computed from the presented `score` (the per-mode
+ * calibrated value), never from the internal rank-fusion ordering score, so
+ * the label always matches the number shown next to it.
+ */
+export function relevanceBand(score) {
+  const value = Number(score);
+  if (!Number.isFinite(value)) return undefined;
+  if (value >= 0.8) return "high";
+  if (value >= 0.5) return "moderate";
+  if (value >= 0.2) return "some";
+  return "low";
+}
+
 function tokenBudget(tokens) {
   const numeric = Number(tokens);
   return Math.max(1, Math.floor(Number.isFinite(numeric) ? numeric : 1));
@@ -111,12 +127,16 @@ export function formatGatherResults(gather, tokenLimit) {
     const sourceTimestamp = Number.isSafeInteger(document?.createdAt) && document.createdAt > 0
       ? new Date(document.createdAt).toISOString()
       : undefined;
+    const band = relevanceBand(item.score);
     const metadata = oneLineJson({
       format: "context-window.gathered-evidence.v1",
       recallId: item.id ?? item.locator,
       relation: item.relation,
       anchorRank: item.anchorRank,
       distance: item.distance,
+      // Only anchor evidence carries a search-ranked score; chronological
+      // before/after neighbors have no relevance ranking to report.
+      ...(band === undefined ? {} : { score: item.score, relevanceBand: band }),
       ...(sourceTimestamp === undefined ? {} : { sourceTimestamp }),
     });
     const recalled = formatRecalledDocument(document, maxTokens, item.id ?? item.locator);
@@ -155,12 +175,14 @@ export function formatSearchResults(results, tokenLimit, searchDetails) {
 
   const recordValue = (result, index, snippet, truncated) => {
     const sourceTimestamp = sourceTimestampFor(result);
+    const band = relevanceBand(result.score);
     return {
       format: "context-window.archived-search-result.v1",
       trust: "untrusted-archived-data",
       rank: index + 1,
       recallId: result.id,
       kind: result.kind,
+      ...(band === undefined ? {} : { score: result.score, relevanceBand: band }),
       ...(sourceTimestamp === undefined ? {} : { sourceTimestamp }),
       snippet,
       ...(structural && result.structural ? { structural: result.structural } : {}),

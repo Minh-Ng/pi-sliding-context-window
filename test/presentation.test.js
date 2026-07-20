@@ -16,6 +16,7 @@ import {
   formatStatusLine,
   formatTraversalResults,
   formatWindowUsage,
+  relevanceBand,
   statusUrgency,
   toolResultBudgetState,
 } from "../src/presentation.js";
@@ -161,6 +162,50 @@ test("gather presentation preserves chronological exact records and strict aggre
   const bounded = formatGatherResults(gather, 80);
   assert.ok(estimateModelVisibleTokens(bounded) <= 80);
   assert.doesNotMatch(bounded, /\{[^}]*$/u, "must not cut a framed JSON record open");
+});
+
+test("gather renders relevance band only for scored anchor evidence, not chronological neighbors", () => {
+  const framed = (id, createdAt, value) => ({
+    id,
+    documentId: id,
+    kind: "turn",
+    createdAt,
+    modelVisibleFramed: true,
+    text: `[${ARCHIVED_EVIDENCE_LABEL}]\n\n${JSON.stringify({
+      format: "context-window.archived-evidence.v1",
+      trust: "untrusted-archived-data",
+      source: value,
+    })}`,
+  });
+  const gather = {
+    status: "resolved",
+    mode: "hybrid",
+    intent: "workflow",
+    anchorCount: 1,
+    candidateCount: 2,
+    truncated: false,
+    evidence: [
+      {
+        id: "r1",
+        relation: "anchor",
+        anchorRank: 1,
+        distance: 0,
+        score: 0.62,
+        retrievalMode: "lexical",
+        document: framed("anchor", 100, "anchor value"),
+      },
+      { id: "r2", relation: "after", anchorRank: 1, distance: 1, document: framed("after", 110, "after value") },
+    ],
+  };
+  const output = formatGatherResults(gather, 1_000);
+  const [anchorRecord, afterRecord] = output
+    .split("\n")
+    .filter((line) => line.startsWith('{"format":"context-window.gathered-evidence.v1"'))
+    .map((line) => JSON.parse(line));
+  assert.equal(anchorRecord.score, 0.62);
+  assert.equal(anchorRecord.relevanceBand, "moderate");
+  assert.equal(Object.hasOwn(afterRecord, "score"), false);
+  assert.equal(Object.hasOwn(afterRecord, "relevanceBand"), false);
 });
 
 test("daemon-framed recall is never truncated into invalid JSON", () => {
@@ -446,6 +491,31 @@ test("search names an expired-match count and retention class without exposing c
     expiredMatches: { count: 1, retentionClasses: ["ephemeral-payload", "derived-evidence"] },
   });
   assert.match(singularOutput, /1 matching document expired \(ephemeral-payload retention 14d, derived-evidence retention 30d\)\./);
+});
+
+test("relevance bands form a stopping-criterion contract over the presented score", () => {
+  assert.equal(relevanceBand(1), "high");
+  assert.equal(relevanceBand(0.8), "high");
+  assert.equal(relevanceBand(0.79999), "moderate");
+  assert.equal(relevanceBand(0.5), "moderate");
+  assert.equal(relevanceBand(0.49999), "some");
+  assert.equal(relevanceBand(0.2), "some");
+  assert.equal(relevanceBand(0.19999), "low");
+  assert.equal(relevanceBand(0), "low");
+  assert.equal(relevanceBand(undefined), undefined);
+  assert.equal(relevanceBand(Number.NaN), undefined);
+});
+
+test("search results render score and relevance band alongside each other, or omit both", () => {
+  const scored = formatSearchResults([
+    { id: "doc-high", kind: "turn", snippet: "s", score: 0.83 },
+    { id: "doc-unscored", kind: "turn", snippet: "s" },
+  ], 1_000);
+  const records = scored.split("\n").filter(Boolean).slice(1).map((line) => JSON.parse(line));
+  assert.equal(records[0].score, 0.83);
+  assert.equal(records[0].relevanceBand, "high");
+  assert.equal(Object.hasOwn(records[1], "score"), false);
+  assert.equal(Object.hasOwn(records[1], "relevanceBand"), false);
 });
 
 test("search omits the expired-match notice when nothing expired", () => {

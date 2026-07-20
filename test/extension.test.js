@@ -1490,6 +1490,68 @@ test("unsafe threshold, overflow, and manual compaction return the same bounded 
   handlers.get("session_shutdown")({}, ctx);
 });
 
+test("/window usage reports the same epoch estimate as the footer plus a per-component breakdown", async () => {
+  const handlers = new Map();
+  const commands = new Map();
+  const notifications = [];
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => memoryCheckpointArchive(),
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand(name, command) { commands.set(name, command); },
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { provider: "provider", id: "model", contextWindow: 372_000 },
+    isProjectTrusted: () => false,
+    getContextUsage: () => ({ tokens: 1_234, contextWindow: 372_000, percent: 0.3 }),
+    sessionManager: { getSessionId: () => "usage-test", getBranch: () => [] },
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
+  };
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  handlers.get("context")({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "please read this file" }], timestamp: 1 },
+      {
+        role: "toolResult",
+        content: [{ type: "text", text: "z".repeat(2_000) }],
+        timestamp: 2,
+        toolCallId: "call-1",
+        toolName: "Read",
+      },
+      { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 3 },
+    ],
+  }, ctx);
+
+  await commands.get("window").handler("usage", ctx);
+  await commands.get("window").handler("status", ctx);
+
+  assert.equal(notifications.length, 2);
+  const [usageResult, statusResult] = notifications;
+  const usage = usageResult.message;
+  assert.equal(usageResult.level, "info");
+
+  assert.match(usage, /^Epoch estimate: ~\d[\d,]* tokens; rotation limit: [\d,]+ tokens/);
+  const [, epochEstimateFromUsage] = usage.match(/^Epoch estimate: ~([\d,]+) tokens/);
+  assert.match(statusResult.message, new RegExp(`~${epochEstimateFromUsage} tokens`));
+
+  assert.match(usage, /Provider-reported usage: 1,234 tokens; provider context window: 372,000 tokens/);
+  assert.match(usage, /Implied fixed overhead \(provider usage - epoch estimate\): \+[\d,]+ tokens/);
+  assert.match(usage, /Per-component breakdown, top \d+\/3 by token share \(role or role:tool\):/);
+  assert.match(usage, /- toolResult:Read: [\d,]+ tokens \(\d+%\) across 1 message\(s\)/);
+  assert.match(usage, /Largest single message\(s\), top \d+\/3:/);
+  assert.match(usage, /#2 toolResult:Read: [\d,]+ tokens/);
+
+  handlers.get("session_shutdown")({}, ctx);
+});
+
 test("compaction admission fails closed for missing, malformed, undefined, and thrown checkpoints", async () => {
   const handlers = new Map();
   const archive = memoryCheckpointArchive();

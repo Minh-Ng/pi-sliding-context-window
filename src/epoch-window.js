@@ -457,6 +457,7 @@ export class EpochWindowSession {
     this.boundaryKey = undefined;
     this.activeTokens = undefined;
     this.activeTurns = undefined;
+    this.activeMessages = undefined;
     this.rotations = 0;
     this.forceRotation = false;
     this.lastRotationReason = undefined;
@@ -650,8 +651,9 @@ export class EpochWindowSession {
       suppressedHintMessageKeys,
     );
     this.activeTurns = this.countUserTurns(active);
-    this.activeTokens = estimateTokens(marker ? [marker, ...active] : active);
-    return marker ? [marker, ...active] : active;
+    this.activeMessages = marker ? [marker, ...active] : active;
+    this.activeTokens = estimateTokens(this.activeMessages);
+    return this.activeMessages;
   }
 
   /**
@@ -941,6 +943,7 @@ export class EpochWindowSession {
   clearMeasurement() {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
+    this.activeMessages = undefined;
   }
 
   search(query, options = {}) {

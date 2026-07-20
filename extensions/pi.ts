@@ -28,6 +28,7 @@ import {
   formatStatusLine,
   formatSupersedeResult,
   formatTraversalResults,
+  formatWindowUsage,
 } from "../src/presentation.js";
 import { archiveDocumentProvenance } from "../src/provenance.js";
 import { canonicalProjectId, projectIdentityAlias } from "../src/project-identity.js";
@@ -41,6 +42,7 @@ const TURN_CAP_VALUES = Object.freeze([10, 20, 30, 40, 50, 75, 100]);
 const CONTEXT_CAP_VALUES = Object.freeze([64_000, 96_000, 128_000, 160_000, 192_000, 256_000]);
 const WINDOW_ARGUMENTS = Object.freeze([
   { value: "status", label: "status", description: "Show context-window status" },
+  { value: "usage", label: "usage", description: "Show per-component context token breakdown" },
   { value: "settings", label: "settings", description: "Configure persistent turn and context caps" },
   { value: "rotate", label: "rotate", description: "Queue rotation before the next provider request" },
   { value: "search ", label: "search <query>", description: "Search archived evidence" },
@@ -1252,6 +1254,17 @@ export function createContextEpochWindow({
           ctx.ui.notify(
             "Usage: /window archive redact session|project confirm <token>",
             "warning",
+          );
+          return;
+        }
+        if (input === "usage") {
+          let contextUsage;
+          try {
+            contextUsage = ctx.getContextUsage?.();
+          } catch { /* provider usage is presentation-only; never block the command */ }
+          ctx.ui.notify(
+            formatWindowUsage(active.status({ includeArchiveCount: false }), active.activeMessages, { contextUsage }),
+            "info",
           );
           return;
         }

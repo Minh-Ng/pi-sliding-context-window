@@ -15,6 +15,7 @@ import {
   formatStatusDetails,
   formatStatusLine,
   formatTraversalResults,
+  formatWindowUsage,
   statusUrgency,
 } from "../src/presentation.js";
 import { renderRecalledEvidence } from "../src/retrieval/render.js";
@@ -646,6 +647,66 @@ test("footer urgency uses the nearest configured limit", () => {
   assert.equal(statusUrgency(status({ activeTurns: 16 })), "near");
   assert.equal(statusUrgency(status({ activeTokens: 96_000 })), "limit");
   assert.equal(statusUrgency(status({ rotationPending: true })), "queued");
+});
+
+function windowUsageMessage(role, text, extra = {}) {
+  return { role, content: [{ type: "text", text }], ...extra };
+}
+
+test("/window usage headline restates the footer's own epoch estimate and rotation limit verbatim", () => {
+  const output = formatWindowUsage(status({ activeTokens: 40_000, rotationTokens: 96_000 }), []);
+  assert.match(output, /^Epoch estimate: ~40,000 tokens; rotation limit: 96,000 tokens/);
+});
+
+test("/window usage reports provider usage and derives fixed overhead as provider minus epoch estimate", () => {
+  const output = formatWindowUsage(status({ activeTokens: 40_000 }), [], {
+    contextUsage: { tokens: 46_500, contextWindow: 200_000, percent: 23.25 },
+  });
+  assert.match(output, /Provider-reported usage: 46,500 tokens; provider context window: 200,000 tokens/);
+  assert.match(output, /Implied fixed overhead \(provider usage - epoch estimate\): \+6,500 tokens/);
+});
+
+test("/window usage names provider usage and overhead as unavailable rather than guessing", () => {
+  const noUsage = formatWindowUsage(status({ activeTokens: 40_000 }), []);
+  assert.match(noUsage, /Provider-reported usage: unavailable/);
+  assert.doesNotMatch(noUsage, /Implied fixed overhead/);
+
+  const nullTokens = formatWindowUsage(status({ activeTokens: 40_000 }), [], {
+    contextUsage: { tokens: null, contextWindow: 200_000, percent: null },
+  });
+  assert.match(nullTokens, /Provider-reported usage: unavailable/);
+
+  const unmeasured = formatWindowUsage(status({ activeTokens: undefined, activeTurns: undefined }), undefined, {
+    contextUsage: { tokens: 10_000, contextWindow: 200_000, percent: 5 },
+  });
+  assert.match(unmeasured, /Epoch estimate: not measured since session start\/reload/);
+  assert.match(unmeasured, /Implied fixed overhead: unavailable \(epoch not yet measured\)/);
+});
+
+test("/window usage groups the active epoch by role/tool name and ranks by token share", () => {
+  const messages = [
+    windowUsageMessage("user", "short question"),
+    windowUsageMessage("assistant", "y".repeat(400)),
+    windowUsageMessage("toolResult", "z".repeat(2_000), { toolName: "Bash" }),
+    windowUsageMessage("toolResult", "w".repeat(100), { toolName: "Bash" }),
+    windowUsageMessage("toolResult", "v".repeat(50), { toolName: "Read" }),
+  ];
+  const output = formatWindowUsage(status({ activeTokens: 40_000 }), messages, { topComponents: 2, topMessages: 2 });
+
+  assert.match(output, /Per-component breakdown, top 2\/4 by token share \(role or role:tool\):/);
+  const bashLine = output.split("\n").find((line) => line.startsWith("- toolResult:Bash:"));
+  assert.match(bashLine, /across 2 message\(s\)/);
+  // Bash's combined tool result text dwarfs every other component, so it must rank first.
+  assert.equal(output.split("\n").filter((line) => line.startsWith("- ")).at(0), bashLine);
+  assert.doesNotMatch(output, /toolResult:Read/);
+
+  assert.match(output, /Largest single message\(s\), top 2\/5:/);
+  assert.match(output, /#3 toolResult:Bash: \d+ tokens/);
+});
+
+test("/window usage reports no breakdown when the epoch has no measured messages", () => {
+  const output = formatWindowUsage(status({ activeTokens: undefined, activeTurns: undefined }), undefined);
+  assert.match(output, /No active epoch messages to break down\./);
 });
 
 test("RocksDB status reports compaction evidence without inventing a routine size cap", () => {

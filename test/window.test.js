@@ -5,6 +5,7 @@ import {
   buildTocMarkerText,
   contentToText,
   ESTIMATED_IMAGE_CHARS,
+  estimateMessageTokens,
   estimateTokens,
   externalizeLargeToolResults,
   extractDecisionCandidates,
@@ -307,6 +308,24 @@ test("serializes and counts Pi synthetic message payloads", () => {
   assert.notEqual(messageKey(messages[0]), messageKey({ ...messages[0], output: `${large}!` }));
   assert.notEqual(messageKey(messages[1]), messageKey({ ...messages[1], summary: `${large}!` }));
   assert.notEqual(messageKey(messages[2]), messageKey({ ...messages[2], fromId: "other-branch" }));
+});
+
+test("estimateMessageTokens shares its per-message accounting with estimateTokens' array aggregate", () => {
+  const messages = [
+    user("short question", 1),
+    assistant("a longer answer with more characters to weigh", 2),
+    tool("some tool output text", 3, "call-1"),
+  ];
+
+  // estimateTokens' array path ceils once over the summed characters (plus a
+  // small n-1 join-character term), while summing estimateMessageTokens ceils
+  // once per message; the two can drift by at most about one token per
+  // message from that independent per-message rounding.
+  const summedTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+  assert.ok(Math.abs(estimateTokens(messages) - summedTokens) <= messages.length);
+
+  assert.equal(estimateMessageTokens(tool("x", 4, "call-2")), estimateMessageTokens(tool("x", 5, "call-3")));
+  assert.ok(estimateMessageTokens(assistant("x".repeat(400), 6)) > estimateMessageTokens(assistant("x", 7)));
 });
 
 test("multimodal serialization is bounded, content-sensitive, and provider-conservative", () => {

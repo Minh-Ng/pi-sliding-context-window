@@ -10,6 +10,7 @@ import {
 import { archiveDocumentProvenance } from "./provenance.js";
 import { oneLineJson } from "./retrieval/render.js";
 import { DEFAULT_RETENTION_LIFETIMES_MS } from "./daemon/retention-policy.js";
+import { estimateMessageTokens } from "./window.js";
 
 const TRUNCATION_MARKER = "[… retrieval truncated …]";
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -590,4 +591,102 @@ export function formatStatusDetails(status) {
   );
   if (status.archiveStorage) sections.push(formatArchiveStorage(status.archiveStorage));
   return sections.join("\n");
+}
+
+const WINDOW_USAGE_TOP_COMPONENTS = 5;
+const WINDOW_USAGE_TOP_MESSAGES = 5;
+
+/** role:toolName for tool calls/results, matching window.js's own label
+ * convention (estimatedMessageCharacters), else the bare role. */
+function windowUsageComponentKey(message) {
+  const role = String(message?.role ?? "unknown");
+  if (role === "toolResult" || role === "tool") {
+    return `${role}:${message?.toolName ?? message?.name ?? "unknown"}`;
+  }
+  return role;
+}
+
+function windowUsageMessageLabel(message, position) {
+  return `#${position} ${windowUsageComponentKey(message)}`;
+}
+
+/**
+ * Read-only per-component breakdown of the active epoch's provider-visible
+ * messages (the same array window.js's estimateTokens measured for the
+ * status footer), grouped by role/tool name. Component and largest-message
+ * tokens are computed with window.js's estimateMessageTokens — the same
+ * per-message character accounting the footer's aggregate estimate sums —
+ * so the numbers trace back to that one estimator. Each component's total
+ * is rounded independently, so the sum of components can differ from the
+ * footer's epoch estimate by a few tokens (inter-message join separators and
+ * per-group rounding); this is presentation only and never feeds policy.
+ */
+export function formatWindowUsage(status, messages, options = {}) {
+  const {
+    contextUsage,
+    topComponents = WINDOW_USAGE_TOP_COMPONENTS,
+    topMessages = WINDOW_USAGE_TOP_MESSAGES,
+  } = options;
+  const measured = Number.isFinite(status.activeTokens);
+  const lines = [
+    measured
+      ? `Epoch estimate: ~${status.activeTokens.toLocaleString()} tokens; rotation limit: ${status.rotationTokens.toLocaleString()} tokens`
+      : `Epoch estimate: not measured since session start/reload (rotation limit: ${status.rotationTokens.toLocaleString()} tokens)`,
+  ];
+
+  const providerTokens = contextUsage?.tokens;
+  const hasProviderTokens = typeof providerTokens === "number" && Number.isFinite(providerTokens);
+  if (hasProviderTokens) {
+    const windowLabel = Number.isFinite(Number(contextUsage?.contextWindow))
+      ? `; provider context window: ${Number(contextUsage.contextWindow).toLocaleString()} tokens`
+      : "";
+    lines.push(`Provider-reported usage: ${Math.round(providerTokens).toLocaleString()} tokens${windowLabel}`);
+    if (measured) {
+      const overhead = Math.round(providerTokens) - status.activeTokens;
+      const sign = overhead >= 0 ? "+" : "";
+      lines.push(`Implied fixed overhead (provider usage - epoch estimate): ${sign}${overhead.toLocaleString()} tokens`);
+    } else {
+      lines.push("Implied fixed overhead: unavailable (epoch not yet measured)");
+    }
+  } else {
+    lines.push("Provider-reported usage: unavailable");
+  }
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    lines.push("", "No active epoch messages to break down.");
+    return lines.join("\n");
+  }
+
+  const components = new Map();
+  const perMessage = messages.map((message, position) => {
+    const tokens = estimateMessageTokens(message);
+    const key = windowUsageComponentKey(message);
+    const entry = components.get(key) ?? { key, count: 0, tokens: 0 };
+    entry.count += 1;
+    entry.tokens += tokens;
+    components.set(key, entry);
+    return { position, tokens, message };
+  });
+
+  const rankedComponents = [...components.values()].sort((a, b) => b.tokens - a.tokens);
+  const componentTotal = rankedComponents.reduce((sum, entry) => sum + entry.tokens, 0);
+  lines.push(
+    "",
+    `Per-component breakdown, top ${Math.min(topComponents, rankedComponents.length)}/${rankedComponents.length} by token share (role or role:tool):`,
+  );
+  for (const entry of rankedComponents.slice(0, topComponents)) {
+    const share = componentTotal > 0 ? Math.round((entry.tokens / componentTotal) * 100) : 0;
+    lines.push(`- ${entry.key}: ${entry.tokens.toLocaleString()} tokens (${share}%) across ${entry.count} message(s)`);
+  }
+
+  const rankedMessages = [...perMessage].sort((a, b) => b.tokens - a.tokens).slice(0, topMessages);
+  lines.push(
+    "",
+    `Largest single message(s), top ${Math.min(topMessages, perMessage.length)}/${perMessage.length}:`,
+  );
+  for (const entry of rankedMessages) {
+    lines.push(`- ${windowUsageMessageLabel(entry.message, entry.position + 1)}: ${entry.tokens.toLocaleString()} tokens`);
+  }
+
+  return lines.join("\n");
 }

@@ -77,6 +77,18 @@ function estimatedMessageCharacters(message) {
   return label.length + 3 + estimatedContentCharacters(message?.content);
 }
 
+/**
+ * Per-message token estimate using the identical character accounting
+ * estimateTokens sums over an array. A component breakdown built from this
+ * shares its arithmetic with the aggregate footer number; only the inter-
+ * message join separator (len - 1 characters, folded into estimateTokens'
+ * array path) and independent per-group rounding are not reflected here, so
+ * a breakdown's total may differ from the aggregate by a few tokens.
+ */
+export function estimateMessageTokens(message) {
+  return Math.ceil(estimatedMessageCharacters(message) / 4);
+}
+
 export function estimateTokens(value) {
   if (typeof value === "string") return Math.ceil(value.length / 4);
   if (Array.isArray(value)) {

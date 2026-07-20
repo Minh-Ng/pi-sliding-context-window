@@ -1,23 +1,26 @@
 import { spawn } from "node:child_process";
-import { existsSync, renameSync, rmSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import {
+  MAX_DAEMON_SAMPLE_BYTES,
+  capDaemonArtifact,
   closeDaemonLog,
   openDaemonLog,
+  rotateDaemonArtifact,
   writeDaemonLog,
 } from "./log-file.js";
 import { createWatchdogState, inspectWatchdogState } from "./watchdog-state.js";
 
 const heartbeat = new Int32Array(workerData.heartbeat);
 const activeRequests = new Map();
-const { descriptor, path: logPath } = openDaemonLog(workerData.logPath);
+const writer = openDaemonLog(workerData.logPath);
+const logPath = writer.path;
 let watchdogState = createWatchdogState(Atomics.load(heartbeat, 0), Date.now());
 let sampleInFlight = false;
 let lastSampleAt = 0;
 let shuttingDown = false;
 
 function log(event, details = {}) {
-  writeDaemonLog(descriptor, {
+  writeDaemonLog(writer, {
     timestamp: new Date().toISOString(),
     processId: workerData.processId,
     event,
@@ -32,10 +35,8 @@ function captureSample(stallMs) {
   sampleInFlight = true;
   lastSampleAt = Date.now();
   const samplePath = `${logPath}.sample.txt`;
-  const previous = `${samplePath}.1`;
   try {
-    rmSync(previous, { force: true });
-    if (existsSync(samplePath)) renameSync(samplePath, previous);
+    rotateDaemonArtifact(samplePath, { maxBytes: MAX_DAEMON_SAMPLE_BYTES });
   } catch (error) {
     log("stall-sample-rotation-error", { message: String(error?.message ?? error).slice(0, 1_024) });
   }
@@ -58,6 +59,13 @@ function captureSample(stallMs) {
   child.once("exit", (code, signal) => {
     sampleInFlight = false;
     if (shuttingDown) return;
+    try {
+      capDaemonArtifact(samplePath, { maxBytes: MAX_DAEMON_SAMPLE_BYTES });
+    } catch (error) {
+      log("stall-sample-cap-error", {
+        message: String(error?.message ?? error).slice(0, 1_024),
+      });
+    }
     log("stall-sample-complete", {
       stallMs,
       samplePath,
@@ -127,7 +135,7 @@ parentPort.on("message", (message) => {
     clearInterval(timer);
     log("watchdog-stopped");
     shuttingDown = true;
-    closeDaemonLog(descriptor);
+    closeDaemonLog(writer);
     parentPort.close();
   }
 });

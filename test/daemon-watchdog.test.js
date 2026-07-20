@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   existsSync,
   mkdtempSync,
@@ -14,10 +16,10 @@ import test from "node:test";
 import { DaemonWatchdog } from "../src/daemon/watchdog.js";
 import { createWatchdogState, inspectWatchdogState } from "../src/daemon/watchdog-state.js";
 import {
-  closeDaemonLog,
   MAX_DAEMON_LOG_BYTES,
+  MAX_DAEMON_SAMPLE_BYTES,
+  appendDaemonLog,
   openDaemonLog,
-  writeDaemonLog,
 } from "../src/daemon/log-file.js";
 
 function delay(milliseconds) {
@@ -150,27 +152,42 @@ test("watchdog state suppresses system-suspend gaps and rearms after recovery", 
   assert.equal(inspected.state.stallReported, false);
 });
 
-test("daemon logs rotate, remain private, reject symlinks, and retain concurrent writers", (t) => {
+test("daemon logs stay strictly size-bounded, private, complete, and symlink-safe", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-log-file-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const logPath = join(directory, "daemon.jsonl");
+  const maxBytes = 1_024;
   writeFileSync(logPath, "x".repeat(MAX_DAEMON_LOG_BYTES + 1), { mode: 0o666 });
-  const first = openDaemonLog(logPath);
-  const second = openDaemonLog(logPath);
-  try {
-    writeDaemonLog(first.descriptor, { event: "first" });
-    writeDaemonLog(second.descriptor, { event: "second" });
-  } finally {
-    closeDaemonLog(first.descriptor);
-    closeDaemonLog(second.descriptor);
+  appendDaemonLog(logPath, { event: "legacy-rotated" }, { maxBytes });
+  assert.ok(statSync(`${logPath}.1`).size <= maxBytes);
+
+  for (let index = 0; index < 200; index += 1) {
+    appendDaemonLog(logPath, {
+      event: `event-${index}`,
+      payload: "detail ".repeat(12),
+    }, { maxBytes });
   }
-  assert.ok(statSync(`${logPath}.1`).size > MAX_DAEMON_LOG_BYTES);
-  assert.equal(statSync(logPath).mode & 0o077, 0);
-  assert.deepEqual(
-    readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse)
-      .map(({ event }) => event).sort(),
-    ["first", "second"],
-  );
+  for (const path of [logPath, `${logPath}.1`]) {
+    assert.ok(statSync(path).size <= maxBytes, path);
+    assert.equal(statSync(path).mode & 0o077, 0);
+    for (const line of readFileSync(path, "utf8").trim().split("\n").filter(Boolean)) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  }
+  assert.ok(statSync(logPath).size + statSync(`${logPath}.1`).size <= maxBytes * 2);
+
+  const secret = "OVERSIZED_LOG_SECRET_MUST_NOT_PERSIST";
+  appendDaemonLog(logPath, {
+    timestamp: new Date(0).toISOString(),
+    processId: process.pid,
+    event: "oversized",
+    payload: secret.repeat(1_000),
+  }, { maxBytes });
+  const rendered = [logPath, `${logPath}.1`]
+    .map((path) => readFileSync(path, "utf8"))
+    .join("\n");
+  assert.doesNotMatch(rendered, new RegExp(secret, "u"));
+  assert.match(rendered, /"event":"log-record-truncated"/u);
 
   if (process.platform !== "win32") {
     const target = join(directory, "target.log");
@@ -179,6 +196,31 @@ test("daemon logs rotate, remain private, reject symlinks, and retain concurrent
     symlinkSync(target, link);
     assert.throws(() => openDaemonLog(link), /regular file/u);
   }
+});
+
+test("concurrent lifecycle writers coordinate rotation without exceeding disk bounds", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-log-concurrent-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const logPath = join(directory, "daemon-launch.log");
+  const maxBytes = 4_096;
+  const fixture = new URL("../test-support/daemon-log-writer.js", import.meta.url).pathname;
+  const children = Array.from({ length: 4 }, (_, index) => spawn(process.execPath, [
+    fixture,
+    logPath,
+    `writer-${index}`,
+    "200",
+    String(maxBytes),
+  ], { stdio: "ignore" }));
+  const exits = await Promise.all(children.map((child) => once(child, "exit")));
+  assert.deepEqual(exits.map(([code]) => code), [0, 0, 0, 0]);
+  for (const path of [logPath, `${logPath}.1`]) {
+    assert.ok(statSync(path).size <= maxBytes, path);
+    for (const line of readFileSync(path, "utf8").trim().split("\n").filter(Boolean)) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  }
+  assert.ok(statSync(logPath).size + statSync(`${logPath}.1`).size <= maxBytes * 2);
+  assert.equal(existsSync(`${logPath}.lock`), false);
 });
 
 test("watchdog captures and rotates an external stall sample", async (t) => {
@@ -194,7 +236,11 @@ test("watchdog captures and rotates an external stall sample", async (t) => {
     heartbeatIntervalMs: 5,
     sampleOnStall: true,
     sampleCommand: process.execPath,
-    sampleCommandArguments: [new URL("../test-support/fake-sample.js", import.meta.url).pathname],
+    sampleCommandArguments: [
+      new URL("../test-support/fake-sample.js", import.meta.url).pathname,
+      "--bytes",
+      String(MAX_DAEMON_SAMPLE_BYTES + 1_024),
+    ],
   });
   try {
     await watchdog.ready();
@@ -209,5 +255,7 @@ test("watchdog captures and rotates an external stall sample", async (t) => {
   }
   assert.match(readFileSync(samplePath, "utf8"), /sampled process/u);
   assert.equal(readFileSync(`${samplePath}.1`, "utf8"), "previous sample\n");
+  assert.ok(statSync(samplePath).size <= MAX_DAEMON_SAMPLE_BYTES);
+  assert.ok(statSync(`${samplePath}.1`).size <= MAX_DAEMON_SAMPLE_BYTES);
   assert.equal(statSync(samplePath).mode & 0o077, 0);
 });

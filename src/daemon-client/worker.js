@@ -14,10 +14,9 @@ import { workerData } from "node:worker_threads";
 import { StoreClient } from "../store-client.js";
 import { ensureSecureSocketDirectory } from "../daemon/paths.js";
 import {
+  appendDaemonLog,
   defaultDaemonLaunchLogPath,
   defaultDaemonLogPath,
-  openDaemonLog,
-  writeDaemonLog,
 } from "../daemon/log-file.js";
 
 const daemonPath = fileURLToPath(new URL("../../bin/context-windowd.js", import.meta.url));
@@ -54,17 +53,12 @@ function recordLifecycle(event, { processId = null, ...details } = {}) {
   const launchLogPath = options.daemonLaunchLogPath
     ?? defaultDaemonLaunchLogPath(options.storePath);
   try {
-    const { descriptor } = openDaemonLog(launchLogPath);
-    try {
-      writeDaemonLog(descriptor, {
-        timestamp: new Date().toISOString(),
-        event,
-        processId,
-        ...details,
-      });
-    } finally {
-      closeSync(descriptor);
-    }
+    appendDaemonLog(launchLogPath, {
+      timestamp: new Date().toISOString(),
+      event,
+      processId,
+      ...details,
+    });
   } catch { /* diagnostics must not affect daemon ownership retries */ }
 }
 
@@ -242,37 +236,25 @@ function launchDaemon() {
     "--semantic-candidates", String(options.semantic.candidates),
   ] : [];
   const logPath = options.daemonLogPath ?? defaultDaemonLogPath(options.storePath);
-  const launchLogPath = options.daemonLaunchLogPath
-    ?? defaultDaemonLaunchLogPath(options.storePath);
-  let logDescriptor;
-  try {
-    logDescriptor = openDaemonLog(launchLogPath).descriptor;
-  } catch { /* the daemon reports diagnostics setup failure if it can */ }
-  let child;
-  try {
-    child = spawn(nodeExecutable, [
-      daemonPath,
-      "--store",
-      options.storePath,
-      "--socket",
-      options.socketPath,
-      "--log",
-      logPath,
-      ...semanticArguments,
-    ], {
-      // Worker.terminate() tears down subprocesses that remain in the worker's
-      // process session on some Node/platform combinations. The store daemon
-      // is shared infrastructure, so give it an independent session before
-      // releasing the ChildProcess handle below.
-      detached: process.platform !== "win32",
-      stdio: logDescriptor === undefined
-        ? "ignore"
-        : ["ignore", logDescriptor, logDescriptor],
-      windowsHide: true,
-    });
-  } finally {
-    if (logDescriptor !== undefined) closeSync(logDescriptor);
-  }
+  const child = spawn(nodeExecutable, [
+    daemonPath,
+    "--store",
+    options.storePath,
+    "--socket",
+    options.socketPath,
+    "--log",
+    logPath,
+    ...semanticArguments,
+  ], {
+    // Worker.terminate() tears down subprocesses that remain in the worker's
+    // process session on some Node/platform combinations. The store daemon
+    // is shared infrastructure, so give it an independent session before
+    // releasing the ChildProcess handle below. Daemon diagnostics use their
+    // own bounded JSONL writer; never attach unbounded child stdio to a file.
+    detached: process.platform !== "win32",
+    stdio: "ignore",
+    windowsHide: true,
+  });
   // The daemon is shared by every facade for this store and must outlive the
   // worker that happened to win startup. The store lock arbitrates concurrent
   // launch attempts; losing processes exit while every client retries the

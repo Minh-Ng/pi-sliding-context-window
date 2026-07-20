@@ -305,6 +305,8 @@ Point any MCP-capable client at that command. This provides shared archival and 
 
 The Pi and MCP adapters start `context-windowd` on demand. Each daemon advertises the fingerprint of the production code it actually loaded. After an extension/package update, a reloaded client verifies the daemon's store identity, runtime fingerprint, and required capabilities; if stale, it sends `SIGTERM` only to that verified owner and reconnects through the existing lock/socket startup arbitration. Concurrent clients reconnect automatically. In normal Pi use, `/reload` is therefore sufficient—manual PID lookup and `pkill` are neither required nor recommended. Upgrade requests are recorded as `daemon-upgrade-requested` in the bounded daemon launch log.
 
+Daemon diagnostics are strictly size-bounded per physical store. The event log, launch log, and optional stall sample each retain one active file and one previous generation, with every file capped at 4 MiB (24 MiB maximum across all six files). Rotation occurs before a write can cross the cap; oversized JSON records are replaced by bounded metadata, concurrent lifecycle writers coordinate rotation, and external sample output is capped after collection. Files stay mode `0600`, symlinks are rejected, and daemon child stdio is never attached to an unbounded file.
+
 The daemon can also be managed explicitly:
 
 ```bash

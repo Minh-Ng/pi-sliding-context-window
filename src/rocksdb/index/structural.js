@@ -4,6 +4,7 @@ import {
   createDecisionEvidence,
   decisionMutation,
   lookupDecisionEvidence,
+  lookupDecisionEvidenceAsync,
 } from "./decisions.js";
 import {
   IndexPreparationLimitError,
@@ -27,6 +28,9 @@ const MAX_SEQUENCE = Number.MAX_SAFE_INTEGER;
 const MAX_INLINE_STRUCTURAL_TEXT_BYTES = 64 * 1_024;
 const MAX_STRUCTURAL_TEXT_SHARD_BYTES = 352 * 1_024;
 const STRUCTURAL_TEXT_KEYSPACE = "structural-text";
+const SEARCH_YIELD_RECORDS = 128;
+const SEARCH_YIELD_CHARACTERS = 1 * 1_024 * 1_024;
+const SEARCH_SCAN_PAGE = 64;
 const RELATION_SCORE = Object.freeze({
   "latest-question": "questionScore",
   "latest-request": "requestScore",
@@ -42,15 +46,21 @@ function reverseSequence(sequence) {
 }
 
 function queryTerms(query) {
-  return [...new Set(String(query ?? "").toLocaleLowerCase()
-    .match(/[\p{L}\p{N}_-]{2,}/gu) ?? [])];
+  return new Set(String(query ?? "").toLocaleLowerCase()
+    .match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
 }
 
 function matchesQuery(text, terms) {
-  if (terms.length === 0) return true;
-  const tokens = new Set(String(text ?? "").toLocaleLowerCase()
-    .match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
-  return terms.some((term) => tokens.has(term));
+  if (terms.size === 0) return true;
+  const normalized = String(text ?? "").toLocaleLowerCase();
+  for (const match of normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)) {
+    if (terms.has(match[0])) return true;
+  }
+  return false;
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function resolvePublishedGeneration(store, requested) {
@@ -433,20 +443,25 @@ function scoped(posting, { project, lineage, scope, generation, store }) {
   return true;
 }
 
-function structuralRecords(store, { relation, project, lineage, scope, scanLimit }) {
+function structuralPrefixes({ relation, project, lineage, scope }) {
   if (scope === "session") {
-    return lineage.flatMap((lineageSessionId) => store.scan([
+    return lineage.map((lineageSessionId) => [
       KEYSPACE.RELATION,
       relation,
       "session",
       project,
       lineageSessionId,
-    ], { limit: scanLimit }));
+    ]);
   }
   if (scope === "project") {
-    return store.scan([KEYSPACE.RELATION, relation, "session", project], { limit: scanLimit });
+    return [[KEYSPACE.RELATION, relation, "session", project]];
   }
-  return store.scan([KEYSPACE.RELATION, relation, "session"], { limit: scanLimit });
+  return [[KEYSPACE.RELATION, relation, "session"]];
+}
+
+function structuralRecords(store, options) {
+  return structuralPrefixes(options).flatMap((prefix) =>
+    store.scan(prefix, { limit: options.scanLimit }));
 }
 
 function postingTextSegments(store, posting) {
@@ -519,8 +534,7 @@ function result(posting, lineage) {
   });
 }
 
-/** Resolve one supported relation with legacy and lineage ambiguity labels. */
-export function lookupStructural(store, {
+function structuralLookupContext(store, {
   relation,
   query = "",
   sessionId,
@@ -538,7 +552,15 @@ export function lookupStructural(store, {
     throw new TypeError("scope must be session, project, or all.");
   }
   if (!STRUCTURAL_RELATIONS.includes(relation)) {
-    return Object.freeze({ mode: "structural", relation, status: "not-found", results: [], candidates: [] });
+    return {
+      unsupported: Object.freeze({
+        mode: "structural",
+        relation,
+        status: "not-found",
+        results: [],
+        candidates: [],
+      }),
+    };
   }
   const boundedLimit = Math.min(100, Math.max(1, Number(limit) || 3));
   const lineage = [...new Set(sessionIds.filter(Boolean).map(String))];
@@ -551,18 +573,20 @@ export function lookupStructural(store, {
   if (scope !== "all" && (typeof project !== "string" || project.length === 0)) {
     throw new TypeError("Scoped structural lookup requires project.");
   }
-  const resolvedGeneration = resolvePublishedGeneration(store, generation);
-  if (relation === "latest-decision") {
-    const decisions = lookupDecisionEvidence(store, {
-      query,
-      project,
-      sessionIds: lineage,
-      scope,
-      generation: resolvedGeneration,
-      limit: boundedLimit,
-      scanLimit,
-    });
-    const results = decisions.map((decision) => Object.freeze({
+  return {
+    relation,
+    query,
+    project,
+    scope,
+    scanLimit,
+    boundedLimit,
+    lineage,
+    resolvedGeneration: resolvePublishedGeneration(store, generation),
+  };
+}
+
+function decisionLookupResult(context, decisions) {
+  const results = decisions.map((decision) => Object.freeze({
       id: decision.documentId,
       documentId: decision.documentId,
       version: decision.documentVersion,
@@ -573,18 +597,111 @@ export function lookupStructural(store, {
       snippet: decision.excerpt,
       score: 100,
       structural: decision,
-    }));
+  }));
+  return Object.freeze({
+    mode: "structural",
+    relation: context.relation,
+    status: results.length === 0
+      ? "not-found"
+      : (context.scope === "session" && results[0].structural.lineageDepth === 0
+          ? "resolved"
+          : "ambiguous"),
+    results: Object.freeze(results),
+    candidates: Object.freeze(results.map(({ structural }) => structural)),
+  });
+}
+
+function compareStructural(left, right, lineage) {
+  return right.relationConfidence - left.relationConfidence
+    || Math.max(0, lineage.indexOf(left.sessionId)) - Math.max(0, lineage.indexOf(right.sessionId))
+    || right.outboxSequence - left.outboxSequence
+    || right.messageIndex - left.messageIndex
+    || String(left.messageKey ?? "").localeCompare(String(right.messageKey ?? ""));
+}
+
+function insertRanked(target, posting, limit, lineage) {
+  let low = 0;
+  let high = target.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (compareStructural(posting, target[middle], lineage) < 0) high = middle;
+    else low = middle + 1;
+  }
+  if (low >= limit) return;
+  target.splice(low, 0, posting);
+  if (target.length > limit) target.pop();
+}
+
+function structuralLookupResult(context, eligible) {
+  const {
+    relation,
+    boundedLimit,
+    lineage,
+    scope,
+  } = context;
+  const distinct = new Map();
+  for (const posting of eligible) {
+    const identity = `${posting.documentId}\0${posting.documentVersion}\0${posting.messageIndex}\0${posting.relation}`;
+    const previous = distinct.get(identity);
+    if (previous === undefined || compareStructural(posting, previous, lineage) < 0) {
+      distinct.set(identity, posting);
+    }
+  }
+
+  const modern = [];
+  const legacy = [];
+  for (const posting of distinct.values()) {
+    insertRanked(posting.legacy ? legacy : modern, posting, boundedLimit, lineage);
+  }
+  if (modern.length === 0) {
+    const results = legacy.map((posting) => result(posting, lineage));
     return Object.freeze({
       mode: "structural",
       relation,
-      status: results.length === 0
-        ? "not-found"
-        : (scope === "session" && results[0].structural.lineageDepth === 0 ? "resolved" : "ambiguous"),
+      status: results.length > 0 ? "legacy-fallback" : "not-found",
       results: Object.freeze(results),
       candidates: Object.freeze(results.map(({ structural }) => structural)),
     });
   }
 
+  const top = modern[0];
+  let newerLegacy;
+  for (const posting of distinct.values()) {
+    if (!posting.legacy || posting.outboxSequence <= top.outboxSequence) continue;
+    if (newerLegacy === undefined || compareStructural(posting, newerLegacy, lineage) < 0) {
+      newerLegacy = posting;
+    }
+  }
+  const combined = newerLegacy
+    ? [top, newerLegacy, ...modern.slice(1)]
+    : modern;
+  const results = combined.slice(0, boundedLimit).map((posting) => result(posting, lineage));
+  const topDepth = lineage.indexOf(top.sessionId);
+  const ambiguous = top.relationConfidence < 50
+    || topDepth > 0
+    || scope === "project"
+    || scope === "all"
+    || Boolean(newerLegacy);
+  return Object.freeze({
+    mode: "structural",
+    relation,
+    status: ambiguous ? "ambiguous" : "resolved",
+    results: Object.freeze(results),
+    candidates: Object.freeze(results.map(({ structural }) => structural)),
+  });
+}
+
+function structuralEligible(store, context) {
+  const {
+    relation,
+    query,
+    project,
+    scope,
+    scanLimit,
+    boundedLimit,
+    lineage,
+    resolvedGeneration,
+  } = context;
   const terms = queryTerms(query);
   const boundedScan = Math.min(100_000, Math.max(boundedLimit, Number(scanLimit) || 10_000));
   const postings = structuralRecords(store, {
@@ -619,52 +736,111 @@ export function lookupStructural(store, {
         : {}),
     }));
   }
-  eligible.sort((left, right) =>
-    right.relationConfidence - left.relationConfidence
-    || Math.max(0, lineage.indexOf(left.sessionId)) - Math.max(0, lineage.indexOf(right.sessionId))
-    || right.outboxSequence - left.outboxSequence
-    || right.messageIndex - left.messageIndex
-    || String(left.messageKey ?? "").localeCompare(String(right.messageKey ?? "")));
+  return eligible;
+}
 
-  const distinct = [];
-  const seen = new Set();
-  for (const posting of eligible) {
-    const identity = `${posting.documentId}\0${posting.documentVersion}\0${posting.messageIndex}\0${posting.relation}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    distinct.push(posting);
+/** Resolve one supported relation with legacy and lineage ambiguity labels. */
+export function lookupStructural(store, request = {}) {
+  const context = structuralLookupContext(store, request);
+  if (context.unsupported) return context.unsupported;
+  if (context.relation === "latest-decision") {
+    return decisionLookupResult(context, lookupDecisionEvidence(store, {
+      query: context.query,
+      project: context.project,
+      sessionIds: context.lineage,
+      scope: context.scope,
+      generation: context.resolvedGeneration,
+      limit: context.boundedLimit,
+      scanLimit: context.scanLimit,
+    }));
+  }
+  return structuralLookupResult(context, structuralEligible(store, context));
+}
+
+/** Cooperative daemon variant with bounded synchronous search slices. */
+export async function lookupStructuralAsync(store, request = {}, {
+  yieldControl = yieldToEventLoop,
+} = {}) {
+  const context = structuralLookupContext(store, request);
+  if (context.unsupported) return context.unsupported;
+  if (context.relation === "latest-decision") {
+    const decisions = await lookupDecisionEvidenceAsync(store, {
+      query: context.query,
+      project: context.project,
+      sessionIds: context.lineage,
+      scope: context.scope,
+      generation: context.resolvedGeneration,
+      limit: context.boundedLimit,
+      scanLimit: context.scanLimit,
+    }, { yieldControl });
+    return decisionLookupResult(context, decisions);
   }
 
-  const modern = distinct.filter((posting) => !posting.legacy);
-  const legacy = distinct.filter((posting) => posting.legacy);
-  if (modern.length === 0) {
-    const results = legacy.slice(0, boundedLimit).map((posting) => result(posting, lineage));
-    return Object.freeze({
-      mode: "structural",
-      relation,
-      status: results.length > 0 ? "legacy-fallback" : "not-found",
-      results: Object.freeze(results),
-      candidates: Object.freeze(results.map(({ structural }) => structural)),
-    });
-  }
-
-  const top = modern[0];
-  const newerLegacy = legacy.find((posting) => posting.outboxSequence > top.outboxSequence);
-  const combined = newerLegacy
-    ? [top, newerLegacy, ...modern.slice(1)]
-    : modern;
-  const results = combined.slice(0, boundedLimit).map((posting) => result(posting, lineage));
-  const topDepth = lineage.indexOf(top.sessionId);
-  const ambiguous = top.relationConfidence < 50
-    || topDepth > 0
-    || scope === "project"
-    || scope === "all"
-    || Boolean(newerLegacy);
-  return Object.freeze({
-    mode: "structural",
-    relation,
-    status: ambiguous ? "ambiguous" : "resolved",
-    results: Object.freeze(results),
-    candidates: Object.freeze(results.map(({ structural }) => structural)),
+  const terms = queryTerms(context.query);
+  const boundedScan = Math.min(
+    100_000,
+    Math.max(context.boundedLimit, Number(context.scanLimit) || 10_000),
+  );
+  const prefixes = structuralPrefixes({
+    relation: context.relation,
+    project: context.project,
+    lineage: context.lineage,
+    scope: context.scope,
   });
+  const eligible = [];
+  let recordsSinceYield = 0;
+  let charactersSinceYield = 0;
+  for (const prefix of prefixes) {
+    let remaining = boundedScan;
+    let after;
+    while (remaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, remaining);
+      const page = store.scan(prefix, {
+        limit: pageLimit,
+        ...(after === undefined ? {} : { after }),
+      });
+      for (const { payload } of page) {
+        recordsSinceYield += 1;
+        if (payload && scoped(payload, {
+          project: context.project,
+          lineage: context.lineage,
+          scope: context.scope,
+          generation: context.resolvedGeneration,
+          store,
+        })) {
+          const segments = postingTextSegments(store, payload);
+          charactersSinceYield += segments.reduce(
+            (total, segment) => total + String(segment.text ?? "").length,
+            0,
+          );
+          const matching = segments.find(({ text }) => matchesQuery(text, terms));
+          if (matching !== undefined) {
+            const located = Number.isSafeInteger(payload.startByte)
+              && Number.isSafeInteger(payload.endByte);
+            eligible.push(Object.freeze({
+              ...payload,
+              text: matching.text,
+              ...(located
+                ? {
+                    snippetStartByte: payload.startByte + matching.startByte,
+                    snippetEndByte: payload.startByte + matching.endByte,
+                  }
+                : {}),
+            }));
+          }
+        }
+        if (recordsSinceYield >= SEARCH_YIELD_RECORDS
+          || charactersSinceYield >= SEARCH_YIELD_CHARACTERS) {
+          recordsSinceYield = 0;
+          charactersSinceYield = 0;
+          await yieldControl();
+        }
+      }
+      remaining -= page.length;
+      if (page.length < pageLimit || page.at(-1)?.keyBytes === undefined) break;
+      after = page.at(-1).keyBytes;
+      await yieldControl();
+    }
+  }
+  return structuralLookupResult(context, eligible);
 }

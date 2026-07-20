@@ -27,7 +27,7 @@ const ERROR_CLASS = /^[A-Z][A-Za-z0-9]*(?:Error|Exception)$/u;
 const COMMIT = /^[0-9a-fA-F]{7,40}$/u;
 const SNAKE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/u;
 const DOTTED = /^(?:[$A-Za-z_][$A-Za-z0-9_]*\.)+[$A-Za-z_][$A-Za-z0-9_]*$/u;
-const CAMEL = /^(?:[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+)$/u;
+const CAMEL_CANDIDATE = /\b[A-Za-z][A-Za-z0-9_]*\b/gu;
 const HYPHENATED = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$/u;
 const VERSION_OR_VALUE = /^(?:v?\d+\.\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?|0x[0-9a-fA-F]+|[A-Za-z][A-Za-z0-9_]*=[^\s,;]+)$/u;
 const URL = /^https?:\/\/[^\s<>"'`]+$/iu;
@@ -94,6 +94,45 @@ function snakeType(value) {
   return value === value.toUpperCase() && ERROR_CUE.test(value) ? "error" : "symbol";
 }
 
+function asciiUpper(code) {
+  return code >= 65 && code <= 90;
+}
+
+function asciiLower(code) {
+  return code >= 97 && code <= 122;
+}
+
+function asciiDigit(code) {
+  return code >= 48 && code <= 57;
+}
+
+/** Classify the same lower-camel and PascalCase forms without regex backtracking. */
+function camelLike(value) {
+  if (typeof value !== "string" || value.length < 2) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (!asciiUpper(code) && !asciiLower(code) && !asciiDigit(code)) return false;
+  }
+  const first = value.charCodeAt(0);
+  if (asciiLower(first)) {
+    for (let index = 1; index < value.length; index += 1) {
+      if (asciiUpper(value.charCodeAt(index))) return true;
+    }
+    return false;
+  }
+  if (!asciiUpper(first) || !(asciiLower(value.charCodeAt(1)) || asciiDigit(value.charCodeAt(1)))) {
+    return false;
+  }
+  let index = 2;
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+    if (asciiUpper(code)) return true;
+    if (!asciiLower(code) && !asciiDigit(code)) return false;
+    index += 1;
+  }
+  return false;
+}
+
 /** Classify an entire value. A non-null result must be attempted before lexical broadening. */
 export function classifyExactValue(value) {
   if (typeof value !== "string") return undefined;
@@ -111,7 +150,7 @@ export function classifyExactValue(value) {
   if (SNAKE.test(candidate)) return Object.freeze({ type: snakeType(candidate), value: candidate });
   if (ERROR_CLASS.test(candidate)) return Object.freeze({ type: "error", value: candidate });
   if (DOTTED.test(candidate)) return Object.freeze({ type: "dotted-name", value: candidate });
-  if (CAMEL.test(candidate)) return Object.freeze({ type: "symbol", value: candidate });
+  if (camelLike(candidate)) return Object.freeze({ type: "symbol", value: candidate });
   if (HYPHENATED.test(candidate) || VERSION_OR_VALUE.test(candidate)) {
     return Object.freeze({ type: "value", value: candidate });
   }
@@ -122,12 +161,37 @@ function caseSensitive(type) {
   return type !== "commit";
 }
 
-function anchorRecord(text, type, value, startCodeUnit, options) {
+function utf8ByteOffsets(text) {
+  const offsets = new Uint32Array(text.length + 1);
+  let byteOffset = 0;
+  for (let index = 0; index < text.length;) {
+    offsets[index] = byteOffset;
+    const code = text.charCodeAt(index);
+    if (code <= 0x7f) {
+      byteOffset += 1;
+      index += 1;
+    } else if (code <= 0x7ff) {
+      byteOffset += 2;
+      index += 1;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      offsets[index + 1] = byteOffset;
+      byteOffset += 4;
+      index += 2;
+    } else {
+      byteOffset += 3;
+      index += 1;
+    }
+    offsets[index] = byteOffset;
+  }
+  return offsets;
+}
+
+function anchorRecord(type, value, startCodeUnit, options, byteOffsets) {
   if (typeof value !== "string" || value.length === 0) return undefined;
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.length > options.maxAnchorBytes) return undefined;
-  const startByte = Buffer.byteLength(text.slice(0, startCodeUnit), "utf8");
-  const endByte = startByte + bytes.length;
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength > options.maxAnchorBytes) return undefined;
+  const startByte = byteOffsets[startCodeUnit];
+  const endByte = startByte + byteLength;
   const sensitive = caseSensitive(type);
   const normalized = normalizeExactValue(value, { foldCase: !sensitive });
   return Object.freeze({
@@ -142,12 +206,37 @@ function anchorRecord(text, type, value, startCodeUnit, options) {
   });
 }
 
-function collectMatches(target, text, expression, type, options, group = 0, prefixGroup = undefined) {
+function collectMatches(
+  target,
+  text,
+  expression,
+  type,
+  options,
+  byteOffsets,
+  group = 0,
+  prefixGroup = undefined,
+) {
   for (const match of text.matchAll(expression)) {
     const value = match[group];
     const resolvedType = typeof type === "function" ? type(value, match) : type;
     const prefixLength = prefixGroup === undefined ? 0 : match[prefixGroup].length;
-    const anchor = anchorRecord(text, resolvedType, value, match.index + prefixLength, options);
+    const anchor = anchorRecord(
+      resolvedType,
+      value,
+      match.index + prefixLength,
+      options,
+      byteOffsets,
+    );
+    if (anchor) target.push(anchor);
+  }
+}
+
+function collectCamelMatches(target, text, options, byteOffsets) {
+  for (const match of text.matchAll(CAMEL_CANDIDATE)) {
+    const value = match[0];
+    if (!camelLike(value)) continue;
+    const type = ERROR_CLASS.test(value) ? "error" : "symbol";
+    const anchor = anchorRecord(type, value, match.index, options, byteOffsets);
     if (anchor) target.push(anchor);
   }
 }
@@ -169,6 +258,7 @@ export function extractExactAnchors(text, options = {}) {
     maxAnchors: positiveInteger(options.maxAnchors ?? DEFAULT_EXACT_ANCHOR_LIMIT, "maxAnchors"),
     maxAnchorBytes: positiveInteger(options.maxAnchorBytes ?? MAX_ANCHOR_BYTES, "maxAnchorBytes", 4_096),
   };
+  const byteOffsets = utf8ByteOffsets(text);
   const anchors = [];
 
   collectMatches(
@@ -177,16 +267,25 @@ export function extractExactAnchors(text, options = {}) {
     /(["'`])((?:\\.|(?!\1)[^\\\r\n]){1,256})\1/gu,
     "quoted-value",
     normalizedOptions,
+    byteOffsets,
     2,
     1,
   );
-  collectMatches(anchors, text, /\bhttps?:\/\/[^\s<>"'`]+/giu, "url", normalizedOptions);
+  collectMatches(
+    anchors,
+    text,
+    /\bhttps?:\/\/[^\s<>"'`]+/giu,
+    "url",
+    normalizedOptions,
+    byteOffsets,
+  );
   collectMatches(
     anchors,
     text,
     /(^|[\s("'`=])((?:(?:(?:\.{1,2}|~)?[\\/]|[A-Za-z]:[\\/])?)(?:[\p{L}\p{N}_@.+-]+[\\/])+[\p{L}\p{N}_@.+-]+)(?=$|[\s)"'`,:;!?])/gmu,
     "path",
     normalizedOptions,
+    byteOffsets,
     2,
     1,
   );
@@ -196,6 +295,7 @@ export function extractExactAnchors(text, options = {}) {
     /\b(?:[$A-Za-z_][$A-Za-z0-9_]*\.)+[$A-Za-z_][$A-Za-z0-9_]*\b/gu,
     "dotted-name",
     normalizedOptions,
+    byteOffsets,
   );
   collectMatches(
     anchors,
@@ -203,20 +303,16 @@ export function extractExactAnchors(text, options = {}) {
     /\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b/gu,
     snakeType,
     normalizedOptions,
+    byteOffsets,
   );
-  collectMatches(
-    anchors,
-    text,
-    /\b(?:[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+)\b/gu,
-    (value) => (ERROR_CLASS.test(value) ? "error" : "symbol"),
-    normalizedOptions,
-  );
+  collectCamelMatches(anchors, text, normalizedOptions, byteOffsets);
   collectMatches(
     anchors,
     text,
     /\b[0-9a-fA-F]{7,40}\b/gu,
     "commit",
     normalizedOptions,
+    byteOffsets,
   );
   collectMatches(
     anchors,
@@ -224,6 +320,7 @@ export function extractExactAnchors(text, options = {}) {
     /\b(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|v?\d+\.\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?|0x[0-9a-fA-F]+|[A-Za-z][A-Za-z0-9_]*=[^\s,;]+)\b/gu,
     "value",
     normalizedOptions,
+    byteOffsets,
   );
 
   anchors.sort(compareAnchors);

@@ -4,6 +4,7 @@ import {
   Worker,
   receiveMessageOnPort,
 } from "node:worker_threads";
+import { DAEMON_RUNTIME_VERSION } from "../daemon/runtime-version.js";
 
 const POLL_SIGNAL = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
@@ -37,6 +38,12 @@ export class SynchronousStoreBridge {
     clientVersion = "0.1.0",
     requestTimeoutMs = 90_000,
     daemonStartTimeoutMs = 30_000,
+    semantic,
+    daemonLogPath,
+    autoUpgradeDaemon = false,
+    daemonRuntimeVersion = DAEMON_RUNTIME_VERSION,
+    requiredCapabilities = [],
+    daemonLaunchLogPath,
   }) {
     if (typeof storePath !== "string" || !storePath) throw new TypeError("storePath is required.");
     if (typeof socketPath !== "string" || !socketPath) throw new TypeError("socketPath is required.");
@@ -65,6 +72,12 @@ export class SynchronousStoreBridge {
           clientVersion,
           requestTimeoutMs: this.requestTimeoutMs,
           daemonStartTimeoutMs: this.daemonStartTimeoutMs,
+          autoUpgradeDaemon: autoUpgradeDaemon === true,
+          daemonRuntimeVersion,
+          requiredCapabilities: [...new Set(requiredCapabilities)],
+          ...(semantic === undefined ? {} : { semantic }),
+          ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
+          ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
         },
       },
       transferList: [channel.port2],

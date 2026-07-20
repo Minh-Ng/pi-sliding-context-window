@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { createDaemonOperations } from "../src/daemon/operations.js";
+import { DAEMON_RUNTIME_VERSION } from "../src/daemon/runtime-version.js";
 import { startStoreDaemon } from "../src/daemon/server.js";
+import { defaultDaemonLogPath } from "../src/daemon/log-file.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
+import {
+  DaemonWatchdog,
+  DEFAULT_SLOW_REQUEST_MS,
+  DEFAULT_STALL_THRESHOLD_MS,
+} from "../src/daemon/watchdog.js";
 import {
   activateRocksBackend,
   claimSqliteBackend,
@@ -14,6 +21,9 @@ import {
 const VALUE_OPTIONS = new Set([
   "--store",
   "--socket",
+  "--log",
+  "--stall-threshold-ms",
+  "--slow-request-ms",
   "--maintenance-interval-ms",
   "--retention-batch-size",
   "--retention-waves",
@@ -21,14 +31,22 @@ const VALUE_OPTIONS = new Set([
   "--compaction-reclaimable-bytes",
   "--critical-free-bytes",
   "--admission-reserve-bytes",
+  "--semantic-model",
+  "--semantic-revision",
+  "--semantic-cache",
+  "--semantic-index",
+  "--semantic-candidates",
 ]);
-const FLAG_OPTIONS = new Set(["--allow-shutdown", "--help"]);
+const FLAG_OPTIONS = new Set(["--allow-shutdown", "--semantic", "--help"]);
 
 function usage() {
   return [
     "Usage: context-windowd [options]",
     "  --store PATH                       RocksDB directory",
     "  --socket PATH                      Unix socket path",
+    "  --log PATH                         Bounded daemon JSONL diagnostics",
+    "  --stall-threshold-ms N             Event-loop watchdog threshold",
+    "  --slow-request-ms N                Slow-operation logging threshold",
     "  --allow-shutdown                   Permit the remote shutdown operation",
     "  --maintenance-interval-ms N        Maintenance interval",
     "  --retention-batch-size N           Retention records per wave",
@@ -37,6 +55,12 @@ function usage() {
     "  --compaction-reclaimable-bytes N   Reclaimable-byte compaction threshold",
     "  --critical-free-bytes N            Low-disk emergency threshold",
     "  --admission-reserve-bytes N        Required free space after admission",
+    "  --semantic                         Enable local semantic fallback",
+    "  --semantic-model ID                Local embedding model id",
+    "  --semantic-revision REVISION       Pinned embedding model revision",
+    "  --semantic-cache PATH              Library-managed local model cache",
+    "  --semantic-index PATH              Library-managed local ANN indexes",
+    "  --semantic-candidates N            ANN candidates before filtering",
     "  --help                             Show this help",
   ].join("\n");
 }
@@ -81,6 +105,16 @@ const storePath = resolve(argument("--store", process.env.CONTEXT_WINDOW_ROCKSDB
   ?? ".context-window/archive.rocks"));
 const socketPath = argument("--socket", process.env.CONTEXT_WINDOW_SOCKET
   ?? defaultSocketPath(storePath));
+const logPath = resolve(argument("--log", process.env.CONTEXT_WINDOW_DAEMON_LOG
+  ?? defaultDaemonLogPath(storePath)));
+const stallThresholdMs = Number(argument(
+  "--stall-threshold-ms",
+  process.env.CONTEXT_WINDOW_STALL_THRESHOLD_MS ?? DEFAULT_STALL_THRESHOLD_MS,
+));
+const slowRequestMs = Number(argument(
+  "--slow-request-ms",
+  process.env.CONTEXT_WINDOW_SLOW_REQUEST_MS ?? DEFAULT_SLOW_REQUEST_MS,
+));
 const maintenance = {
   intervalMs: argument(
     "--maintenance-interval-ms",
@@ -111,9 +145,24 @@ const maintenance = {
     process.env.CONTEXT_WINDOW_ADMISSION_RESERVE_BYTES,
   ),
 };
+const semantic = {
+  enabled: parsed.flags.has("--semantic")
+    || ["1", "true", "yes", "on"].includes(String(process.env.CONTEXT_WINDOW_SEMANTIC_RETRIEVAL).toLowerCase()),
+  model: argument("--semantic-model", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL
+    ?? "Xenova/all-MiniLM-L6-v2"),
+  revision: argument("--semantic-revision", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION
+    ?? "751bff37182d3f1213fa05d7196b954e230abad9"),
+  cachePath: resolve(argument("--semantic-cache", process.env.CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
+    ?? ".context-window/models")),
+  indexPath: resolve(argument("--semantic-index", process.env.CONTEXT_WINDOW_SEMANTIC_INDEX
+    ?? ".context-window/semantic-index")),
+  candidates: Number(argument("--semantic-candidates", process.env.CONTEXT_WINDOW_SEMANTIC_CANDIDATES
+    ?? 40)),
+};
 
 let daemon;
 let runtime;
+let watchdog;
 let runtimeClosing;
 function closeRuntime() {
   if (!runtimeClosing) runtimeClosing = runtime?.close() ?? Promise.resolve();
@@ -123,6 +172,8 @@ const runtimeOperations = [
   "store.put",
   "store.get",
   "store.search",
+  "store.gather",
+  "store.traverse",
   "store.recall",
   "store.count",
   "store.preflight",
@@ -154,17 +205,32 @@ operationHandlers["migration.start"] = (payload, context) => startMigration(cont
 operationHandlers["migration.verify"] = (payload, context) => verifyMigration(context.store, payload);
 
 try {
+  try {
+    watchdog = new DaemonWatchdog({ logPath, stallThresholdMs, slowRequestMs });
+    await watchdog.ready();
+    watchdog.log("daemon-starting", { storePath, socketPath });
+  } catch (error) {
+    await watchdog?.close().catch(() => {});
+    watchdog = undefined;
+    process.stderr.write(`${JSON.stringify({
+      status: "diagnostics-unavailable",
+      message: error instanceof Error ? error.message : String(error),
+    })}\n`);
+  }
   const { RocksStore } = await import("../src/rocksdb/store.js");
   daemon = await startStoreDaemon({
     storePath,
     socketPath,
+    serverVersion: DAEMON_RUNTIME_VERSION,
     allowShutdown: parsed.flags.has("--allow-shutdown"),
     operationHandlers,
     beforeStoreClose: closeRuntime,
+    requestObserver: watchdog,
+    slowRequestMs,
     createStore: async (path) => {
       const store = await RocksStore.open(path);
       try {
-        runtime = await createDaemonOperations(store, { maintenance });
+        runtime = await createDaemonOperations(store, { maintenance, semantic });
         return store;
       } catch (error) {
         store.close();
@@ -181,8 +247,14 @@ try {
     processId: process.pid,
     storePath,
     socketPath,
+    logPath,
   })}\n`);
+  watchdog?.log("daemon-ready", { storePath, socketPath });
 } catch (error) {
+  watchdog?.log("daemon-start-error", {
+    code: error?.code ?? "INTERNAL",
+    message: (error instanceof Error ? error.message : String(error)).slice(0, 8_192),
+  });
   process.stderr.write(`${JSON.stringify({
     status: "error",
     code: error?.code ?? "INTERNAL",
@@ -192,8 +264,13 @@ try {
 }
 
 async function stop() {
-  if (daemon) await daemon.close();
-  else await closeRuntime();
+  watchdog?.log("daemon-stopping");
+  try {
+    if (daemon) await daemon.close();
+    else await closeRuntime();
+  } finally {
+    await watchdog?.close();
+  }
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

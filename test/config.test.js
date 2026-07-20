@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { findModelProfile, loadConfig, resolveModelConfig } from "../src/config.js";
+import {
+  findModelProfile,
+  loadConfig,
+  resolveModelConfig,
+  saveGlobalConfig,
+} from "../src/config.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import { resolveContextLimits, shouldRotateWindow } from "../src/window.js";
 
@@ -18,6 +30,45 @@ test("trusted project config can disable the footer label accent", () => {
 
     const config = loadConfig({ cwd: directory, projectTrusted: true, env: {}, home: directory });
     assert.equal(config.statusLabelAccent, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("global cap settings persist atomically without clobbering shared Pi settings", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-save-config-"));
+  const settingsPath = join(directory, ".pi", "agent", "settings.json");
+  try {
+    mkdirSync(join(directory, ".pi", "agent"), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      theme: "dark",
+      "context-window": {
+        rotationTurns: 20,
+        rotationTokens: 96_000,
+        automaticRetrieval: false,
+      },
+    }));
+
+    saveGlobalConfig({ rotationTurns: 30, rotationTokens: 128_000 }, { home: directory });
+    assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {
+      theme: "dark",
+      "context-window": {
+        rotationTurns: 30,
+        rotationTokens: 128_000,
+        automaticRetrieval: false,
+      },
+    });
+    assert.equal(statSync(settingsPath).mode & 0o077, 0);
+    let config = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(config.rotationTurns, 30);
+    assert.equal(config.rotationTokens, 128_000);
+    assert.equal(config.rotationTokensExplicit, true);
+
+    saveGlobalConfig({ rotationTokens: undefined }, { home: directory });
+    config = loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory });
+    assert.equal(config.rotationTokens, 96_000);
+    assert.equal(config.rotationTokensExplicit, false);
+    assert.equal(config.automaticRetrieval, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -44,6 +95,11 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(defaults.ephemeralRetentionDays, 14);
     assert.equal(defaults.conversationRetentionDays, 90);
     assert.equal(defaults.derivedRetentionDays, 30);
+    assert.equal(defaults.semanticRetrieval, true);
+    assert.equal(defaults.semanticModel, "Xenova/all-MiniLM-L6-v2");
+    assert.equal(defaults.semanticModelRevision, "751bff37182d3f1213fa05d7196b954e230abad9");
+    assert.equal(defaults.semanticModelCachePath, join(directory, ".pi", "context-window", "models"));
+    assert.equal(defaults.semanticIndexPath, join(directory, ".pi", "context-window", "semantic-index"));
 
     mkdirSync(join(directory, ".pi", "context-window"), { recursive: true });
     writeFileSync(defaults.dbPath, "legacy SQLite placeholder");
@@ -78,6 +134,12 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
         CONTEXT_WINDOW_EPHEMERAL_RETENTION_DAYS: "2",
         CONTEXT_WINDOW_CONVERSATION_RETENTION_DAYS: "30",
         CONTEXT_WINDOW_DERIVED_RETENTION_DAYS: "0",
+        CONTEXT_WINDOW_SEMANTIC_RETRIEVAL: "true",
+        CONTEXT_WINDOW_SEMANTIC_MODEL: "local/test-model",
+        CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION: "revision-1",
+        CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE: "~/models/local",
+        CONTEXT_WINDOW_SEMANTIC_INDEX: "~/indexes/local",
+        CONTEXT_WINDOW_SEMANTIC_CANDIDATES: "24",
       },
     });
     assert.equal(overridden.archiveBackend, "sqlite");
@@ -87,6 +149,12 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.hintBudgetTokens, 80);
     assert.equal(overridden.activeHintBudgetTokens, 300);
     assert.equal(overridden.epochHintBudgetTokens, 300);
+    assert.equal(overridden.semanticRetrieval, true);
+    assert.equal(overridden.semanticModel, "local/test-model");
+    assert.equal(overridden.semanticModelRevision, "revision-1");
+    assert.equal(overridden.semanticModelCachePath, join(directory, "models", "local"));
+    assert.equal(overridden.semanticIndexPath, join(directory, "indexes", "local"));
+    assert.equal(overridden.semanticCandidates, 24);
     assert.equal(overridden.hintSourceCooldownHours, 12);
     assert.equal(overridden.maxInlineUserTokens, 8_000);
     assert.equal(overridden.ephemeralAutoRetrievalDays, 3);
@@ -391,6 +459,88 @@ test("model profile wildcards treat every character except star literally", () =
   assert.equal(findModelProfile(models, { provider: "openai", id: "gpta4" }), undefined);
   assert.equal(findModelProfile(models, { provider: "?", id: "model" }).rotationTurns, 14);
   assert.equal(findModelProfile(models, { provider: "provider", id: "model[preview]" }).rotationTurns, 16);
+});
+
+test("model profile wildcard matching remains linear on dense near misses", () => {
+  const pattern = `*${"a".repeat(2_048)}b/model`;
+  const provider = "a".repeat(32_768);
+  const startedAt = performance.now();
+  assert.equal(findModelProfile({
+    [pattern]: { rotationTurns: 12 },
+  }, { provider, id: "model" }), undefined);
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs < 250, `model profile matching took ${elapsedMs.toFixed(1)} ms`);
+});
+
+test("model profile matching preserves Unicode simple case folding", () => {
+  for (const [patternProvider, modelProvider] of [
+    ["s", "ſ"],
+    ["ſ", "s"],
+    ["Σ", "ς"],
+    ["σ", "ς"],
+    ["ς", "Σ"],
+    ["k", "K"],
+    ["ß", "ẞ"],
+    ["μ", "µ"],
+  ]) {
+    assert.equal(findModelProfile({
+      [`${patternProvider}*/model`]: { rotationTurns: 12 },
+    }, { provider: modelProvider, id: "model" }).rotationTurns, 12);
+  }
+  assert.equal(findModelProfile({
+    "i*/model": { rotationTurns: 12 },
+  }, { provider: "İ", id: "model" }), undefined);
+  assert.equal(findModelProfile({
+    "i*/model": { rotationTurns: 12 },
+  }, { provider: "ı", id: "model" }), undefined);
+});
+
+test("model profile wildcard matching agrees with a dynamic-programming reference", () => {
+  const strings = (alphabet, maxLength) => {
+    const values = [""];
+    let frontier = [""];
+    for (let length = 1; length <= maxLength; length += 1) {
+      frontier = frontier.flatMap((prefix) => alphabet.map((character) => prefix + character));
+      values.push(...frontier);
+    }
+    return values;
+  };
+  const reference = (pattern, value) => {
+    const table = Array.from(
+      { length: pattern.length + 1 },
+      () => new Uint8Array(value.length + 1),
+    );
+    table[0][0] = 1;
+    for (let patternIndex = 1; patternIndex <= pattern.length; patternIndex += 1) {
+      if (pattern[patternIndex - 1] === "*") {
+        table[patternIndex][0] = table[patternIndex - 1][0];
+      }
+      for (let valueIndex = 1; valueIndex <= value.length; valueIndex += 1) {
+        table[patternIndex][valueIndex] = pattern[patternIndex - 1] === "*"
+          ? Number(table[patternIndex - 1][valueIndex] || table[patternIndex][valueIndex - 1])
+          : Number(table[patternIndex - 1][valueIndex - 1]
+            && pattern[patternIndex - 1] === value[valueIndex - 1]);
+      }
+    }
+    return table[pattern.length][value.length] === 1;
+  };
+  const patternParts = strings(["a", "b", "*", "?"], 2);
+  const valueParts = strings(["a", "b", "?"], 2).filter(Boolean);
+  for (const leftPattern of patternParts) {
+    for (const rightPattern of patternParts) {
+      const pattern = `${leftPattern}/${rightPattern}`;
+      for (const provider of valueParts) {
+        for (const id of valueParts) {
+          const value = `${provider}/${id}`;
+          assert.equal(
+            findModelProfile({ [pattern]: { rotationTurns: 12 } }, { provider, id }) !== undefined,
+            reference(pattern, value),
+            `${JSON.stringify(pattern)} against ${JSON.stringify(value)}`,
+          );
+        }
+      }
+    }
+  }
 });
 
 test("project profiles merge over global profiles field by field", () => {

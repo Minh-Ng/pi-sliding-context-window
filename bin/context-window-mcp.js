@@ -6,12 +6,15 @@ import { loadConfig } from "../src/config.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import { LineFramer } from "../src/daemon/framing.js";
 import {
+  GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
   SUPERSEDE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import {
   formatArchiveStorage,
+  formatGatherResults,
   formatPromotePacket,
   formatRecalledDocument,
   formatRedactResult,
@@ -51,6 +54,14 @@ if (config.archiveBackend === "sqlite") {
     recallMaxTokens: Math.max(39, config.searchResultTokens * 2),
     retentionPolicy: retentionPolicyFromDays(config),
     migrationSourcePath: config.dbPath,
+    semantic: {
+      enabled: config.semanticRetrieval,
+      model: config.semanticModel,
+      revision: config.semanticModelRevision,
+      cachePath: config.semanticModelCachePath,
+      indexPath: config.semanticIndexPath,
+      candidates: config.semanticCandidates,
+    },
   });
 }
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -83,14 +94,49 @@ function writeMessage(message) {
 
 const tools = [
   {
+    name: "context_window_gather",
+    description: GATHER_TOOL_DESCRIPTION,
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 65_536 },
+        intent: { type: "string", enum: ["auto", "state", "workflow"], default: "auto" },
+        expansionTerms: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
+        scope: {
+          type: "string",
+          enum: ["session", "project", "all"],
+          default: "project",
+          description: SEARCH_SCOPE_DESCRIPTION,
+        },
+        limit: { type: "integer", minimum: 1, maximum: 10, default: 3 },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "context_window_search",
     description: SEARCH_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", maxLength: 65_536 },
+        expansionTerms: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
         relation: { type: "string", enum: [...STRUCTURAL_RELATIONS] },
-        scope: { type: "string", enum: ["session", "project", "all"], default: "project" },
+        scope: {
+          type: "string",
+          enum: ["session", "project", "all"],
+          default: "project",
+          description: SEARCH_SCOPE_DESCRIPTION,
+        },
         limit: { type: "integer", minimum: 1, maximum: 10, default: 3 },
       },
       anyOf: [{ required: ["query"] }, { required: ["relation"] }],
@@ -173,6 +219,22 @@ function textResult(text, isError = false) {
 
 function callTool(name, args = {}) {
   switch (name) {
+    case "context_window_gather": {
+      const query = String(args.query ?? "").trim();
+      if (!query) return textResult("context_window_gather requires query.", true);
+      const totalBudget = config.searchResultTokens * 4;
+      const gather = archive.gatherDetailed(query, {
+        intent: args.intent ?? "auto",
+        sessionId,
+        project,
+        scope: args.scope ?? "project",
+        limit: args.limit ?? config.searchResults,
+        expansionTerms: args.expansionTerms,
+        maxEvidence: 12,
+        maxTokens: Math.max(39, totalBudget - 640),
+      });
+      return textResult(formatGatherResults(gather, totalBudget), gather.status === "not-found");
+    }
     case "context_window_search": {
       const query = String(args.query ?? "").trim();
       if (!query && !args.relation) {
@@ -184,8 +246,12 @@ function callTool(name, args = {}) {
         project,
         scope: args.scope ?? "project",
         limit: args.limit ?? config.searchResults,
+        expansionTerms: args.expansionTerms,
       });
-      return textResult(formatSearchResults(search.results, config.searchResultTokens, search));
+      return textResult(formatSearchResults(search.results, config.searchResultTokens, {
+        ...search,
+        query: typeof args.query === "string" ? args.query : "",
+      }));
     }
     case "context_recall": {
       const document = archive.get(String(args.id ?? ""));

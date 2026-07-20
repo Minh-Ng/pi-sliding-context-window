@@ -4,7 +4,7 @@ import {
 } from "../store-contract.js";
 import { lookupExact, planExactQuery } from "../rocksdb/index/exact.js";
 import { searchBm25 } from "../rocksdb/index/bm25.js";
-import { lookupStructural } from "../rocksdb/index/structural.js";
+import { lookupStructuralAsync } from "../rocksdb/index/structural.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { semanticIdentifier } from "../semantic-identifiers.js";
@@ -19,7 +19,7 @@ import {
   RetrievalLeaseTargetUnavailableError,
 } from "./leases.js";
 
-const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1 });
+const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, semantic: 1 });
 const WINDOW_SCAN_PAGE = 1_000;
 const MAX_LEGACY_STRUCTURAL_LOCATION_BYTES = 64 * 1_024;
 const MAX_STRUCTURAL_CANDIDATE_BYTES = 64 * 1_024;
@@ -70,6 +70,7 @@ export function normalizeModeScore(mode, score) {
   // of the current result set, so adding a weaker candidate cannot promote the
   // top result to an artificial confidence of 1.0 or otherwise change it.
   if (mode === "lexical") return score / (score + 1);
+  if (mode === "semantic") return Math.min(1, score);
   throw new TypeError(`Unknown retrieval mode ${mode}.`);
 }
 
@@ -96,6 +97,40 @@ function lexicalCandidates(response) {
     retrievalMode: "lexical",
     normalizedScore: normalizeModeScore("lexical", result.rawScore),
     matchedAnchors: Object.freeze([]),
+  }));
+}
+
+function semanticCandidates(results, generation) {
+  return results.map((result) => ({
+    documentId: result.documentId,
+    version: result.version,
+    kind: result.kind,
+    createdAt: result.createdAt,
+    score: result.score,
+    rawScore: result.score,
+    normalizedScore: normalizeModeScore("semantic", result.score),
+    retrievalMode: "semantic",
+    matchType: "semantic-similarity",
+    margin: 0,
+    snippet: result.text,
+    historical: true,
+    superseded: false,
+    matchedAnchors: Object.freeze([]),
+    matchedTerms: Object.freeze([]),
+    termCoverage: 0,
+    termIdf: Object.freeze([]),
+    maxNormalizedIdf: 0,
+    source: {
+      project: result.project,
+      sessionId: result.sessionId,
+      sourceMessageKeys: result.sourceMessageKeys,
+    },
+    location: {
+      windowOrdinal: result.windowOrdinal,
+      startByte: result.startByte,
+      endByte: result.endByte,
+      generation,
+    },
   }));
 }
 
@@ -297,11 +332,13 @@ function preserveCandidateMargins(candidates) {
   });
 }
 
-function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted }) {
-  const count = Number(exactAttempted) + Number(lexicalAttempted) + Number(structuralAttempted);
+function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, semanticAttempted }) {
+  const count = Number(Boolean(exactAttempted)) + Number(Boolean(lexicalAttempted))
+    + Number(Boolean(structuralAttempted)) + Number(Boolean(semanticAttempted));
   if (count > 1) return "hybrid";
   if (exactAttempted) return "exact";
   if (structuralAttempted) return "structural";
+  if (semanticAttempted) return "semantic";
   return "lexical";
 }
 
@@ -337,7 +374,7 @@ async function collectCandidates(view, request, options) {
   if (lexicalAllowed) {
     lexicalAttempted = true;
     const lexical = await searchBm25(view, {
-      query: request.query,
+      query: [request.query, ...(request.expansionTerms ?? [])].join(" "),
       project: request.project,
       scope: request.effectiveScope,
       sessionIds: request.sessionIds,
@@ -350,7 +387,7 @@ async function collectCandidates(view, request, options) {
 
   if (request.relation !== null) {
     structuralAttempted = true;
-    const structural = lookupStructural(view, {
+    const structural = await lookupStructuralAsync(view, {
       relation: request.relation,
       query: request.query,
       project: request.project,
@@ -369,7 +406,42 @@ async function collectCandidates(view, request, options) {
     generation,
     candidates: Object.freeze(preserveCandidateMargins(fused)),
     mode: responseMode({ exactAttempted, lexicalAttempted, structuralAttempted }),
+    exactAttempted,
+    lexicalAttempted,
+    structuralAttempted,
     structuralStatus,
+  });
+}
+
+function shouldTrySemantic(collected, request, options) {
+  if (!options.semantic
+    || options.allowSemantic === false
+    || request.semanticPolicy === "never"
+    || request.query.trim().length === 0) return false;
+  if (request.semanticPolicy === "always") return true;
+  if (collected.candidates.some(({ retrievalMode }) => retrievalMode === "exact")) return false;
+  const lexical = collected.candidates.find(({ retrievalMode }) => retrievalMode === "lexical");
+  return lexical === undefined
+    || lexical.normalizedScore < (options.semanticMinimumLexicalScore ?? 0.55)
+    || lexical.termCoverage < (options.semanticMinimumTermCoverage ?? 0.5);
+}
+
+async function broadenWithSemantic(collected, request, options) {
+  if (!shouldTrySemantic(collected, request, options)) return collected;
+  const results = await options.semantic.search(request);
+  const candidates = preserveCandidateMargins(fuseCandidates([
+    ...collected.candidates,
+    ...semanticCandidates(results, collected.generation),
+  ], Math.min(100, Math.max(request.limit, request.limit * 3))));
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(candidates),
+    mode: responseMode({
+      exactAttempted: collected.exactAttempted,
+      lexicalAttempted: collected.lexicalAttempted,
+      structuralAttempted: collected.structuralAttempted,
+      semanticAttempted: true,
+    }),
   });
 }
 
@@ -465,7 +537,8 @@ export async function searchArchive(store, request, options = {}) {
     secret: options.secret,
     now: options.now,
   });
-  const collected = await store.snapshot((view) => collectCandidates(view, normalized, options));
+  const lexical = await store.snapshot((view) => collectCandidates(view, normalized, options));
+  const collected = await broadenWithSemantic(lexical, normalized, options);
   const results = await locateCandidates(store, collected, normalized, options, secret);
   let status = results.length === 0 ? "not-found" : "resolved";
   if (results.length > 0 && collected.mode === "structural"

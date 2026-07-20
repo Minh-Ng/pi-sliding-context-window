@@ -31,10 +31,13 @@ import {
   unpinDocument,
 } from "../rocksdb/retention.js";
 import { cleanupExpiredLeases } from "../retrieval/leases.js";
+import { gatherArchive } from "../retrieval/gather.js";
 import { clearScopedHints, removeFrozenHint } from "../retrieval/hints.js";
 import { recallArchive } from "../retrieval/recall.js";
 import { preflightArchive } from "../retrieval/preflight.js";
 import { searchArchive } from "../retrieval/search.js";
+import { traverseArchive } from "../retrieval/traverse.js";
+import { LocalSemanticIndex } from "../semantic/index.js";
 import {
   MAX_DIRECT_CHUNK_TABLE_ENTRIES,
   MAX_DIRECT_DOCUMENT_RESPONSE_BYTES,
@@ -244,6 +247,10 @@ export class DaemonOperations {
         createStructuralIndexHandler(),
       ],
     });
+    this.semantic = new LocalSemanticIndex(store, {
+      ...(options.semantic ?? {}),
+      recordError: (error) => this.recordBackgroundError(error),
+    });
     this.maintenance = new DaemonMaintenance(store, {
       ...(options.maintenance ?? {}),
       runRetention: (payload) => this.runRetentionWave(payload, {
@@ -281,6 +288,7 @@ export class DaemonOperations {
       }
     }
     await this.maintenance.initialize();
+    this.semantic.initialize();
     this.scheduleIndexing();
     return this;
   }
@@ -302,6 +310,7 @@ export class DaemonOperations {
       this.indexRetryTimer = undefined;
     }
     await this.maintenance.close();
+    await this.semantic.close();
     await this.idleDrainPromise?.catch(() => {});
     await this.drainPromise?.catch(() => {});
   }
@@ -468,6 +477,7 @@ export class DaemonOperations {
     } finally {
       this.scheduleIndexing();
     }
+    this.semantic.enqueueDocument(result.documentId, result.version);
     return result;
   }
 
@@ -543,7 +553,24 @@ export class DaemonOperations {
     const now = Date.now();
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
-    return searchArchive(this.store, { ...payload, project: context.project });
+    return searchArchive(this.store, { ...payload, project: context.project }, {
+      semantic: this.semantic,
+    });
+  }
+
+  async gather(payload, context) {
+    this.continueIndexing();
+    const now = Date.now();
+    await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
+    await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
+    return gatherArchive(this.store, payload, {
+      project: context.project,
+      semantic: this.semantic,
+    });
+  }
+
+  traverse(payload, context) {
+    return traverseArchive(this.store, payload, { project: context.project });
   }
 
   recall(payload, context) {
@@ -875,6 +902,8 @@ export class DaemonOperations {
       "store.put": (payload, context) => this.put(payload, context),
       "store.get": (payload, context) => this.get(payload, context),
       "store.search": (payload, context) => this.search(payload, context),
+      "store.gather": (payload, context) => this.gather(payload, context),
+      "store.traverse": (payload, context) => this.traverse(payload, context),
       "store.recall": (payload, context) => this.recall(payload, context),
       "store.count": (payload, context) => this.count(payload, context),
       "store.preflight": (payload, context) => this.preflight(payload, context),
@@ -948,6 +977,7 @@ export class DaemonOperations {
           : { oldestPendingAgeMs: outbox.oldestPendingAgeMs }),
       },
       index: { generation: publication?.generation ?? 0 },
+      semantic: this.semantic.status(),
       retention,
       rocksdb: this.store.properties(),
       filesystem: filesystemStatus(this.store.path, retention.emergencyMode),

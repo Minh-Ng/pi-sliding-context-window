@@ -1,12 +1,12 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../src/config.js";
-import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
-  EVIDENCE_ROUTING_GUIDELINES,
-  RECALL_TOOL_DESCRIPTION,
-  SEARCH_TOOL_DESCRIPTION,
-  SUPERSEDE_TOOL_DESCRIPTION,
-} from "../src/evidence-routing.js";
+  DynamicBorder,
+  getSettingsListTheme,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { loadConfig, saveGlobalConfig } from "../src/config.js";
+import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
   EpochWindowSession,
   ROTATION_STATE_ENTRY,
@@ -14,6 +14,7 @@ import {
 import {
   formatArchiveStorage,
   formatAutomaticRetrievalDiagnostics,
+  formatGatherResults,
   formatPromotePacket,
   formatRecalledDocument,
   formatRedactResult,
@@ -21,6 +22,7 @@ import {
   formatStatusDetails,
   formatStatusLine,
   formatSupersedeResult,
+  formatTraversalResults,
 } from "../src/presentation.js";
 import { archiveDocumentProvenance } from "../src/provenance.js";
 import { ancestorSessionIds, stableSessionId } from "../src/session-id.js";
@@ -29,6 +31,42 @@ import { Type } from "typebox";
 
 const CONTEXT_PREPARATION_FAILURE_NOTICE =
   "Context preparation failed. The turn was aborted before provider submission.";
+const TURN_CAP_VALUES = Object.freeze([10, 20, 30, 40, 50, 75, 100]);
+const CONTEXT_CAP_VALUES = Object.freeze([64_000, 96_000, 128_000, 160_000, 192_000, 256_000]);
+
+function formatTokenCap(tokens: number) {
+  return tokens % 1_000 === 0 ? `${tokens / 1_000}k` : String(tokens);
+}
+
+function parseTokenCap(value: string) {
+  if (value === "adaptive") return undefined;
+  const match = /^(?<amount>\d+)(?<suffix>k)?$/u.exec(value);
+  if (!match?.groups?.amount) return undefined;
+  const amount = Number(match.groups.amount);
+  const tokens = match.groups.suffix ? amount * 1_000 : amount;
+  return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
+}
+
+function turnCapOptions(current: number, minimum: number) {
+  return [...new Set([...TURN_CAP_VALUES, current, minimum].filter((value) => value >= minimum))]
+    .sort((left, right) => left - right)
+    .map(String);
+}
+
+function contextCapValue(config: Record<string, any>) {
+  return config.rotationTokensExplicit === false
+    ? "adaptive"
+    : formatTokenCap(Number(config.rotationTokens));
+}
+
+function contextCapOptions(config: Record<string, any>) {
+  const configured = contextCapValue(config);
+  const fixed = [...new Set([
+    ...CONTEXT_CAP_VALUES.map(formatTokenCap),
+    ...(configured === "adaptive" ? [] : [configured]),
+  ])].sort((left, right) => Number(parseTokenCap(left)) - Number(parseTokenCap(right)));
+  return ["adaptive", ...fixed];
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -79,6 +117,11 @@ function exactKeys(value: Record<string, unknown>, expected: string[]) {
     && actual.every((key, index) => key === wanted[index]);
 }
 
+type ContextToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+};
+
 type ArchiveCompactionResult = {
   summary: string;
   firstKeptEntryId: string;
@@ -119,12 +162,31 @@ function isArchiveCompactionResult(value: unknown): value is ArchiveCompactionRe
  */
 export function createContextEpochWindow({
   configLoader = loadConfig,
+  configSaver = saveGlobalConfig,
   archiveFactory,
 }: {
   configLoader?: typeof loadConfig;
+  configSaver?: typeof saveGlobalConfig | null;
   archiveFactory?: (path: string, options?: any) => any;
 } = {}) {
+  const persistConfig = typeof configSaver === "function" ? configSaver : saveGlobalConfig;
   return async function contextEpochWindow(pi: ExtensionAPI) {
+    // Pi reloads the TypeScript entrypoint, but under Node its Jiti loader may
+    // retain native ESM dependencies from the prior generation. A unique URL
+    // keeps the extension-facing routing contract generation-consistent.
+    const routingUrl = new URL("../src/evidence-routing.js", import.meta.url);
+    routingUrl.searchParams.set("pi-reload", `${Date.now()}-${Math.random()}`);
+    const {
+      ARCHIVE_GATHER_TURN_GUIDANCE,
+      EVIDENCE_ROUTING_GUIDELINES,
+      GATHER_TOOL_DESCRIPTION,
+      RECALL_TOOL_DESCRIPTION,
+      SEARCH_SCOPE_DESCRIPTION,
+      SEARCH_TOOL_DESCRIPTION,
+      SUPERSEDE_TOOL_DESCRIPTION,
+      TRAVERSE_TOOL_DESCRIPTION,
+      archiveGatherSuggested,
+    } = await import(routingUrl.href);
     let SQLiteArchive: any;
     let RocksArchive: any;
     let claimSqliteAuthority: any;
@@ -140,6 +202,16 @@ export function createContextEpochWindow({
       ]);
     }
     let session: EpochWindowSession | undefined;
+    let recallHandles = new Map<string, string>();
+    let recallHandleTargets = new Map<string, string>();
+    let recallHandleByTarget = new Map<string, string>();
+    let recallHandleByDocumentId = new Map<string, string>();
+    let nextRecallHandle = 1;
+    let pendingTraversal: {
+      nextId: string;
+      direction: "before" | "after";
+      visibleIds: Set<string>;
+    } | undefined;
     let protectionRefreshTimer: ReturnType<typeof setInterval> | undefined;
     let startupState: "not-started" | "starting" | "ready" | "failed" | "stopped" = "not-started";
 
@@ -177,6 +249,84 @@ export function createContextEpochWindow({
       return session;
     }
 
+    function exposeRecallHandles(results: any[]) {
+      return results.map((result) => {
+        const target = typeof result.documentId === "string"
+          ? `${result.project ?? ""}\0${result.sessionId ?? ""}\0${result.documentId}\0${result.version ?? 1}`
+          : String(result.id);
+        let handle = recallHandleByTarget.get(target);
+        if (handle === undefined) {
+          handle = `r${nextRecallHandle}`;
+          nextRecallHandle += 1;
+          recallHandleByTarget.set(target, handle);
+          recallHandleTargets.set(handle, target);
+        }
+        // Refresh the internal signed locator when repeated searches return a
+        // newer lease for the same exact document version. The model keeps one
+        // stable short handle instead of seeing duplicate opaque identities.
+        recallHandles.set(handle, result.id);
+        if (typeof result.documentId === "string") {
+          recallHandleByDocumentId.set(result.documentId, handle);
+        }
+        while (recallHandles.size > 1_000) {
+          const oldest = recallHandles.keys().next().value;
+          if (oldest === undefined) break;
+          recallHandles.delete(oldest);
+          const oldestTarget = recallHandleTargets.get(oldest);
+          recallHandleTargets.delete(oldest);
+          if (oldestTarget !== undefined) recallHandleByTarget.delete(oldestTarget);
+          for (const [documentId, candidate] of recallHandleByDocumentId) {
+            if (candidate === oldest) recallHandleByDocumentId.delete(documentId);
+          }
+        }
+        return { ...result, id: handle };
+      });
+    }
+
+    function resolveRecallHandle(id: string) {
+      const handle = recallHandleByDocumentId.get(id);
+      return recallHandles.get(handle ?? id) ?? id;
+    }
+
+    function exposeGatherHandles(gather: any) {
+      return {
+        ...gather,
+        evidence: gather.evidence.map((item: any) => {
+          const [exposed] = exposeRecallHandles([{
+            id: item.id ?? item.locator,
+            documentId: item.document?.documentId,
+            version: item.document?.version,
+            sessionId: item.document?.sessionId,
+            project: item.document?.project,
+            kind: item.document?.kind,
+          }]);
+          return {
+            ...item,
+            id: exposed.id,
+            locator: exposed.id,
+            document: {
+              ...item.document,
+              recallId: exposed.id,
+              locator: exposed.id,
+            },
+          };
+        }),
+      };
+    }
+
+    function pendingTraversalResult(): ContextToolResult {
+      if (!pendingTraversal) throw new Error("No chronological traversal is pending.");
+      const instruction = `Chronological traversal is unresolved. Call context_window_traverse with id=${JSON.stringify(pendingTraversal.nextId)} and direction=${JSON.stringify(pendingTraversal.direction)}, or recall one of the visible traversal ids.`;
+      return {
+        content: [{ type: "text" as const, text: instruction }],
+        details: {
+          blocked: true,
+          continuationId: pendingTraversal.nextId,
+          direction: pendingTraversal.direction,
+        },
+      };
+    }
+
     function failClosedContext(ctx: ExtensionContext) {
       try { ctx.abort(); } catch { /* abort is best-effort after preparation failure */ }
       try { ctx.ui.notify(CONTEXT_PREPARATION_FAILURE_NOTICE, "error"); } catch {}
@@ -184,9 +334,116 @@ export function createContextEpochWindow({
       return { messages: [] };
     }
 
+    async function openSettings(ctx: ExtensionContext) {
+      const active = requireSession();
+      if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+        ctx.ui.notify("/context-window settings require TUI mode.", "error");
+        return;
+      }
+      await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+        const status = active.status();
+        const minimumTurns = Number(active.config.retainTurns) + 1;
+        const items: SettingItem[] = [
+          {
+            id: "turn-cap",
+            label: "Turn cap",
+            currentValue: String(status.rotationTurns),
+            values: turnCapOptions(status.rotationTurns, minimumTurns),
+            description: `Rotate at this many user interaction groups. Must exceed retained turns (${active.config.retainTurns}).`,
+          },
+          {
+            id: "context-cap",
+            label: "Context cap",
+            currentValue: contextCapValue(active.config),
+            values: contextCapOptions(active.config),
+            description: `Rotate at this estimated message-token cap. Adaptive uses ${Math.round(active.config.rotationContextRatio * 100)}% of the selected model; current effective cap is ${formatTokenCap(status.rotationTokens)}.`,
+          },
+        ];
+        let settingsList: SettingsList;
+        settingsList = new SettingsList(
+          items,
+          items.length + 2,
+          getSettingsListTheme(),
+          (id, newValue) => {
+            const previousValue = id === "turn-cap"
+              ? String(active.status().rotationTurns)
+              : contextCapValue(active.config);
+            let updates: Record<string, number | undefined>;
+            if (id === "turn-cap") {
+              const turns = Number(newValue);
+              if (!Number.isSafeInteger(turns) || turns < minimumTurns) {
+                settingsList.updateValue(id, previousValue);
+                ctx.ui.notify(`Turn cap must be an integer of at least ${minimumTurns}.`, "error");
+                return;
+              }
+              updates = { rotationTurns: turns };
+            } else {
+              const tokens = parseTokenCap(newValue);
+              if (newValue !== "adaptive" && tokens === undefined) {
+                settingsList.updateValue(id, previousValue);
+                ctx.ui.notify("Context cap must be adaptive or a positive token count.", "error");
+                return;
+              }
+              updates = { rotationTokens: tokens };
+            }
+            try {
+              persistConfig(updates);
+              const refreshed = configLoader({
+                cwd: ctx.cwd,
+                projectTrusted: ctx.isProjectTrusted?.() === true,
+              });
+              active.updateWindowPolicy(refreshed, ctx.model);
+              const effective = active.status();
+              const effectiveValue = id === "turn-cap"
+                ? String(effective.rotationTurns)
+                : contextCapValue(active.config);
+              settingsList.updateValue(id, effectiveValue);
+              updateStatus(ctx);
+              ctx.ui.notify(
+                `Context window ${id}: ${effectiveValue} · effective ${effective.rotationTurns} turns / ${formatTokenCap(effective.rotationTokens)} tokens · saved globally`,
+                "info",
+              );
+            } catch (error) {
+              settingsList.updateValue(id, previousValue);
+              ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            }
+          },
+          () => done(undefined),
+        );
+        const container = new Container();
+        container.addChild(new DynamicBorder((text: string) => theme.fg("border", text)));
+        container.addChild(new (class {
+          render() {
+            return [
+              theme.fg("accent", theme.bold("Context Window Settings")),
+              theme.fg("dim", "Global caps · persistent · project/environment overrides still win"),
+              "",
+            ];
+          }
+          invalidate() {}
+        })());
+        container.addChild(settingsList);
+        container.addChild(new DynamicBorder((text: string) => theme.fg("border", text)));
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            settingsList.handleInput?.(data);
+            tui.requestRender();
+          },
+        };
+      });
+    }
+
     pi.on("session_start", (event, ctx) => {
       const previousSession = session;
       session = undefined;
+      recallHandles = new Map();
+      recallHandleTargets = new Map();
+      recallHandleByTarget = new Map();
+      recallHandleByDocumentId = new Map();
+      nextRecallHandle = 1;
+      pendingTraversal = undefined;
       startupState = "starting";
       try {
         stopProtectionRefresh();
@@ -239,6 +496,14 @@ export function createContextEpochWindow({
                 recallMaxTokens: Math.max(39, config.searchResultTokens * 2),
                 retentionPolicy: retentionPolicyFromDays(config),
                 migrationSourcePath: config.dbPath,
+                semantic: {
+                  enabled: (config as any).semanticRetrieval,
+                  model: (config as any).semanticModel,
+                  revision: (config as any).semanticModelRevision,
+                  cachePath: (config as any).semanticModelCachePath,
+                  indexPath: (config as any).semanticIndexPath,
+                  candidates: (config as any).semanticCandidates,
+                },
               });
         nextSession = new EpochWindowSession({
           archive,
@@ -280,13 +545,31 @@ export function createContextEpochWindow({
       let messages;
       try {
         messages = session.process(event.messages, ctx.model);
-      } catch {
+      } catch (error) {
+        // Keep provider submission fail-closed while exposing bounded internal
+        // diagnostics to embedders and evaluation harnesses via Pi's event bus.
+        try {
+          pi.events.emit("context-window:failure", {
+            phase: "context",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } catch { /* diagnostics must never weaken fail-closed behavior */ }
         return failClosedContext(ctx);
       }
       // Status is presentation-only. Once the provider copy is safely bounded,
       // a UI failure must not make Pi discard it and restore the raw input.
       try { updateStatus(ctx); } catch {}
       return { messages };
+    });
+
+    pi.on("before_agent_start", (event) => {
+      const activeTools = event.systemPromptOptions.selectedTools ?? [];
+      if (!activeTools.includes("context_window_gather")
+        || !archiveGatherSuggested(event.prompt)
+        || event.systemPrompt.includes(ARCHIVE_GATHER_TURN_GUIDANCE)) return;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n## Historical context gathering for this turn\n\n${ARCHIVE_GATHER_TURN_GUIDANCE}`,
+      };
     });
 
     // The provider-context event may run without an active TUI context. Refresh
@@ -376,8 +659,65 @@ export function createContextEpochWindow({
       }
       const closingSession = session;
       session = undefined;
+      recallHandles.clear();
+      recallHandleTargets.clear();
+      recallHandleByTarget.clear();
+      recallHandleByDocumentId.clear();
+      pendingTraversal = undefined;
       try { closingSession?.close(); } catch (error) { cleanupFailure ??= { error }; }
       if (cleanupFailure) throw cleanupFailure.error;
+    });
+
+    pi.registerTool({
+      name: "context_window_gather",
+      label: "context_window_gather",
+      description: GATHER_TOOL_DESCRIPTION,
+      promptGuidelines: [...EVIDENCE_ROUTING_GUIDELINES],
+      parameters: Type.Object({
+        query: Type.String({ minLength: 1, description: "Historical question with its entity, workflow anchor, and temporal qualifiers preserved" }),
+        intent: Type.Optional(Type.Union([
+          Type.Literal("auto"),
+          Type.Literal("state"),
+          Type.Literal("workflow"),
+        ], { default: "auto" })),
+        expansionTerms: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+          maxItems: 16,
+          description: "Likely synonyms or domain terms for hybrid broadening",
+        })),
+        scope: Type.Optional(Type.Union([
+          Type.Literal("session"),
+          Type.Literal("project"),
+          Type.Literal("all"),
+        ], { default: "session", description: SEARCH_SCOPE_DESCRIPTION })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+      }, { additionalProperties: false }),
+      async execute(_id, params): Promise<ContextToolResult> {
+        const active = requireSession();
+        if (pendingTraversal) return pendingTraversalResult();
+        const totalBudget = active.config.searchResultTokens * 4;
+        const gather = exposeGatherHandles(active.gatherDetailed(params.query.trim(), {
+          intent: params.intent ?? "auto",
+          scope: params.scope ?? "session",
+          limit: params.limit ?? active.config.searchResults,
+          expansionTerms: params.expansionTerms,
+          maxEvidence: 12,
+          maxTokens: Math.max(39, totalBudget - 640),
+        }));
+        return {
+          content: [{ type: "text", text: formatGatherResults(gather, totalBudget) }],
+          details: {
+            ids: gather.evidence.map((item: any) => item.id),
+            count: gather.evidence.length,
+            status: gather.status,
+            mode: gather.mode,
+            intent: gather.intent,
+            anchorCount: gather.anchorCount,
+            candidateCount: gather.candidateCount,
+            truncated: gather.truncated,
+            hasMore: gather.hasMore,
+          },
+        };
+      },
     });
 
     pi.registerTool({
@@ -387,6 +727,10 @@ export function createContextEpochWindow({
       promptGuidelines: [...EVIDENCE_ROUTING_GUIDELINES],
       parameters: Type.Object({
         query: Type.Optional(Type.String({ description: "Specific terms, file names, errors, or decisions to find" })),
+        expansionTerms: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+          maxItems: 16,
+          description: "Likely synonyms or domain terms for lexical expansion; keep query as the original request",
+        })),
         relation: Type.Optional(Type.Union(
           STRUCTURAL_RELATIONS.map((relation) => Type.Literal(relation)),
           { description: "Structural archived-message relation for anchorless references" },
@@ -395,11 +739,15 @@ export function createContextEpochWindow({
           Type.Literal("session"),
           Type.Literal("project"),
           Type.Literal("all"),
-        ], { default: "session" })),
+        ], {
+          default: "session",
+          description: SEARCH_SCOPE_DESCRIPTION,
+        })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
       }, { additionalProperties: false }),
-      async execute(_id, params) {
+      async execute(_id, params): Promise<ContextToolResult> {
         const active = requireSession();
+        if (pendingTraversal) return pendingTraversalResult();
         const query = params.query?.trim() ?? "";
         if (!query && !params.relation) {
           throw new Error("context_window_search requires query or relation.");
@@ -408,15 +756,17 @@ export function createContextEpochWindow({
           relation: params.relation,
           scope: params.scope ?? "session",
           limit: params.limit ?? active.config.searchResults,
+          expansionTerms: params.expansionTerms,
         });
+        const results = exposeRecallHandles(search.results);
         return {
           content: [{
             type: "text",
-            text: formatSearchResults(search.results, active.config.searchResultTokens, search),
+            text: formatSearchResults(results, active.config.searchResultTokens, { ...search, query }),
           }],
           details: {
-            ids: search.results.map((result: { id: string }) => result.id),
-            count: search.results.length,
+            ids: results.map((result: { id: string }) => result.id),
+            count: results.length,
             mode: search.mode,
             status: search.status,
             relation: search.relation,
@@ -427,13 +777,74 @@ export function createContextEpochWindow({
     });
 
     pi.registerTool({
+      name: "context_window_traverse",
+      label: "context_window_traverse",
+      description: TRAVERSE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        id: Type.String({ description: "Short anchor id from search or a prior traversal page" }),
+        direction: Type.Union([Type.Literal("before"), Type.Literal("after")]),
+        scope: Type.Optional(Type.Union([
+          Type.Literal("session"),
+          Type.Literal("project"),
+          Type.Literal("all"),
+        ], { default: "session", description: SEARCH_SCOPE_DESCRIPTION })),
+      }, { additionalProperties: false }),
+      async execute(_toolCallId, params): Promise<ContextToolResult> {
+        const active = requireSession();
+        if (pendingTraversal
+          && (params.id !== pendingTraversal.nextId || params.direction !== pendingTraversal.direction)) {
+          return pendingTraversalResult();
+        }
+        pendingTraversal = undefined;
+        const traversal = active.traverseDetailed(resolveRecallHandle(params.id), {
+          direction: params.direction,
+          scope: params.scope ?? "session",
+          // A fixed bounded page prevents the model from accidentally choosing
+          // a page too short to satisfy unknown-distance temporal relations.
+          limit: 128,
+        });
+        const results = exposeRecallHandles(traversal.results);
+        const text = formatTraversalResults(results, active.config.searchResultTokens * 2, traversal);
+        const continuation = /continue with context_window_traverse using id="(?<id>[^"]+)" and direction="(?<direction>before|after)"/u.exec(text);
+        if (continuation?.groups?.id && continuation.groups.direction) {
+          pendingTraversal = {
+            nextId: continuation.groups.id,
+            direction: continuation.groups.direction as "before" | "after",
+            visibleIds: new Set(
+              [...text.matchAll(/"id":"(?<id>[^"]+)"/gu)]
+                .map((match) => match.groups?.id)
+                .filter((id): id is string => id !== undefined),
+            ),
+          };
+        }
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            ids: results.map((result: { id: string }) => result.id),
+            count: results.length,
+            status: traversal.status,
+            direction: traversal.direction,
+            scanned: traversal.scanned,
+            truncated: traversal.truncated,
+            hasMore: Boolean(pendingTraversal),
+            continuationId: pendingTraversal?.nextId ?? null,
+          },
+        };
+      },
+    });
+
+    pi.registerTool({
       name: "context_recall",
       label: "context_recall",
       description: RECALL_TOOL_DESCRIPTION,
       parameters: Type.Object({ id: Type.String() }, { additionalProperties: false }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params): Promise<ContextToolResult> {
         const active = requireSession();
-        const document = active.recall(params.id);
+        if (pendingTraversal && !pendingTraversal.visibleIds.has(params.id)) {
+          return pendingTraversalResult();
+        }
+        if (pendingTraversal?.visibleIds.has(params.id)) pendingTraversal = undefined;
+        const document = active.recall(resolveRecallHandle(params.id));
         const text = formatRecalledDocument(
           document,
           active.config.searchResultTokens * 2,
@@ -470,6 +881,11 @@ export function createContextEpochWindow({
           details: result,
         };
       },
+    });
+
+    pi.registerCommand("context-window", {
+      description: "Configure persistent turn and context caps",
+      handler: async (_args, ctx) => openSettings(ctx),
     });
 
     pi.registerCommand("window", {

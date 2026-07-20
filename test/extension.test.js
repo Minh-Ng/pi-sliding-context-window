@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import contextEpochWindow, { createContextEpochWindow } from "../extensions/pi.ts";
 import {
+  ARCHIVE_GATHER_TURN_GUIDANCE,
   EVIDENCE_ROUTING_GUIDELINES,
+  GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
   SUPERSEDE_TOOL_DESCRIPTION,
+  TRAVERSE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import { Archive } from "../src/archive.js";
 import { loadConfig } from "../src/config.js";
@@ -60,17 +65,26 @@ test("archive tools advertise evidence-source routing", async () => {
     appendEntry() {},
   });
 
+  const gather = tools.get("context_window_gather");
   const search = tools.get("context_window_search");
   const recall = tools.get("context_recall");
+  const traverse = tools.get("context_window_traverse");
   const supersede = tools.get("context_window_supersede");
+  assert.ok(gather);
   assert.ok(search);
   assert.ok(recall);
+  assert.ok(traverse);
   assert.ok(supersede);
   assert.equal(tools.has("context_window_recall"), false);
 
+  assert.equal(gather.description, GATHER_TOOL_DESCRIPTION);
   assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);
+  assert.equal(search.parameters.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
+  assert.match(search.parameters.properties.scope.description, /all.*does not bypass project authorization/i);
   assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);
+  assert.equal(traverse.description, TRAVERSE_TOOL_DESCRIPTION);
   assert.equal(supersede.description, SUPERSEDE_TOOL_DESCRIPTION);
+  assert.deepEqual(gather.promptGuidelines, EVIDENCE_ROUTING_GUIDELINES);
   assert.deepEqual(search.promptGuidelines, EVIDENCE_ROUTING_GUIDELINES);
   assert.equal(search.promptSnippet, undefined);
   assert.equal(recall.promptGuidelines, undefined);
@@ -78,7 +92,7 @@ test("archive tools advertise evidence-source routing", async () => {
   for (const guideline of search.promptGuidelines) {
     assert.match(
       guideline,
-      /context_window_search|context_recall|context_window_supersede|AGENTS\.md/,
+      /context_window_search|context_window_traverse|context_recall|context_window_supersede|AGENTS\.md/,
       `unattributed flattened guideline: ${guideline}`,
     );
   }
@@ -91,6 +105,47 @@ test("archive tools advertise evidence-source routing", async () => {
   assert.match(search.description, /conceptually phrased historical question.*3–8 concise likely synonyms or domain terms/);
   assert.match(search.promptGuidelines.join("\n"), /exact file names.*symbols.*error strings.*commits.*PRs.*specific values.*verbatim first/);
   assert.match(search.promptGuidelines.join("\n"), /conceptual archive-required search misses.*at most one reformulated context_window_search/);
+  assert.match(search.description, /plausible result.*context_recall.*before issuing more query variants/i);
+  assert.match(search.promptGuidelines.join("\n"), /distinct short result id.*avoid parallel query variants.*preserve every concrete recalled entity/i);
+  assert.match(recall.description, /preserve the concrete user-specific entities/i);
+  assert.match(traverse.description, /bounded chronological page.*unknown.*do not guess answer-specific terms/i);
+  assert.equal("limit" in traverse.parameters.properties, false);
+});
+
+test("per-turn gather guidance is fixed, tool-aware, and limited to state or workflow prompts", async () => {
+  const handlers = new Map();
+  await contextEpochWindow({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const before = handlers.get("before_agent_start");
+  assert.ok(before);
+  const base = "BASE SYSTEM\n\nUSER APPEND MUST REMAIN";
+  const options = { selectedTools: ["context_window_gather"], appendSystemPrompt: "USER APPEND MUST REMAIN" };
+
+  assert.equal(before({
+    prompt: "Quote the exact earlier sentence.",
+    systemPrompt: base,
+    systemPromptOptions: options,
+  }), undefined);
+  assert.equal(before({
+    prompt: "Use the same procedure as we did before.",
+    systemPrompt: base,
+    systemPromptOptions: { ...options, selectedTools: ["context_window_search"] },
+  }), undefined);
+
+  const uniqueRawText = "Use the same procedure as we did before. RAW_SECRET_92741";
+  const result = before({
+    prompt: uniqueRawText,
+    systemPrompt: base,
+    systemPromptOptions: options,
+  });
+  assert.ok(result.systemPrompt.startsWith(base));
+  assert.match(result.systemPrompt, new RegExp(ARCHIVE_GATHER_TURN_GUIDANCE.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(result.systemPrompt, /RAW_SECRET_92741/u);
+  assert.equal(result.systemPrompt.match(/USER APPEND MUST REMAIN/gu)?.length, 1);
 });
 
 test("custom archive factories can replace the SQLite backend", async () => {
@@ -104,6 +159,10 @@ test("custom archive factories can replace the SQLite backend", async () => {
   const sourceKeys = Array.from({ length: 200 }, (_, index) =>
     `user:${index}::${"long-source-key".repeat(12)}`,
   );
+  const longLocatorA = `cw1.${"a".repeat(560)}.signature-a`;
+  const longLocatorB = `cw1.${"a".repeat(559)}b.signature-b`;
+  const priorLocatorA = `cw1.${"p".repeat(560)}.prior-a`;
+  const priorLocatorB = `cw1.${"q".repeat(560)}.prior-b`;
   const recalledDocument = {
     id: "recall-id",
     sessionId: "custom",
@@ -120,8 +179,51 @@ test("custom archive factories can replace the SQLite backend", async () => {
   };
   const archive = {
     put() {},
-    search() { return []; },
-    get(id) { return id === recalledDocument.id ? recalledDocument : undefined; },
+    search(query) {
+      const result = (id) => ({
+        ...recalledDocument,
+        id,
+        documentId: "stable-document",
+        version: 1,
+        snippet: recalledDocument.text,
+      });
+      if (query === "first locator") return [result(longLocatorA)];
+      if (query === "second locator") return [result(longLocatorB)];
+      if (query === "current locator") return [result(longLocatorA)];
+      return [];
+    },
+    get(id) {
+      return [recalledDocument.id, longLocatorA, longLocatorB, priorLocatorA, priorLocatorB].includes(id)
+        ? recalledDocument
+        : undefined;
+    },
+    traverseDetailed(id) {
+      if (id === priorLocatorB) {
+        return {
+          mode: "chronological",
+          status: "not-found",
+          direction: "before",
+          scanned: 2,
+          truncated: false,
+          hasMore: false,
+          results: [],
+          candidates: [],
+        };
+      }
+      return {
+        mode: "chronological",
+        status: "resolved",
+        direction: "before",
+        scanned: 200,
+        truncated: false,
+        hasMore: true,
+        results: [
+          { ...recalledDocument, id: priorLocatorA, documentId: "prior-a", version: 1, snippet: "nearer prior event" },
+          { ...recalledDocument, id: priorLocatorB, documentId: "prior-b", version: 1, snippet: "older prior event" },
+        ],
+        candidates: [],
+      };
+    },
     count() { return 0; },
     close() { closed = true; },
   };
@@ -198,6 +300,46 @@ test("custom archive factories can replace the SQLite backend", async () => {
   const missing = await tools.get("context_recall").execute("call", { id: "missing" });
   assert.deepEqual(missing.details, { found: false, provenance: null });
 
+  const firstSearch = await tools.get("context_window_search").execute("call", {
+    query: "first locator",
+  });
+  const secondSearch = await tools.get("context_window_search").execute("call", {
+    query: "second locator",
+  });
+  const currentSearch = await tools.get("context_window_search").execute("call", {
+    query: "current locator",
+  });
+  assert.deepEqual(firstSearch.details.ids, ["r1"]);
+  assert.deepEqual(secondSearch.details.ids, ["r1"]);
+  assert.deepEqual(currentSearch.details.ids, ["r1"]);
+  assert.match(firstSearch.content[0].text, /"recallId":"r1"/u);
+  assert.match(secondSearch.content[0].text, /"recallId":"r1"/u);
+  assert.equal(firstSearch.content[0].text.includes(longLocatorA), false);
+  assert.equal(secondSearch.content[0].text.includes(longLocatorB), false);
+  assert.match(currentSearch.content[0].text, /Time-sensitive archive query/);
+  assert.match(currentSearch.content[0].text, /"sourceTimestamp":"1970-01-01T00:00:00.042Z"/);
+  const handledRecall = await tools.get("context_recall").execute("call", { id: "r1" });
+  assert.equal(handledRecall.details.found, true);
+  assert.match(handledRecall.content[0].text, /deterministic archived text/u);
+
+  const traversal = await tools.get("context_window_traverse").execute("call", {
+    id: "stable-document",
+    direction: "before",
+  });
+  assert.equal(traversal.details.hasMore, true);
+  assert.equal(traversal.details.continuationId, "r3");
+  const blockedSearch = await tools.get("context_window_search").execute("call", { query: "must wait" });
+  assert.equal(blockedSearch.details.blocked, true);
+  assert.equal(blockedSearch.details.continuationId, "r3");
+  const blockedRecall = await tools.get("context_recall").execute("call", { id: "r1" });
+  assert.equal(blockedRecall.details.blocked, true);
+  assert.equal(blockedRecall.details.continuationId, "r3");
+  const exhausted = await tools.get("context_window_traverse").execute("call", {
+    id: "r3",
+    direction: "before",
+  });
+  assert.equal(exhausted.details.hasMore, false);
+
   const structural = await tools.get("context_window_search").execute("call", {
     relation: "latest-question",
   });
@@ -224,8 +366,100 @@ test("custom archive factories can replace the SQLite backend", async () => {
     { message: "Archive reclamation is unavailable for this backend.", level: "warning" },
   ]);
 
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  const staleHandle = await tools.get("context_recall").execute("call", { id: "r1" });
+  assert.equal(staleHandle.details.found, false);
+
   handlers.get("session_shutdown")({}, ctx);
   assert.equal(closed, true);
+});
+
+test("/context-window persists and applies turn and token caps from its TUI", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-settings-tui-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = directory;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const handlers = new Map();
+  const commands = new Map();
+  const notifications = [];
+  const statuses = [];
+  let panel;
+  const extension = createContextEpochWindow({
+    configLoader: ({ cwd, projectTrusted }) => loadConfig({
+      cwd,
+      projectTrusted,
+      env: {},
+      home: directory,
+    }),
+    // A stale hot-reload generation may supply a missing/non-callable optional
+    // dependency. Production persistence must still fall back to its real saver.
+    configSaver: null,
+    archiveFactory: () => memoryCheckpointArchive(),
+  });
+  await extension({
+    events: { emit() {} },
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand(name, command) { commands.set(name, command); },
+    appendEntry() {},
+  });
+  const codingAgentEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const { initTheme } = await import(
+    new URL("./modes/interactive/theme/theme.js", codingAgentEntry).href
+  );
+  initTheme("dark");
+  const ctx = {
+    cwd: directory,
+    hasUI: true,
+    mode: "tui",
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: { getSessionId: () => "settings", getBranch: () => [] },
+    ui: {
+      theme: {
+        fg(_color, text) { return text; },
+        bold(text) { return text; },
+      },
+      setStatus(_key, value) { statuses.push(value); },
+      notify(message, level) { notifications.push({ message, level }); },
+      async custom(factory) {
+        panel = factory(
+          { requestRender() {} },
+          this.theme,
+          {},
+          () => {},
+        );
+      },
+    },
+  };
+
+  handlers.get("session_start")({}, ctx);
+  await commands.get("context-window").handler("", ctx);
+  const initialLines = panel.render(100).map(stripVTControlCharacters);
+  assert.equal(initialLines[0], "─".repeat(100));
+  assert.equal(initialLines.at(-1), "─".repeat(100));
+  const initial = initialLines.join("\n");
+  assert.match(initial, /Context Window Settings/);
+  assert.match(initial, /Turn cap\s+20/);
+  assert.match(initial, /Context cap\s+adaptive/);
+
+  panel.handleInput("\r");
+  const settingsPath = join(directory, ".pi", "agent", "settings.json");
+  let persisted = JSON.parse(readFileSync(settingsPath, "utf8"))["context-window"];
+  assert.equal(persisted.rotationTurns, 30);
+  assert.match(notifications.at(-1).message, /effective 30 turns \/ 130k tokens/);
+  panel.handleInput("\x1b[B");
+  panel.handleInput("\r");
+  persisted = JSON.parse(readFileSync(settingsPath, "utf8"))["context-window"];
+  assert.equal(persisted.rotationTokens, 64_000);
+  assert.match(notifications.at(-1).message, /effective 30 turns \/ 64k tokens/);
+  assert.match(String(statuses.at(-1)), /30 turns/);
+
+  handlers.get("session_shutdown")({}, ctx);
 });
 
 test("Pi defaults to project-bound RocksDB search, locator recall, and protection leases", async () => {
@@ -291,7 +525,9 @@ test("Pi defaults to project-bound RocksDB search, locator recall, and protectio
       limit: 3,
     });
     assert.equal(search.details.count, 1);
-    assert.match(search.details.ids[0], /^cw1\./u);
+    assert.equal(search.details.ids[0], "r1");
+    assert.match(search.content[0].text, /"recallId":"r1"/u);
+    assert.doesNotMatch(search.content[0].text, /cw1\./u);
     assert.match(search.content[0].text, /PI_ROCKS_LOCATOR_TOKEN/u);
 
     const recall = await tools.get("context_recall").execute("call", {
@@ -305,6 +541,16 @@ test("Pi defaults to project-bound RocksDB search, locator recall, and protectio
     const recallEnvelope = JSON.parse(recallLines[1]);
     assert.equal(recallEnvelope.trust, "untrusted-archived-data");
     assert.match(JSON.parse(recallEnvelope.bodyJson), /PI_ROCKS_LOCATOR_TOKEN/u);
+
+    const traversal = await tools.get("context_window_traverse").execute("call", {
+      id: search.details.ids[0],
+      direction: "after",
+      scope: "session",
+    });
+    assert.equal(traversal.details.status, "resolved");
+    assert.ok(traversal.details.count >= 1);
+    assert.match(traversal.content[0].text, /Chronological traversal: after/u);
+    assert.doesNotMatch(traversal.content[0].text, /cw1\./u);
 
     // The normal post-run hook refreshes the active-context protection lease.
     handlers.get("agent_settled")({}, ctx);
@@ -503,7 +749,8 @@ test("a pre-rotation fork searches externalized tool results across header linea
       scope: "project",
       limit: 10,
     });
-    assert.equal(projectResult.details.ids.includes("unrelated-doc"), true);
+    assert.equal(projectResult.details.count, 2);
+    assert.match(projectResult.content[0].text, /unrelated session/u);
 
     // Pi may still report the parent file during the earliest fork callback.
     activeSessionFile = parentFile;

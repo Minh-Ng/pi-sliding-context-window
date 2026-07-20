@@ -508,17 +508,33 @@ function planPublication(plans, { publicationId, sessionId, project, createdAt }
   if (Buffer.byteLength(text, "utf8") > MAX_DIRECT_DOCUMENT_SOURCE_BYTES) {
     throw new RangeError("Checkpoint publication manifest exceeds the bounded direct-read limit.");
   }
-  const sourceMessageKeys = [...new Set(plans.flatMap(
+  // Preserve direct original-message provenance when its aggregate remains
+  // within one document's contract. For larger checkpoints, each root already
+  // carries those exact keys, so the publication marker references one bounded
+  // source key per root instead of duplicating an unbounded aggregate.
+  const aggregateSourceMessageKeys = [...new Set(plans.flatMap(
     (plan) => plan.root.sourceMessageKeys ?? [plan.root.sourceKey],
   ))];
-  normalizeSourceMessageKeys(sourceMessageKeys, sourceMessageKeys[0]);
-  const metadata = {
+  const publicationMetadata = (sourceMessageKeys) => ({
     checkpointFormatVersion: ARCHIVE_CHECKPOINT_FORMAT_VERSION,
     checkpointRecordType: "publication",
     contentHash: contentHash(text),
     rootCount: publication.rootIds.length,
     sourceMessageKeys,
-  };
+  });
+  let sourceMessageKeys = aggregateSourceMessageKeys;
+  let metadata;
+  try {
+    normalizeSourceMessageKeys(sourceMessageKeys, sourceMessageKeys[0]);
+    metadata = publicationMetadata(sourceMessageKeys);
+    if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > MAX_DOCUMENT_METADATA_BYTES) {
+      throw new RangeError("Aggregate publication provenance exceeds its metadata bound.");
+    }
+  } catch {
+    sourceMessageKeys = [...new Set(plans.map((plan) => plan.root.sourceKey))];
+    normalizeSourceMessageKeys(sourceMessageKeys, sourceMessageKeys[0]);
+    metadata = publicationMetadata(sourceMessageKeys);
+  }
   if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > MAX_DOCUMENT_METADATA_BYTES) {
     throw new RangeError("Checkpoint publication metadata exceeds the store document limit.");
   }

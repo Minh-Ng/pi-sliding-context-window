@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
 import { DaemonArchive } from "../src/daemon-archive.js";
+import { SynchronousStoreBridge } from "../src/daemon-client/sync-bridge.js";
 import {
   DEFAULT_MAX_BUFFERED_FRAME_BYTES,
   DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
@@ -485,6 +486,7 @@ test("the synchronous facade retries retryable connection capacity until a slot 
       project: paths.directory,
       requestTimeoutMs: 2_000,
       daemonStartTimeoutMs: 2_000,
+      autoUpgradeDaemon: false,
     });
   } finally {
     if (priorNodeExecutable === undefined) delete process.env.CONTEXT_WINDOW_NODE;
@@ -525,6 +527,7 @@ test("correlated handler capacity surfaces once without reconnecting a healthy f
     project: paths.directory,
     requestTimeoutMs: 2_000,
     daemonStartTimeoutMs: 2_000,
+    autoUpgradeDaemon: false,
   });
   t.after(() => archive.close({ releaseProtection: false }));
   const startedAt = Date.now();
@@ -950,6 +953,67 @@ test("RocksDB native locking excludes a second daemon process", async (t) => {
   assert.equal(failure.code, "STORE_BUSY");
 });
 
+test("the launcher persists an abnormal daemon exit signal", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix signals are required.");
+  const paths = fixture();
+  const daemonLogPath = join(paths.directory, "daemon-events.jsonl");
+  const daemonLaunchLogPath = join(paths.directory, "daemon-launch.log");
+  const bridge = new SynchronousStoreBridge({
+    ...paths,
+    project: paths.directory,
+    daemonLogPath,
+    daemonLaunchLogPath,
+  });
+  t.after(() => {
+    bridge.close();
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+  const status = bridge.request("daemon.status", {});
+  process.kill(status.processId, "SIGKILL");
+  await waitFor(() => {
+    if (!existsSync(daemonLaunchLogPath)) return false;
+    return readFileSync(daemonLaunchLogPath, "utf8").split("\n").some((line) => {
+      if (!line.trim().startsWith("{")) return false;
+      const event = JSON.parse(line);
+      return event.event === "daemon-exit"
+        && event.processId === status.processId
+        && event.signal === "SIGKILL"
+        && event.abnormal === true;
+    });
+  }, "launcher did not persist the daemon SIGKILL exit");
+  assert.equal(lstatSync(daemonLaunchLogPath).mode & 0o077, 0);
+});
+
+test("a shared daemon outlives the bridge worker that launched it", async (t) => {
+  if (process.platform === "win32") return t.skip("Detached Unix process sessions are required.");
+  const paths = fixture();
+  const bridge = new SynchronousStoreBridge({
+    ...paths,
+    project: paths.directory,
+    daemonLogPath: join(paths.directory, "daemon-events.jsonl"),
+    daemonLaunchLogPath: join(paths.directory, "daemon-launch.log"),
+  });
+  const status = bridge.request("daemon.status", {});
+  t.after(() => {
+    bridge.close();
+    try { process.kill(status.processId, "SIGKILL"); } catch { /* already stopped */ }
+    rmSync(paths.directory, { recursive: true, force: true });
+  });
+
+  bridge.close();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.doesNotThrow(
+    () => process.kill(status.processId, 0),
+    "the daemon stopped when its launching bridge worker terminated",
+  );
+
+  process.kill(status.processId, "SIGTERM");
+  await waitFor(
+    () => !existsSync(paths.socketPath),
+    "the detached daemon did not release its socket after SIGTERM",
+  );
+});
+
 test("closed daemon instances are terminal", async () => {
   const paths = fixture();
   const daemon = await startStoreDaemon({ ...paths, createStore: fakeStore });
@@ -1053,6 +1117,101 @@ test("status is schema-valid and shutdown is explicitly gated", async (t) => {
     client.request("daemon.shutdown", { reason: "test" }),
     (error) => error.code === "UNAUTHORIZED",
   );
+});
+
+test("slow requests are exposed in status and reported to the watchdog observer", async (t) => {
+  const paths = fixture();
+  const observed = [];
+  const requestObserver = {
+    requestStarted(details) {
+      observed.push({ phase: "start", ...details });
+      return 7;
+    },
+    requestFinished(token, details) {
+      observed.push({ phase: "finish", token, ...details });
+    },
+  };
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: fakeStore,
+    slowRequestMs: 5,
+    requestObserver,
+    operationHandlers: {
+      "store.count": async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { count: 1 };
+      },
+    },
+  });
+  t.after(() => daemon.close());
+  const client = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  t.after(() => client.close());
+  assert.deepEqual(await client.request("store.count", { scope: "project" }), { count: 1 });
+  const status = await client.request("daemon.status", {});
+  const slow = status.slowRequests.find(({ operation }) => operation === "store.count");
+  assert.ok(slow);
+  assert.ok(slow.durationMs >= 5);
+  assert.equal(slow.ok, true);
+  assert.ok(observed.some(({ phase, token, operation, ok }) =>
+    phase === "finish" && token === 7 && operation === "store.count" && ok === true));
+  assert.equal(JSON.stringify(observed).includes("payload"), false);
+});
+
+test("slow-request history is bounded and records failed operations", async (t) => {
+  const paths = fixture();
+  let failNext = false;
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: fakeStore,
+    slowRequestMs: 1,
+    operationHandlers: {
+      "store.count": async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        if (failNext) throw new Error("injected slow failure");
+        return { count: 1 };
+      },
+    },
+  });
+  t.after(() => daemon.close());
+  const client = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  t.after(() => client.close());
+  for (let index = 0; index < 105; index += 1) {
+    assert.deepEqual(await client.request("store.count", { scope: "project" }), { count: 1 });
+  }
+  failNext = true;
+  await assert.rejects(client.request("store.count", { scope: "project" }), /injected slow failure/u);
+  const status = await client.request("daemon.status", {});
+  assert.equal(status.slowRequests.length, 100);
+  assert.equal(status.slowRequests.at(-1).operation, "store.count");
+  assert.equal(status.slowRequests.at(-1).ok, false);
+  assert.ok(status.slowRequests.every(({ durationMs }) => durationMs >= 1));
+});
+
+test("request observer failures never affect daemon requests", async (t) => {
+  const paths = fixture();
+  let starts = 0;
+  let finishes = 0;
+  const daemon = await startStoreDaemon({
+    ...paths,
+    createStore: fakeStore,
+    requestObserver: {
+      requestStarted() {
+        starts += 1;
+        throw new Error("observer start failure");
+      },
+      requestFinished() {
+        finishes += 1;
+        throw new Error("observer finish failure");
+      },
+    },
+    operationHandlers: { "store.count": () => ({ count: 1 }) },
+  });
+  t.after(() => daemon.close());
+  const client = new StoreClient({ socketPath: paths.socketPath, project: paths.directory });
+  t.after(() => client.close());
+  assert.deepEqual(await client.request("store.count", { scope: "project" }), { count: 1 });
+  assert.equal(starts, 1);
+  assert.equal(finishes, 1);
 });
 
 test("duplicate in-flight request IDs coalesce and mutation timeouts do not auto-retry", async (t) => {

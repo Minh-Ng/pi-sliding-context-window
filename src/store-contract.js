@@ -101,7 +101,7 @@ export const MAX_DIRECT_SOURCE_MESSAGE_KEYS = 16;
 export const MAX_RECALL_TOKENS = 100_000;
 
 export const STORE_SCOPES = Object.freeze(["session", "project", "all"]);
-export const RETRIEVAL_MODES = Object.freeze(["exact", "lexical", "structural", "hybrid"]);
+export const RETRIEVAL_MODES = Object.freeze(["exact", "lexical", "semantic", "structural", "hybrid"]);
 export const STRUCTURAL_RELATIONS = Object.freeze([
   "latest-question",
   "latest-request",
@@ -398,7 +398,9 @@ const termIdfEvidence = object({
 
 const searchRequest = object({
   query: string({ maxLength: 65_536 }),
+  expansionTerms: array(identifier, { maxItems: 16 }),
   relation: nullable(enumeration(STRUCTURAL_RELATIONS)),
+  semanticPolicy: enumeration(["auto", "always", "never"]),
   ...scopeProperties,
   limit: integer({ minimum: 1, maximum: 100 }),
   excludeVisibleSourceKeys: visibleSourceKeys,
@@ -412,7 +414,7 @@ const searchResult = object({
   score: normalizedScore,
   rawScore: nonNegativeNumber,
   calibratedScore: normalizedScore,
-  retrievalMode: enumeration(["exact", "lexical", "structural"]),
+  retrievalMode: enumeration(["exact", "lexical", "semantic", "structural"]),
   createdAt: timestamp,
   matchType: identifier,
   margin: normalizedScore,
@@ -446,6 +448,15 @@ const searchResponse = object({
   indexGeneration: nonNegativeInteger,
   results: array(searchResult),
 });
+
+const traversalResponse = object({
+  status: enumeration(["resolved", "not-found"]),
+  direction: enumeration(["before", "after"]),
+  scanned: nonNegativeInteger,
+  truncated: boolean(),
+  hasMore: boolean(),
+  results: array(searchResult, { maxItems: 128 }),
+}, ["status", "direction", "scanned", "truncated", "hasMore", "results"]);
 
 const automaticHint = object({
   documentId: identifier,
@@ -528,6 +539,36 @@ const unresolvedRecall = object({
   reason: string({ minLength: 1, maxLength: 8_192 }),
   replacementLocator: identifier,
 }, ["status", "reason"]);
+
+const gatheredEvidence = object({
+  relation: enumeration(["anchor", "before", "after"]),
+  anchorRank: positiveInteger,
+  distance: nonNegativeInteger,
+  locator: identifier,
+  document: resolvedRecall,
+}, ["relation", "anchorRank", "distance", "locator", "document"]);
+
+const gatherResponse = object({
+  status: enumeration(["resolved", "not-found"]),
+  mode: enumeration(RETRIEVAL_MODES),
+  intent: enumeration(["auto", "state", "workflow"]),
+  anchorCount: nonNegativeInteger,
+  candidateCount: nonNegativeInteger,
+  returnedTokens: nonNegativeInteger,
+  truncated: boolean(),
+  hasMore: boolean(),
+  evidence: array(gatheredEvidence, { maxItems: 24 }),
+}, [
+  "status",
+  "mode",
+  "intent",
+  "anchorCount",
+  "candidateCount",
+  "returnedTokens",
+  "truncated",
+  "hasMore",
+  "evidence",
+]);
 
 const directDocumentIdentity = object({
   documentId: identifier,
@@ -659,6 +700,43 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
   "store.search": {
     request: searchRequest,
     result: searchResponse,
+  },
+  "store.gather": {
+    request: object({
+      query: string({ minLength: 1, maxLength: 65_536 }),
+      expansionTerms: array(identifier, { maxItems: 16 }),
+      intent: enumeration(["auto", "state", "workflow"]),
+      ...scopeProperties,
+      limit: integer({ minimum: 1, maximum: 10 }),
+      before: integer({ minimum: 0, maximum: 8 }),
+      after: integer({ minimum: 0, maximum: 16 }),
+      neighborhoodAnchors: integer({ minimum: 1, maximum: 5 }),
+      maxEvidence: integer({ minimum: 1, maximum: 24 }),
+      maxTokens: integer({ minimum: 39, maximum: MAX_RECALL_TOKENS }),
+      excludeVisibleSourceKeys: visibleSourceKeys,
+    }, [
+      "query",
+      "intent",
+      "scope",
+      "limit",
+      "before",
+      "after",
+      "neighborhoodAnchors",
+      "maxEvidence",
+      "maxTokens",
+      "excludeVisibleSourceKeys",
+    ]),
+    result: gatherResponse,
+  },
+  "store.traverse": {
+    request: object({
+      locator: identifier,
+      direction: enumeration(["before", "after"]),
+      ...scopeProperties,
+      limit: integer({ minimum: 1, maximum: 128 }),
+      scanLimit: integer({ minimum: 1, maximum: 10_000 }),
+    }, ["locator", "direction", "scope", "sessionIds", "limit", "scanLimit"]),
+    result: traversalResponse,
   },
   "store.recall": {
     request: object({
@@ -835,6 +913,7 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       ready: boolean(),
       processId: positiveInteger,
       storePath: identifier,
+      runtimeVersion: identifier,
       startedAt: timestamp,
       schemaVersion: literal(STORE_SCHEMA_VERSION),
       protocolVersion: literal(STORE_PROTOCOL_VERSION),
@@ -853,6 +932,13 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
         skippedHandlers: nonNegativeInteger,
       }),
       index: optionalObject({ generation: nonNegativeInteger }),
+      semantic: optionalObject({
+        enabled: boolean(),
+        available: boolean(),
+        projects: nonNegativeInteger,
+        model: identifier,
+        revision: identifier,
+      }),
       retention: retentionStats,
       rocksdb: metadata,
       filesystem: optionalObject({
@@ -861,6 +947,13 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       }),
       migration: migrationStatus,
       backgroundErrors: array(STORE_ERROR_SCHEMA),
+      slowRequests: array(object({
+        operation: identifier,
+        requestBytes: nonNegativeInteger,
+        durationMs: nonNegativeInteger,
+        completedAt: timestamp,
+        ok: boolean(),
+      }, ["operation", "requestBytes", "durationMs", "completedAt", "ok"])),
     }, [
       "ready",
       "processId",
@@ -1233,7 +1326,7 @@ export function assertStoreRequest(operation, payload) {
       }
     }
   }
-  if (operation === "store.search" || operation === "store.preflight") {
+  if (operation === "store.search" || operation === "store.gather" || operation === "store.preflight") {
     assertVisibleSourceKeys(payload.excludeVisibleSourceKeys, {
       path: "$.payload.excludeVisibleSourceKeys",
     });

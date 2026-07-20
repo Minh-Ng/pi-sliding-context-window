@@ -377,7 +377,7 @@ test("catalog metadata follows the caller's effective smaller preview ranges", (
   assert.equal(result.roots[0].terms.includes(sentinel), false);
 });
 
-test("publication metadata escaping fails before any archive write", () => {
+test("publication metadata references bounded roots without duplicating their provenance", () => {
   const state = {};
   const sources = Array.from({ length: 3 }, (_, sourceIndex) => {
     const sourceMessageKeys = Array.from({ length: 85 }, (_, keyIndex) =>
@@ -395,9 +395,16 @@ test("publication metadata escaping fails before any archive write", () => {
     sources,
   ));
 
-  assert.equal(result.status, "failed");
-  assert.equal(state.putCalls, 0);
-  assert.equal(state.documents.size, 0);
+  assert.equal(result.status, "stored");
+  assert.deepEqual(
+    state.documents.get(result.publicationId).metadata.sourceMessageKeys,
+    sources.map((source) => source.sourceKey),
+  );
+  assert.deepEqual(
+    result.roots.map((root) =>
+      JSON.parse(state.documents.get(root.rootId).text).sourceMessageKeys.length),
+    [85, 85, 85],
+  );
 });
 
 test("root identity fields cannot be deleted without invalidating reconstruction", () => {

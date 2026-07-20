@@ -54,8 +54,10 @@ test("facade version state is stateless and remembered locator lineage is byte-b
     socketPath: paths.socketPath,
     project: "/project/facade-cache",
   });
-  t.after(() => {
+  const daemonProcessId = archive.stats().processId;
+  t.after(async () => {
     archive.close({ releaseProtection: false });
+    await stopProcess(daemonProcessId);
     rmSync(paths.directory, { recursive: true, force: true });
   });
 
@@ -724,6 +726,7 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
       archive.recall(projectDetailed.results[0].id, { sessionIds: ["unrelated-session"] }).version,
       1,
     );
+
     assert.equal(archive.search("REAP_DRAIN", {
       sessionId: "session-a",
       project: "/project/a",
@@ -895,6 +898,54 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
     assert.equal(stats.maxBytes, null);
     assert.equal(stats.retention.liveDocuments, 3);
     archive.releaseProtectionOwner("nonexistent-owner");
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("daemon facade gathers exact workflow successors in one bounded call", async () => {
+  const paths = fixture("context-window-gather-facade-");
+  const project = "/project/gather-facade";
+  const sessionId = "session-gather-facade";
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project,
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+    for (const [id, text, createdAt] of [
+      ["workflow-anchor", "Reusable rollout procedure starts here.", 126],
+      ["workflow-account", "Next switch to the service identity.", 127],
+      ["workflow-verify", "Finally verify the published artifact.", 128],
+    ]) {
+      archive.put({ id, sessionId, project, kind: "turn", text, createdAt });
+    }
+
+    const gathered = archive.gatherDetailed("Reusable rollout procedure", {
+      intent: "workflow",
+      sessionIds: [sessionId],
+      scope: "session",
+      limit: 1,
+      before: 0,
+      after: 2,
+      neighborhoodAnchors: 1,
+      maxEvidence: 3,
+      maxTokens: 1_000,
+    });
+    assert.equal(gathered.status, "resolved");
+    assert.deepEqual(gathered.evidence.map(({ document }) => document.documentId), [
+      "workflow-anchor",
+      "workflow-account",
+      "workflow-verify",
+    ]);
+    assert.match(gathered.evidence[1].document.recalledText, /service identity/u);
   } finally {
     try { archive?.close(); } catch {}
     await stopProcess(daemonProcessId);

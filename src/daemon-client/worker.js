@@ -1,10 +1,24 @@
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { workerData } from "node:worker_threads";
 import { StoreClient } from "../store-client.js";
 import { ensureSecureSocketDirectory } from "../daemon/paths.js";
+import {
+  defaultDaemonLaunchLogPath,
+  defaultDaemonLogPath,
+  openDaemonLog,
+  writeDaemonLog,
+} from "../daemon/log-file.js";
 
 const daemonPath = fileURLToPath(new URL("../../bin/context-windowd.js", import.meta.url));
 const port = workerData.port;
@@ -20,7 +34,9 @@ let socketDirectoryValidated = false;
 
 const CONNECTED = "connected";
 const CAPACITY_BUSY = "capacity-busy";
+const STALE = "stale";
 const UNAVAILABLE = "unavailable";
+const upgradeSignals = new Set();
 
 function canonicalPath(path) {
   try {
@@ -32,6 +48,129 @@ function canonicalPath(path) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function recordLifecycle(event, { processId = null, ...details } = {}) {
+  const launchLogPath = options.daemonLaunchLogPath
+    ?? defaultDaemonLaunchLogPath(options.storePath);
+  try {
+    const { descriptor } = openDaemonLog(launchLogPath);
+    try {
+      writeDaemonLog(descriptor, {
+        timestamp: new Date().toISOString(),
+        event,
+        processId,
+        ...details,
+      });
+    } finally {
+      closeSync(descriptor);
+    }
+  } catch { /* diagnostics must not affect daemon ownership retries */ }
+}
+
+function upgradeMarkerPath() {
+  return `${options.socketPath}.upgrade`;
+}
+
+function clearUpgradeMarker() {
+  try { rmSync(upgradeMarkerPath(), { force: true }); } catch {}
+}
+
+function claimUpgrade(processId, incompatibility) {
+  const path = upgradeMarkerPath();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let descriptor;
+    try {
+      descriptor = openSync(
+        path,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      writeSync(descriptor, JSON.stringify({
+        processId,
+        createdAt: Date.now(),
+        expectedRuntime: incompatibility.expectedRuntime,
+      }));
+      closeSync(descriptor);
+      return true;
+    } catch (error) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        const marker = JSON.parse(readFileSync(path, "utf8"));
+        const fresh = marker.processId === processId
+          && Number.isSafeInteger(marker.createdAt)
+          && Date.now() - marker.createdAt < options.daemonStartTimeoutMs;
+        if (fresh) return false;
+      } catch { /* malformed markers are replaced below */ }
+      try { rmSync(path, { force: true }); } catch {}
+    }
+  }
+  return false;
+}
+
+function daemonIncompatibility(server) {
+  const missingCapabilities = (options.requiredCapabilities ?? [])
+    .filter((capability) => !server.capabilities.includes(capability));
+  const runtimeMismatch = typeof options.daemonRuntimeVersion === "string"
+    && options.daemonRuntimeVersion.length > 0
+    && server.serverVersion !== options.daemonRuntimeVersion;
+  if (!runtimeMismatch && missingCapabilities.length === 0) return undefined;
+  return {
+    runtimeMismatch,
+    expectedRuntime: options.daemonRuntimeVersion ?? null,
+    observedRuntime: server.serverVersion,
+    missingCapabilities,
+  };
+}
+
+function retireStaleDaemon(candidate, server, incompatibility) {
+  candidate.close();
+  const processId = Number(server.processId);
+  if (!Number.isSafeInteger(processId) || processId <= 1 || processId === process.pid) {
+    const error = new Error("Verified stale context-windowd reported an unsafe process identity.");
+    error.code = "DAEMON_UPGRADE_BLOCKED";
+    error.retryable = false;
+    error.details = { processId, ...incompatibility };
+    throw error;
+  }
+  if (upgradeSignals.has(processId)) return STALE;
+  let claimed;
+  try {
+    claimed = claimUpgrade(processId, incompatibility);
+  } catch (error) {
+    const blocked = new Error("Unable to coordinate a stale context-windowd replacement.");
+    blocked.code = "DAEMON_UPGRADE_BLOCKED";
+    blocked.retryable = false;
+    blocked.details = {
+      processId,
+      cause: error instanceof Error ? error.message : String(error),
+      ...incompatibility,
+    };
+    throw blocked;
+  }
+  if (!claimed) return STALE;
+  upgradeSignals.add(processId);
+  recordLifecycle("daemon-upgrade-requested", {
+    processId,
+    ...incompatibility,
+  });
+  try {
+    process.kill(processId, "SIGTERM");
+  } catch (error) {
+    clearUpgradeMarker();
+    if (error?.code === "ESRCH") return STALE;
+    const blocked = new Error(`Unable to terminate stale context-windowd process ${processId}.`);
+    blocked.code = "DAEMON_UPGRADE_BLOCKED";
+    blocked.retryable = false;
+    blocked.details = {
+      processId,
+      cause: error instanceof Error ? error.message : String(error),
+      ...incompatibility,
+    };
+    throw blocked;
+  }
+  return STALE;
 }
 
 function createClient() {
@@ -74,6 +213,11 @@ async function tryConnect() {
       error.retryable = false;
       throw error;
     }
+    const incompatibility = daemonIncompatibility(server);
+    if (options.autoUpgradeDaemon === true && incompatibility) {
+      return retireStaleDaemon(candidate, server, incompatibility);
+    }
+    if (options.autoUpgradeDaemon === true) clearUpgradeMarker();
     client = candidate;
     return CONNECTED;
   } catch (error) {
@@ -89,21 +233,66 @@ async function tryConnect() {
 function launchDaemon() {
   // The adapter host may itself be Bun. RocksDB support is intentionally tied
   // to the package's declared Node runtime, so never inherit the host binary.
-  const child = spawn(nodeExecutable, [
-    daemonPath,
-    "--store",
-    options.storePath,
-    "--socket",
-    options.socketPath,
-  ], {
-    stdio: "ignore",
-    windowsHide: true,
-  });
+  const semanticArguments = options.semantic?.enabled ? [
+    "--semantic",
+    "--semantic-model", options.semantic.model,
+    "--semantic-revision", options.semantic.revision,
+    "--semantic-cache", options.semantic.cachePath,
+    "--semantic-index", options.semantic.indexPath,
+    "--semantic-candidates", String(options.semantic.candidates),
+  ] : [];
+  const logPath = options.daemonLogPath ?? defaultDaemonLogPath(options.storePath);
+  const launchLogPath = options.daemonLaunchLogPath
+    ?? defaultDaemonLaunchLogPath(options.storePath);
+  let logDescriptor;
+  try {
+    logDescriptor = openDaemonLog(launchLogPath).descriptor;
+  } catch { /* the daemon reports diagnostics setup failure if it can */ }
+  let child;
+  try {
+    child = spawn(nodeExecutable, [
+      daemonPath,
+      "--store",
+      options.storePath,
+      "--socket",
+      options.socketPath,
+      "--log",
+      logPath,
+      ...semanticArguments,
+    ], {
+      // Worker.terminate() tears down subprocesses that remain in the worker's
+      // process session on some Node/platform combinations. The store daemon
+      // is shared infrastructure, so give it an independent session before
+      // releasing the ChildProcess handle below.
+      detached: process.platform !== "win32",
+      stdio: logDescriptor === undefined
+        ? "ignore"
+        : ["ignore", logDescriptor, logDescriptor],
+      windowsHide: true,
+    });
+  } finally {
+    if (logDescriptor !== undefined) closeSync(logDescriptor);
+  }
   // The daemon is shared by every facade for this store and must outlive the
   // worker that happened to win startup. The store lock arbitrates concurrent
   // launch attempts; losing processes exit while every client retries the
   // shared socket.
-  child.on("error", () => {});
+  recordLifecycle("daemon-spawned", { processId: child.pid ?? null });
+  child.on("error", (error) => {
+    recordLifecycle("daemon-spawn-error", {
+      processId: child.pid ?? null,
+      code: error?.code ?? null,
+      message: String(error?.message ?? error).slice(0, 1_024),
+    });
+  });
+  child.on("exit", (code, exitSignal) => {
+    recordLifecycle("daemon-exit", {
+      processId: child.pid ?? null,
+      code: Number.isInteger(code) ? code : null,
+      signal: exitSignal ?? null,
+      abnormal: code !== 0 || exitSignal !== null,
+    });
+  });
   child.unref();
 }
 

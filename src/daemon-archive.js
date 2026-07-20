@@ -6,6 +6,10 @@ import {
   normalizeArchiveRetentionPolicy,
   retentionForAdmission,
 } from "./daemon/retention-policy.js";
+import {
+  DAEMON_REQUIRED_CAPABILITIES,
+  DAEMON_RUNTIME_VERSION,
+} from "./daemon/runtime-version.js";
 import { SynchronousStoreBridge } from "./daemon-client/sync-bridge.js";
 import { stableJson } from "./rocksdb/schema.js";
 import {
@@ -476,6 +480,10 @@ export class DaemonArchive {
     recallMaxTokens = DEFAULT_RECALL_MAX_TOKENS,
     retentionPolicy,
     migrationSourcePath,
+    semantic,
+    daemonLogPath,
+    daemonLaunchLogPath,
+    autoUpgradeDaemon = true,
   }) {
     this.path = resolveStorePath(storePath);
     this.socketPath = socketPath ?? defaultSocketPath(this.path);
@@ -503,6 +511,12 @@ export class DaemonArchive {
       project: this.project,
       ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
       ...(daemonStartTimeoutMs === undefined ? {} : { daemonStartTimeoutMs }),
+      autoUpgradeDaemon: autoUpgradeDaemon === true,
+      daemonRuntimeVersion: DAEMON_RUNTIME_VERSION,
+      requiredCapabilities: DAEMON_REQUIRED_CAPABILITIES,
+      ...(semantic === undefined ? {} : { semantic }),
+      ...(daemonLogPath === undefined ? {} : { daemonLogPath }),
+      ...(daemonLaunchLogPath === undefined ? {} : { daemonLaunchLogPath }),
     });
     try {
       if (migrationSourcePath !== undefined) {
@@ -818,7 +832,11 @@ export class DaemonArchive {
     const sessionIds = normalizedSessionLineage(options.sessionIds, options.sessionId);
     const response = this.request("store.search", {
       query: String(query ?? ""),
+      ...(Array.isArray(options.expansionTerms)
+        ? { expansionTerms: [...new Set(options.expansionTerms.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
       relation: options.relation ?? null,
+      semanticPolicy: options.semanticPolicy ?? "auto",
       scope: options.scope ?? "session",
       ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
       sessionIds,
@@ -899,6 +917,119 @@ export class DaemonArchive {
         granularity: "document",
       })),
       indexGeneration: response.indexGeneration,
+    };
+  }
+
+  gatherDetailed(query, options = {}) {
+    if (options.project !== undefined && options.project !== this.project) {
+      return {
+        status: "not-found",
+        mode: "lexical",
+        intent: options.intent ?? "auto",
+        anchorCount: 0,
+        candidateCount: 0,
+        returnedTokens: 0,
+        truncated: false,
+        hasMore: false,
+        evidence: [],
+      };
+    }
+    const intent = options.intent ?? "auto";
+    const defaults = intent === "state"
+      ? { before: 0, after: 0 }
+      : intent === "workflow"
+        ? { before: 1, after: 8 }
+        : { before: 1, after: 3 };
+    const sessionIds = normalizedSessionLineage(options.sessionIds, options.sessionId);
+    const response = this.request("store.gather", {
+      query: requiredString(query, "query"),
+      ...(Array.isArray(options.expansionTerms)
+        ? { expansionTerms: [...new Set(options.expansionTerms.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
+      intent,
+      scope: options.scope ?? "session",
+      ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
+      sessionIds,
+      project: this.project,
+      limit: positiveInteger(options.limit, 3, 10),
+      before: Number.isSafeInteger(options.before) ? options.before : defaults.before,
+      after: Number.isSafeInteger(options.after) ? options.after : defaults.after,
+      neighborhoodAnchors: positiveInteger(options.neighborhoodAnchors, 2, 5),
+      maxEvidence: positiveInteger(options.maxEvidence, 12, 24),
+      maxTokens: Math.max(
+        39,
+        positiveInteger(options.maxTokens, this.recallMaxTokens, MAX_RECALL_TOKENS),
+      ),
+      excludeVisibleSourceKeys: normalizedVisibleSourceKeys(options.excludeVisibleSourceKeys),
+    });
+    const evidence = response.evidence.map((item) => {
+      const authorizedSessionIds = [...new Set([...sessionIds, item.document.sessionId])];
+      this.rememberLocatorSessionIds(item.locator, authorizedSessionIds);
+      return {
+        relation: item.relation,
+        anchorRank: item.anchorRank,
+        distance: item.distance,
+        id: item.locator,
+        locator: item.locator,
+        document: recalledDocument(item.document, item.locator),
+      };
+    });
+    return {
+      status: response.status,
+      mode: response.mode,
+      intent: response.intent,
+      anchorCount: response.anchorCount,
+      candidateCount: response.candidateCount,
+      returnedTokens: response.returnedTokens,
+      truncated: response.truncated,
+      hasMore: response.hasMore,
+      evidence,
+    };
+  }
+
+  traverseDetailed(locator, {
+    direction = "before",
+    scope = "session",
+    sessionId,
+    sessionIds,
+    limit = 128,
+    scanLimit = 2_048,
+  } = {}) {
+    const lineage = normalizedSessionLineage(sessionIds, sessionId);
+    const response = this.request("store.traverse", {
+      locator: requiredString(locator, "locator"),
+      direction,
+      scope,
+      sessionIds: lineage,
+      limit: positiveInteger(limit, 128, 128),
+      scanLimit: positiveInteger(scanLimit, 2_048, 10_000),
+    });
+    const results = response.results.map((candidate) => {
+      this.rememberLocatorSessionIds(candidate.locator, lineage);
+      return {
+        id: candidate.locator,
+        documentId: candidate.documentId,
+        version: candidate.version,
+        sessionId: candidate.source.sessionId,
+        project: candidate.source.project,
+        kind: candidate.kind,
+        createdAt: candidate.createdAt,
+        snippet: candidate.snippet,
+        locator: candidate.locator,
+        historical: candidate.historical,
+        superseded: candidate.superseded,
+        source: structuredClone(candidate.source),
+      };
+    });
+    return {
+      mode: "chronological",
+      status: response.status,
+      direction: response.direction,
+      scanned: response.scanned,
+      truncated: response.truncated,
+      hasMore: response.hasMore,
+      results,
+      candidates: results.map(({ id }) => ({ id, granularity: "document" })),
     };
   }
 
@@ -1188,6 +1319,7 @@ export class DaemonArchive {
       overLimit: false,
       emergencyMode: retention.emergencyMode === true,
       processId: status.processId,
+      runtimeVersion: status.runtimeVersion,
       storePath: status.storePath,
       filesystem: status.filesystem,
       rocksdb,

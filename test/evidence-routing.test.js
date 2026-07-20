@@ -4,11 +4,16 @@ import test from "node:test";
 import { readFile } from "node:fs/promises";
 import {
   ARCHIVED_EVIDENCE_LABEL,
+  ARCHIVE_GATHER_TURN_GUIDANCE,
+  ARCHIVE_STATE_RECONCILIATION_HINT,
   EVIDENCE_ROUTES,
   EVIDENCE_ROUTING_GUIDELINES,
   EVIDENCE_ROUTING_POLICY,
+  GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  archiveGatherSuggested,
+  archiveStateReconciliationSuggested,
 } from "../src/evidence-routing.js";
 import {
   EFFECTIVE_PRODUCTION_GUIDANCE,
@@ -90,6 +95,11 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /archive candidate.*plain language.*archived discussion or a live source/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /project-specific term.*not defined in visible context.*about to search.*live source.*also run context_window_search.*exact term/i.test(guideline)));
   assert.match(SEARCH_TOOL_DESCRIPTION, /project-specific term.*not defined in visible context.*search the archive for that exact term.*origin as ambiguous/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /latest\/current state.*rolling time window.*change over time/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /preserve temporal qualifiers.*inspect every returned candidate.*do not default to rank 1/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /newest relevant candidate.*snippet is truncated or omits the requested value.*older explicit value/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /event dates or old→new values.*preserve uncertainty/i);
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /Source timestamps order messages, not necessarily events/i.test(guideline)));
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -99,6 +109,56 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   });
   const digest = createHash("sha256").update(JSON.stringify(EFFECTIVE_PRODUCTION_GUIDANCE)).digest("hex");
   assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_HASH, `sha256:${digest}`);
+});
+
+test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {
+  for (const query of [
+    "How many are there now?",
+    "What is the latest recorded preference?",
+    "Did the ratio switch to more or less water?",
+    "What changed after the migration?",
+    "How many films were watched in the last 3 months?",
+    "Is that setting still enabled?",
+  ]) {
+    assert.equal(archiveStateReconciliationSuggested(query), true, query);
+  }
+  for (const query of [
+    "What was the count on May 20?",
+    "Why did we choose RocksDB earlier?",
+    "Quote the original deployment decision.",
+    "",
+  ]) {
+    assert.equal(archiveStateReconciliationSuggested(query), false, query);
+  }
+  assert.match(ARCHIVE_STATE_RECONCILIATION_HINT, /one match may be stale or partial/i);
+  assert.match(ARCHIVE_STATE_RECONCILIATION_HINT, /inspect every returned snippet.*do not default to rank 1/i);
+  assert.match(ARCHIVE_STATE_RECONCILIATION_HINT, /sourceTimestamp orders source messages, not events/i);
+  assert.match(ARCHIVE_STATE_RECONCILIATION_HINT, /does not replace live inspection/i);
+});
+
+test("bounded gather intent recognizes generic state and workflow requests without release-specific tuning", () => {
+  for (const query of [
+    "What is the latest recorded value now?",
+    "Use the same procedure as we did before.",
+    "Repeat the previous workflow for this package.",
+    "How did we handle this migration last time?",
+  ]) {
+    assert.equal(archiveGatherSuggested(query), true, query);
+  }
+  for (const query of [
+    "Quote the sentence containing CACHE_KEY.",
+    "Inspect the current repository status.",
+    "Explain Merkle trees.",
+    "",
+  ]) {
+    assert.equal(archiveGatherSuggested(query), false, query);
+  }
+  assert.match(GATHER_TOOL_DESCRIPTION, /bounded packet of exact archived evidence/i);
+  assert.match(GATHER_TOOL_DESCRIPTION, /surrounding turns/i);
+  assert.match(ARCHIVE_GATHER_TURN_GUIDANCE, /Prefer context_window_gather/i);
+  for (const text of [GATHER_TOOL_DESCRIPTION, ARCHIVE_GATHER_TURN_GUIDANCE]) {
+    assert.doesNotMatch(text, /benchmark|expected answer|fixture id|held-out case/iu);
+  }
 });
 
 test("regression and held-out suites are balanced, annotated, and non-cyclic", () => {

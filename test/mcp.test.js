@@ -10,7 +10,9 @@ import { Archive } from "../src/archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {
   ARCHIVED_EVIDENCE_LABEL,
+  GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import { StoreClient } from "../src/store-client.js";
@@ -151,7 +153,7 @@ function collectLines(stream, count) {
 test("MCP exposes routing guidance and labels recall output as archived evidence", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-routing-"));
   const child = startServer(join(directory, "archive.db"));
-  const responses = collectLines(child.stdout, 4);
+  const responses = collectLines(child.stdout, 6);
 
   try {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
@@ -173,13 +175,30 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
       method: "tools/call",
       params: { name: "context_window_search", arguments: { relation: "latest-question" } },
     })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "context_window_search", arguments: { query: "What is the current recorded count?" } },
+    })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "context_window_gather", arguments: { query: "Use the previous workflow", intent: "workflow" } },
+    })}\n`);
 
-    const [listed, recalled, status, structural] = await responses;
+    const [listed, recalled, status, structural, updateSearch, gathered] = await responses;
+    const gather = listed.result.tools.find(({ name }) => name === "context_window_gather");
     const search = listed.result.tools.find(({ name }) => name === "context_window_search");
     const recall = listed.result.tools.find(({ name }) => name === "context_recall");
     const archiveTool = listed.result.tools.find(({ name }) => name === "context_window_archive");
     assert.equal(listed.result.tools.some(({ name }) => name === "context_window_recall"), false);
+    assert.equal(gather.description, GATHER_TOOL_DESCRIPTION);
+    assert.equal(gather.inputSchema.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
     assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);
+    assert.equal(search.inputSchema.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
+    assert.match(search.inputSchema.properties.scope.description, /all.*does not bypass project authorization/i);
     assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);
     assert.equal(search.inputSchema.properties.query.maxLength, 65_536);
     assert.equal(recall.inputSchema.properties.id.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
@@ -195,6 +214,10 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
     assert.match(status.result.content[0].text, /Archive logical usage/);
     assert.match(status.result.content[0].text, /SQLite files/);
     assert.match(structural.result.content[0].text, /Structural retrieval: latest-question — not-found/);
+    assert.match(updateSearch.result.content[0].text, /Time-sensitive archive query/);
+    assert.match(updateSearch.result.content[0].text, /does not replace live inspection/);
+    assert.match(gathered.result.content[0].text, /Bounded historical gather: workflow — not-found/u);
+    assert.equal(gathered.result.isError, true);
     assert.equal(recalled.result.isError, true);
     assert.equal(
       recalled.result.content[0].text.startsWith(`[${ARCHIVED_EVIDENCE_LABEL}]\n\n`),

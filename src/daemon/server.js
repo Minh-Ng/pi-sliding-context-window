@@ -42,6 +42,8 @@ const MAX_ACTIVE_REQUESTS = 32;
 const MAX_ACTIVE_REQUEST_BYTES = 256 * 1_024 * 1_024;
 const SHUTDOWN_SOCKET_DRAIN_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
+const MAX_SLOW_REQUESTS = 100;
+const DEFAULT_SLOW_REQUEST_MS = 250;
 
 function codedError(code, message, details) {
   const error = new Error(message);
@@ -149,6 +151,8 @@ export class StoreDaemon {
     shutdownSocketDrainMs = SHUTDOWN_SOCKET_DRAIN_MS,
     handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS,
     beforeStoreClose,
+    requestObserver,
+    slowRequestMs = DEFAULT_SLOW_REQUEST_MS,
   }) {
     if (typeof createStore !== "function") {
       throw new TypeError("StoreDaemon requires an exclusive createStore function.");
@@ -167,6 +171,14 @@ export class StoreDaemon {
       throw new TypeError("beforeStoreClose must be a function.");
     }
     this.beforeStoreClose = beforeStoreClose;
+    if (requestObserver !== undefined
+      && (typeof requestObserver !== "object"
+        || typeof requestObserver.requestStarted !== "function"
+        || typeof requestObserver.requestFinished !== "function")) {
+      throw new TypeError("requestObserver must expose requestStarted and requestFinished functions.");
+    }
+    this.requestObserver = requestObserver;
+    this.slowRequestMs = positiveLimit(slowRequestMs, "slowRequestMs");
     this.allowShutdown = allowShutdown;
     this.maxFrameBytes = positiveLimit(
       maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
@@ -248,6 +260,7 @@ export class StoreDaemon {
     this.outputReservations = new Set();
     this.outputWaiters = [];
     this.backgroundErrors = [];
+    this.slowRequests = [];
     this.starting = undefined;
     this.closing = undefined;
     this.state = "idle";
@@ -915,6 +928,15 @@ export class StoreDaemon {
     }
     this.activeRequests += 1;
     this.activeRequestBytes += requestBytes;
+    const requestStartedAt = Date.now();
+    let observationToken;
+    try {
+      observationToken = this.requestObserver?.requestStarted({
+        operation: request.operation,
+        requestBytes,
+        startedAt: requestStartedAt,
+      });
+    } catch { /* diagnostics must not affect request handling */ }
 
     const promise = (async () => {
       try {
@@ -932,20 +954,43 @@ export class StoreDaemon {
       byteLength: 0,
     };
     this.requestOutcomes.set(replayKey, entry);
-    const settleActiveRequest = () => {
+    const settleActiveRequest = (ok) => {
       this.activeRequests -= 1;
       this.activeRequestBytes -= requestBytes;
       if (this.activeRequests < 0) this.activeRequests = 0;
       if (this.activeRequestBytes < 0) this.activeRequestBytes = 0;
+      const completedAt = Date.now();
+      const durationMs = Math.max(0, completedAt - requestStartedAt);
+      if (durationMs >= this.slowRequestMs) {
+        this.slowRequests.push(Object.freeze({
+          operation: request.operation,
+          requestBytes,
+          durationMs,
+          completedAt,
+          ok,
+        }));
+        if (this.slowRequests.length > MAX_SLOW_REQUESTS) {
+          this.slowRequests.splice(0, this.slowRequests.length - MAX_SLOW_REQUESTS);
+        }
+      }
+      try {
+        this.requestObserver?.requestFinished(observationToken, {
+          operation: request.operation,
+          requestBytes,
+          durationMs,
+          completedAt,
+          ok,
+        });
+      } catch { /* diagnostics must not affect request handling */ }
     };
     promise.then((response) => {
-      settleActiveRequest();
+      settleActiveRequest(response.ok === true);
       entry.settled = true;
       entry.byteLength = Buffer.byteLength(JSON.stringify(response), "utf8");
       this.replayOutcomeBytes += entry.byteLength;
       this.#trimRequestOutcomes();
     }, () => {
-      settleActiveRequest();
+      settleActiveRequest(false);
       // Dispatch is normalized to a response, but preserve the accounting
       // invariant if that implementation detail changes.
       entry.settled = true;
@@ -996,6 +1041,7 @@ export class StoreDaemon {
       ready: Boolean(this.server?.listening),
       processId: process.pid,
       storePath: this.storePath,
+      runtimeVersion: this.serverVersion,
       startedAt: this.startedAt,
       schemaVersion: STORE_SCHEMA_VERSION,
       protocolVersion: STORE_PROTOCOL_VERSION,
@@ -1005,6 +1051,7 @@ export class StoreDaemon {
         ...(storeStatus.backgroundErrors ?? []),
         ...(runtimeStatus.backgroundErrors ?? []),
       ].slice(-100),
+      slowRequests: [...this.slowRequests],
     };
     for (const field of ["counts", "outbox", "index", "retention", "rocksdb", "filesystem", "migration"]) {
       if (runtimeStatus[field] !== undefined) result[field] = runtimeStatus[field];

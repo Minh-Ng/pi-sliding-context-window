@@ -39,6 +39,41 @@ test("archives and BM25-searches documents by scope", () => {
   }
 });
 
+test("SQLite gather expands exact workflow successors without crossing sessions", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-gather-sqlite-"));
+  const archive = new Archive(join(directory, "archive.db"));
+  try {
+    for (const [id, text, createdAt, sessionId] of [
+      ["anchor", "Prior migration procedure starts here.", 10, "main"],
+      ["account", "Then switch to the automation identity.", 20, "main"],
+      ["verify", "Finally verify the remote artifact.", 30, "main"],
+      ["sibling", "Use a personal identity instead.", 25, "sibling"],
+    ]) {
+      archive.put({ id, sessionId, project: "/project/a", kind: "turn", text, createdAt });
+    }
+    const gathered = archive.gatherDetailed("Prior migration procedure", {
+      intent: "workflow",
+      sessionIds: ["main"],
+      project: "/project/a",
+      scope: "session",
+      limit: 1,
+      before: 0,
+      after: 2,
+      neighborhoodAnchors: 1,
+      maxEvidence: 3,
+    });
+    assert.deepEqual(gathered.evidence.map(({ document }) => document.id), [
+      "anchor",
+      "account",
+      "verify",
+    ]);
+    assert.doesNotMatch(gathered.evidence.map(({ document }) => document.text).join("\n"), /personal identity/u);
+  } finally {
+    archive.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("repeated legacy document writes remain idempotent", () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-repeated-put-"));
   const archive = new Archive(join(directory, "archive.db"));

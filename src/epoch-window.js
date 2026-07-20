@@ -26,6 +26,10 @@ import {
   turnTopic,
 } from "./window.js";
 import { structuralMessageScores } from "./structural.js";
+import {
+  MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT,
+  MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT,
+} from "./store-contract.js";
 
 // Bounds persisted rotation-state growth; the marker text is separately
 // bounded by the token budget in buildTocMarkerText.
@@ -148,6 +152,27 @@ function checkpointSourceKey(label, messages, text) {
   hash.update(`\0${Buffer.byteLength(text, "utf8")}:`);
   hash.update(text);
   return `${label}:${hash.digest("hex")}`;
+}
+
+function checkpointSourceChunks(messages) {
+  const chunks = [];
+  let current = [];
+  let currentKeyBytes = 0;
+  for (const message of messages) {
+    const keyBytes = Buffer.byteLength(messageKey(message), "utf8");
+    if (current.length > 0 && (
+      current.length >= MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT
+      || currentKeyBytes + keyBytes > MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT
+    )) {
+      chunks.push(current);
+      current = [];
+      currentKeyBytes = 0;
+    }
+    current.push(message);
+    currentKeyBytes += keyBytes;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
 }
 
 function textContentPart(part) {
@@ -640,6 +665,24 @@ export class EpochWindowSession {
     this.contextLimits = resolveContextLimits(this.config, model);
   }
 
+  updateWindowPolicy(config, model) {
+    for (const key of [
+      "rotationContextRatio",
+      "hardLimitContextRatio",
+      "rotationTokens",
+      "rotationTokensExplicit",
+      "hardLimitTokens",
+      "hardLimitTokensExplicit",
+      "rotationTurns",
+      "retainTurns",
+      "models",
+      "environmentOverrides",
+    ]) {
+      this.config[key] = config[key];
+    }
+    this.updateModel(model);
+  }
+
   refreshArchiveProtection() {
     const documentIds = new Set([
       ...this.activeArchiveIds,
@@ -717,17 +760,23 @@ export class EpochWindowSession {
 
       const sources = [];
       const appendSource = (messages, label, kind) => {
-        if (messages.length === 0) return;
-        const text = serializeMessages(messages);
-        sources.push({
-          text,
-          sourceKey: checkpointSourceKey(label, messages, text),
-          sourceMessageKeys: messages.map((message) => messageKey(message)),
-          kind,
-          createdAt: checkpointCreatedAt(messages),
-          topic: turnTopic(messages),
-          terms: extractSalientTerms(text),
-        });
+        const chunks = checkpointSourceChunks(messages);
+        for (let index = 0; index < chunks.length; index += 1) {
+          const chunk = chunks[index];
+          const chunkLabel = chunks.length === 1
+            ? label
+            : `${label}-${index + 1}-of-${chunks.length}`;
+          const text = serializeMessages(chunk);
+          sources.push({
+            text,
+            sourceKey: checkpointSourceKey(chunkLabel, chunk, text),
+            sourceMessageKeys: chunk.map((message) => messageKey(message)),
+            kind,
+            createdAt: checkpointCreatedAt(chunk),
+            topic: turnTopic(chunk),
+            terms: extractSalientTerms(text),
+          });
+        }
       };
       appendSource(
         preparation.messagesToSummarize,
@@ -886,6 +935,7 @@ export class EpochWindowSession {
       scope: options.scope ?? "session",
       limit: options.limit ?? this.config.searchResults,
       relation: options.relation,
+      expansionTerms: options.expansionTerms,
     };
     if (this.archive.searchDetailed) {
       return this.archive.searchDetailed(query, searchOptions);
@@ -898,6 +948,111 @@ export class EpochWindowSession {
       results,
       candidates: results.map(({ id }) => ({ id, granularity: "document" })),
     };
+  }
+
+  gatherDetailed(query, options = {}) {
+    const gatherOptions = {
+      sessionId: this.sessionId,
+      sessionIds: [...this.sessionIds],
+      project: this.project,
+      scope: options.scope ?? "session",
+      intent: options.intent ?? "auto",
+      limit: options.limit ?? this.config.searchResults,
+      expansionTerms: options.expansionTerms,
+      before: options.before,
+      after: options.after,
+      neighborhoodAnchors: options.neighborhoodAnchors,
+      maxEvidence: options.maxEvidence,
+      maxTokens: options.maxTokens ?? this.config.searchResultTokens * 4,
+      excludeVisibleSourceKeys: options.excludeVisibleSourceKeys,
+    };
+    if (typeof this.archive.gatherDetailed === "function") {
+      return this.archive.gatherDetailed(query, gatherOptions);
+    }
+
+    // Compatibility fallback for custom and legacy archive implementations.
+    // It preserves the one-tool gather behavior, but only RocksDB can force the
+    // hybrid semantic expansion and enforce the aggregate recall budget in the
+    // store process.
+    const search = this.searchDetailed(query, gatherOptions);
+    const candidates = new Map();
+    const add = (result, relation, anchorRank, distance) => {
+      const key = result.documentId ?? result.id;
+      const current = candidates.get(key);
+      const priority = relation === "anchor" ? anchorRank : 100 + anchorRank * 20 + distance;
+      if (!current || priority < current.priority) {
+        candidates.set(key, { result, relation, anchorRank, distance, priority });
+      }
+    };
+    search.results.forEach((result, index) => add(result, "anchor", index + 1, 0));
+    const intent = gatherOptions.intent;
+    const before = Number.isSafeInteger(gatherOptions.before)
+      ? gatherOptions.before
+      : intent === "state" ? 0 : 1;
+    const after = Number.isSafeInteger(gatherOptions.after)
+      ? gatherOptions.after
+      : intent === "workflow" ? 8 : intent === "state" ? 0 : 3;
+    const neighborhoodAnchors = search.results.slice(0, gatherOptions.neighborhoodAnchors ?? 2);
+    let hasMore = false;
+    neighborhoodAnchors.forEach((anchor, anchorIndex) => {
+      for (const [direction, limit] of [["before", before], ["after", after]]) {
+        if (limit === 0) continue;
+        const traversal = this.traverseDetailed(anchor.id, { direction, scope: gatherOptions.scope, limit });
+        hasMore ||= traversal.hasMore;
+        traversal.results.forEach((result, index) => {
+          add(result, direction, anchorIndex + 1, index + 1);
+        });
+      }
+    });
+    const selected = [...candidates.values()]
+      .sort((left, right) => left.priority - right.priority)
+      .slice(0, gatherOptions.maxEvidence ?? 12)
+      .map((item) => ({
+        relation: item.relation,
+        anchorRank: item.anchorRank,
+        distance: item.distance,
+        id: item.result.id,
+        locator: item.result.id,
+        document: this.recall(item.result.id),
+      }))
+      .filter((item) => item.document)
+      .sort((left, right) => Number(left.document.createdAt) - Number(right.document.createdAt));
+    const truncated = hasMore || candidates.size > selected.length || search.results.length === gatherOptions.limit;
+    return {
+      status: selected.length > 0 ? "resolved" : "not-found",
+      mode: search.mode,
+      intent,
+      anchorCount: search.results.length,
+      candidateCount: candidates.size,
+      returnedTokens: 0,
+      truncated,
+      hasMore: truncated,
+      evidence: selected,
+    };
+  }
+
+  traverseDetailed(id, options = {}) {
+    if (typeof this.archive.traverseDetailed !== "function") {
+      return {
+        mode: "chronological",
+        status: "not-found",
+        direction: options.direction ?? "before",
+        scanned: 0,
+        truncated: false,
+        hasMore: false,
+        results: [],
+        candidates: [],
+      };
+    }
+    return this.archive.traverseDetailed(id, {
+      direction: options.direction ?? "before",
+      scope: options.scope ?? "session",
+      sessionId: this.sessionId,
+      sessionIds: [...this.sessionIds],
+      project: this.project,
+      limit: options.limit ?? 128,
+      scanLimit: options.scanLimit ?? 2_048,
+    });
   }
 
   recall(id) {
@@ -1318,109 +1473,114 @@ export class EpochWindowSession {
       : 16_000;
     try {
       for (const turn of groupCompleteTurns(messages)) {
-        const text = serializeMessages(turn.messages);
-        if (!text.trim()) continue;
-        const sourceMessageKeys = turn.messages.map((message) => messageKey(message));
-        const first = turn.messages[0];
-        const requiresCheckpoint = turn.messages.some((message) =>
-          message?.role === "user" && inlineUserTokens(message) > maxInlineTokens);
-        let id;
-        let topic;
-        let terms;
-        let archiveIds;
-        if (requiresCheckpoint) {
-          const source = {
-            text,
-            sourceKey: sourceMessageKeys[0]
-              ?? checkpointSourceKey("rotated-turn", turn.messages, text),
-            sourceMessageKeys,
-            kind: turn.hasUser ? "turn" : "preamble",
-            createdAt: checkpointCreatedAt(turn.messages),
-            topic: turnTopic(turn.messages),
-            terms: extractSalientTerms(text),
-          };
-          const request = {
-            sessionId: this.sessionId,
-            project: this.project,
-            sources: [source],
-            createdAt: source.createdAt,
-            previewSourceIndex: 0,
-            previewTokens: ARCHIVE_CHECKPOINT_PREVIEW_TOKENS,
-            catalogTokens: ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS,
-          };
-          const planned = createArchiveCheckpoint({
-            archive: checkpointPlanningArchive(this.archive),
-            ...request,
-          });
-          const plannedEntries = planned.status === "stored"
-            ? normalizedArchiveEntries(planned.roots)
-            : undefined;
-          if (plannedEntries === undefined || plannedEntries.length !== 1
-            || checkpointIds(plannedEntries).size > MAX_TOC_CHECKPOINT_IDS_PER_ENTRY) {
-            throw new Error("Context archive capacity prevented storing a rotated turn.");
-          }
-          const stored = createArchiveCheckpoint({ archive: this.archive, ...request });
-          if (!checkpointResultMatches(planned, stored)) {
-            throw new Error("Context archive capacity prevented storing a rotated turn.");
-          }
-          const [root] = stored.roots;
-          id = root.rootId;
-          topic = root.topic;
-          terms = [...root.terms];
-          archiveIds = [...checkpointIds(stored.roots)];
-          for (const checkpointId of archiveIds) this.activeArchiveIds.add(checkpointId);
-          this.refreshArchiveProtection();
-        } else {
-          id = this.archive.put({
-            sessionId: this.sessionId,
-            project: this.project,
-            kind: turn.hasUser ? "turn" : "preamble",
-            text,
-            createdAt: Number(first?.timestamp) || Date.now(),
-            metadata: {
-              // Keep the original fields for consumers that already read them.
-              startKey: sourceMessageKeys[0],
-              messageCount: sourceMessageKeys.length,
+        // One tool-heavy user turn can contain more source messages than the
+        // archive wire contract permits on a single document. Segment it by
+        // the same exact-provenance bounds used for compaction checkpoints.
+        for (const turnMessages of checkpointSourceChunks(turn.messages)) {
+          const text = serializeMessages(turnMessages);
+          if (!text.trim()) continue;
+          const sourceMessageKeys = turnMessages.map((message) => messageKey(message));
+          const first = turnMessages[0];
+          const requiresCheckpoint = turnMessages.some((message) =>
+            message?.role === "user" && inlineUserTokens(message) > maxInlineTokens);
+          let id;
+          let topic;
+          let terms;
+          let archiveIds;
+          if (requiresCheckpoint) {
+            const source = {
+              text,
+              sourceKey: sourceMessageKeys[0]
+                ?? checkpointSourceKey("rotated-turn", turnMessages, text),
               sourceMessageKeys,
-              sourceFirstKey: sourceMessageKeys[0],
-              sourceLastKey: sourceMessageKeys.at(-1),
-              sourceMessageCount: sourceMessageKeys.length,
-            },
-          }, {
-            deferPrune: true,
-            protect: true,
-            structuralMessages: structuralMessages(turn.messages),
-          });
-          if (!id) {
-            throw new Error("Context archive capacity prevented storing a rotated turn.");
+              kind: turn.hasUser ? "turn" : "preamble",
+              createdAt: checkpointCreatedAt(turnMessages),
+              topic: turnTopic(turn.messages),
+              terms: extractSalientTerms(text),
+            };
+            const request = {
+              sessionId: this.sessionId,
+              project: this.project,
+              sources: [source],
+              createdAt: source.createdAt,
+              previewSourceIndex: 0,
+              previewTokens: ARCHIVE_CHECKPOINT_PREVIEW_TOKENS,
+              catalogTokens: ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS,
+            };
+            const planned = createArchiveCheckpoint({
+              archive: checkpointPlanningArchive(this.archive),
+              ...request,
+            });
+            const plannedEntries = planned.status === "stored"
+              ? normalizedArchiveEntries(planned.roots)
+              : undefined;
+            if (plannedEntries === undefined || plannedEntries.length !== 1
+              || checkpointIds(plannedEntries).size > MAX_TOC_CHECKPOINT_IDS_PER_ENTRY) {
+              throw new Error("Context archive capacity prevented storing a rotated turn.");
+            }
+            const stored = createArchiveCheckpoint({ archive: this.archive, ...request });
+            if (!checkpointResultMatches(planned, stored)) {
+              throw new Error("Context archive capacity prevented storing a rotated turn.");
+            }
+            const [root] = stored.roots;
+            id = root.rootId;
+            topic = root.topic;
+            terms = [...root.terms];
+            archiveIds = [...checkpointIds(stored.roots)];
+            for (const checkpointId of archiveIds) this.activeArchiveIds.add(checkpointId);
+            this.refreshArchiveProtection();
+          } else {
+            id = this.archive.put({
+              sessionId: this.sessionId,
+              project: this.project,
+              kind: turn.hasUser ? "turn" : "preamble",
+              text,
+              createdAt: Number(first?.timestamp) || Date.now(),
+              metadata: {
+                // Keep the original fields for consumers that already read them.
+                startKey: sourceMessageKeys[0],
+                messageCount: sourceMessageKeys.length,
+                sourceMessageKeys,
+                sourceFirstKey: sourceMessageKeys[0],
+                sourceLastKey: sourceMessageKeys.at(-1),
+                sourceMessageCount: sourceMessageKeys.length,
+              },
+            }, {
+              deferPrune: true,
+              protect: true,
+              structuralMessages: structuralMessages(turnMessages),
+            });
+            if (!id) {
+              throw new Error("Context archive capacity prevented storing a rotated turn.");
+            }
+            topic = turnTopic(turn.messages);
+            terms = extractSalientTerms(text);
           }
-          topic = turnTopic(turn.messages);
-          terms = extractSalientTerms(text);
-        }
-        stagedToc.push({
-          id,
-          topic,
-          terms,
-          ...(archiveIds ? { archiveIds } : {}),
-        });
-        // Verbatim decision-shaped sentences become separately searchable
-        // records. Additive: the raw turn stays archived either way, so a
-        // missed extraction degrades to the status quo.
-        for (const sentence of extractDecisionCandidates(text)) {
-          this.archive.put({
-            sessionId: this.sessionId,
-            project: this.project,
-            kind: "decision-candidate",
-            text: sentence,
-            createdAt: Number(first?.timestamp) || Date.now(),
-            metadata: {
-              sourceTurnId: id,
-              sourceMessageKeys,
-              sourceFirstKey: sourceMessageKeys[0],
-              sourceLastKey: sourceMessageKeys.at(-1),
-              sourceMessageCount: sourceMessageKeys.length,
-            },
-          }, { deferPrune: true });
+          stagedToc.push({
+            id,
+            topic,
+            terms,
+            ...(archiveIds ? { archiveIds } : {}),
+          });
+          // Verbatim decision-shaped sentences become separately searchable
+          // records. Additive: the raw turn stays archived either way, so a
+          // missed extraction degrades to the status quo.
+          for (const sentence of extractDecisionCandidates(text)) {
+            this.archive.put({
+              sessionId: this.sessionId,
+              project: this.project,
+              kind: "decision-candidate",
+              text: sentence,
+              createdAt: Number(first?.timestamp) || Date.now(),
+              metadata: {
+                sourceTurnId: id,
+                sourceMessageKeys,
+                sourceFirstKey: sourceMessageKeys[0],
+                sourceLastKey: sourceMessageKeys.at(-1),
+                sourceMessageCount: sourceMessageKeys.length,
+              },
+            }, { deferPrune: true });
+          }
         }
       }
     } catch (error) {

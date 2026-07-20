@@ -1,6 +1,6 @@
 # Context Epoch Window
 
-A cache-aware context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, structural, and bounded recall tools.
+A cache-aware context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, optional local semantic, structural, and bounded recall tools.
 
 The Pi adapter provides the complete implementation because Pi exposes a pre-request `context` hook. The included MCP server makes the archive portable to Claude Code, Codex, OpenCode, and other MCP clients, but those clients cannot transparently remove old transcript messages unless their plugin API exposes a message-transform hook.
 
@@ -50,7 +50,7 @@ Default policy:
 - Run a cheap exact-first retrieval preflight for each current user message. Explicit historical intent may reveal one strong, unambiguous, date-labeled JSON excerpt. An implicit recurring concept can reveal only a continuity marker made from exact phrases in the current message; archived candidate wording and cold jargon do not enter that marker. Weak, stale, repeated, current-only, general-knowledge, and failed preflights add zero prompt bytes. Selected bytes are frozen by user-message key so an unchanged active prefix never changes after reindexing.
 - Apply semantic expiry by evidence class and age. There is no routine maximum archive size. Pins, active-context protections, and retrieval leases win deletion races; disk-low emergency mode remains a separate host-safety mechanism.
 - Let RocksDB compact obsolete LSM records in the background. Large deletion waves trigger a flush and continue through RocksDB's background workers; an explicit operator may request a full manual compaction. Compaction never decides which logical evidence is live.
-- Skip threshold-based compaction only when both required measurements are finite, the filtered epoch estimate remains below the hard limit, and the larger provider-aware measurement remains below the earlier rotation limit. Missing usage, manual/overflow requests, unsafe measurements, or an unrotatable turn require an exact archive checkpoint and bounded custom compaction result. If checkpoint publication cannot be confirmed, the adapter cancels compaction rather than pass raw source to a summarizer.
+- Skip threshold-based compaction only when both required measurements are finite, the filtered epoch estimate remains below the hard limit, and the larger provider-aware measurement remains below the earlier rotation limit. Missing usage, manual/overflow requests, unsafe measurements, or an unrotatable turn require an exact archive checkpoint and bounded custom compaction result. Large compaction spans split deterministically across bounded checkpoint roots while preserving every original message key in order. If checkpoint publication cannot be confirmed, the adapter cancels compaction rather than pass raw source to a summarizer.
 
 Epoch sizing uses `characters / 4` and excludes fixed request overhead such as the system prompt, tool schemas, and provider framing. Model-visible hints and recall use the stricter deterministic estimator described below. Provider usage remains authoritative for compaction safety.
 
@@ -62,9 +62,10 @@ From this repository:
 pi install /path/to/context-window
 ```
 
-Restart Pi, then inspect it:
+Restart Pi, then configure or inspect it:
 
 ```text
+/context-window
 /window
 /window search refresh token
 /window recall why
@@ -78,19 +79,45 @@ Restart Pi, then inspect it:
 /window archive redact project confirm <token>
 ```
 
+`/context-window` opens a TUI settings panel for the global turn cap and optional absolute context-token cap. Changes persist under the `context-window` namespace in `~/.pi/agent/settings.json` and apply to the active session immediately when no higher-precedence project or environment override wins. Choose `adaptive` for the context cap to use the configured model-relative rotation ratio instead of an absolute token ceiling.
+
 `/window recall why` explains the last automatic retrieval decision, including its suppression reason and sanitized match metrics. It never prints archived source text. `/window promote` prints a checklist for landing a durable decision in the repo (not an archive pin). `/window supersede` marks a prior archived decision as no longer live for search. Scoped redaction tombstones archive documents for one session or project after an explicit confirm token.
 
 Agent tools:
 
-- `context_window_search` — BM25 search over archived turns and tool output, or structural lookup of the latest archived question, request, correction, or answer
+- `context_window_gather` — retrieve a bounded, chronologically ordered packet of exact evidence for historical state or a multi-turn workflow
+- `context_window_search` — exact/BM25 search with optional local semantic fallback, or structural lookup of the latest archived question, request, correction, or answer
 - `context_recall` — recover an archived document by ID
+- `context_window_traverse` — inspect bounded chronology before or after an authenticated anchor
 - `context_window_supersede` — admit a correction that supersedes a prior archived document
+
+Gather is the default for ordinary questions that require synthesis across dated records or surrounding workflow turns. It performs hybrid candidate retrieval, expands only the verified session lineage, resolves exact source, and returns explicit truncation metadata. Low-level search, recall, and traversal remain available for precise investigations and continuation.
 
 `context_recall` keeps direct document-ID compatibility. Search internally returns authenticated, version-bound locators and exact recall uses them without substituting newer versions.
 
 Use archive tools for prior intent, rationale, exact wording, decisions, rejected approaches, continuity, and scope disputes. Use live inspection for current files, runtime, configuration, tests, and task status. Mentioning old discussion or inviting history lookup does not make archive evidence material when the answer is exclusively current mutable state. For mixed questions, recover archived intent first, inspect live state second, and reconcile conflicts; archived evidence is never proof of current mutable state. Avoid speculative broad archive searches.
 
-For a conceptually phrased historical question without an exact identifier, the agent expands the lexical query with 3–8 concise likely synonyms or domain terms. Exact file names, symbols, errors, commits, PRs, and specific values are searched verbatim and are never broadened. A missed conceptual archive search permits at most one reformulation; a missed well-anchored search routes the agent to live or external evidence instead.
+For a conceptually phrased historical question without an exact identifier, the agent preserves the original question for semantic matching and supplies 3–8 concise likely synonyms or domain terms separately for BM25 expansion. Exact file names, symbols, errors, commits, PRs, and specific values are searched verbatim and are never broadened. A missed conceptual archive search permits at most one reformulation; a missed well-anchored search routes the agent to live or external evidence instead.
+
+Local semantic fallback is enabled by default and applies only to explicit search after exact lookup misses and BM25 evidence is weak. It does not change automatic prompt insertion. Install the pinned model once:
+
+```bash
+context-window-semantic install
+# From a source checkout where the package bin is not on PATH:
+node ./bin/context-window-semantic.js install
+```
+
+The installer is the only path that permits a model download. Restart the shared daemon after installation. Runtime inference uses the library-managed cache with remote model access disabled; embeddings and per-project ANN indexes remain on the local machine. If the model or native index is unavailable, search falls back to exact/BM25 without failing the request.
+
+Semantic retrieval is opt-out. On a machine where its additional memory, CPU, or disk use is undesirable, disable it explicitly:
+
+```json
+{
+  "context-window": {
+    "semanticRetrieval": false
+  }
+}
+```
 
 When an existing context-recovery trigger has no lexical anchor, `context_window_search` accepts a structural `relation` instead of a query:
 
@@ -169,6 +196,12 @@ Use the `context-window` namespace in Pi's shared settings files:
     "derivedRetentionDays": 30,
     "archiveBackend": "rocksdb",
     "rocksdbPath": "~/.pi/context-window/archive.rocks",
+    "semanticRetrieval": true,
+    "semanticModel": "Xenova/all-MiniLM-L6-v2",
+    "semanticModelRevision": "751bff37182d3f1213fa05d7196b954e230abad9",
+    "semanticModelCachePath": "~/.pi/context-window/models",
+    "semanticIndexPath": "~/.pi/context-window/semantic-index",
+    "semanticCandidates": 40,
     "dbPath": "~/.pi/context-window/archive.db",
     "maxArchiveBytes": 1073741824,
     "targetArchiveBytes": 805306368,
@@ -188,7 +221,7 @@ Model keys match `provider/model-id`, are case-insensitive, and support `*`. Cas
 
 `activeHintBudgetTokens` is the preferred name for the 640-token active-context allowance. `epochHintBudgetTokens` remains a compatibility alias; when both are present at the same precedence, the preferred name wins.
 
-Legacy `rotationTokens` and `hardLimitTokens` remain supported as explicit safety caps on ratio-derived limits. When Pi does not provide a valid model context window, they fall back to 96K and 128K respectively.
+`rotationTokens` and `hardLimitTokens` are optional explicit safety caps on ratio-derived limits. `/context-window` writes or removes the global `rotationTokens` cap; selecting `adaptive` removes that global key. When Pi does not provide a valid model context window, the fallback limits are 96K and 128K respectively.
 
 `archiveBackend` defaults to `rocksdb` only when no SQLite archive exists. An existing `dbPath` selects SQLite unless `archiveBackend` or `CONTEXT_WINDOW_BACKEND` explicitly selects RocksDB after offline verification. Every packaged adapter consults the singleton authority record through the configured RocksDB daemon before serving archive operations. SQLite startup persists a source-bound claim before opening SQLite. Fresh RocksDB startup persists permanent authority immediately, while a verified cutover remains rollback-eligible until its first canonical write atomically seals authority. SQLite startup therefore creates or contacts `rocksdbPath` even when remaining on SQLite; RocksDB startup always checks the configured `dbPath`. Concurrent or stale backend selections fail closed instead of opening divergent writable histories. Packaged adapters reject a fresh, incomplete, blocked, wrong-source, or post-authority rollback configuration. `maxArchiveBytes`, `targetArchiveBytes`, and SQLite reclamation settings apply only to SQLite. RocksDB uses `rocksdbPath`, derives a short Unix socket path automatically when `socketPath` is omitted, and has no routine archive-size cap. Raw tool payloads expire after 14 days by default, conversation sources after 90 days, and source-linked derived evidence after 30 days. Automatic prompt insertion is stricter: tool, conversation, and derived candidates become ineligible after 7, 30, and 30 days respectively. Manual or durable archives are never inserted automatically and do not expire automatically. Set a retention day value to `0` to disable automatic expiry for that storage class.
 
@@ -206,6 +239,12 @@ CONTEXT_WINDOW_MAX_INLINE_USER_TOKENS
 CONTEXT_WINDOW_SEARCH_RESULTS
 CONTEXT_WINDOW_SEARCH_RESULT_TOKENS
 CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL
+CONTEXT_WINDOW_SEMANTIC_RETRIEVAL
+CONTEXT_WINDOW_SEMANTIC_MODEL
+CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION
+CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
+CONTEXT_WINDOW_SEMANTIC_INDEX
+CONTEXT_WINDOW_SEMANTIC_CANDIDATES
 CONTEXT_WINDOW_HINT_BUDGET_TOKENS
 CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS
 CONTEXT_WINDOW_EPOCH_HINT_BUDGET_TOKENS
@@ -246,6 +285,7 @@ node /path/to/context-window/bin/context-window-mcp.js
 It exposes:
 
 - `context_window_archive`
+- `context_window_gather`
 - `context_window_search`
 - `context_recall`
 - `context_window_status`
@@ -263,7 +303,9 @@ Point any MCP-capable client at that command. This provides shared archival and 
 
 ## Daemon and migration operations
 
-The Pi and MCP adapters start `context-windowd` on demand. It can also be managed explicitly:
+The Pi and MCP adapters start `context-windowd` on demand. Each daemon advertises the fingerprint of the production code it actually loaded. After an extension/package update, a reloaded client verifies the daemon's store identity, runtime fingerprint, and required capabilities; if stale, it sends `SIGTERM` only to that verified owner and reconnects through the existing lock/socket startup arbitration. Concurrent clients reconnect automatically. In normal Pi use, `/reload` is therefore sufficient—manual PID lookup and `pkill` are neither required nor recommended. Upgrade requests are recorded as `daemon-upgrade-requested` in the bounded daemon launch log.
+
+The daemon can also be managed explicitly:
 
 ```bash
 context-windowd --store ~/.pi/context-window/archive.rocks --socket ~/.cache/context-window/run/context-windowd-migration.sock --allow-shutdown

@@ -707,6 +707,143 @@ export class Archive {
     };
   }
 
+  gatherDetailed(query, options = {}) {
+    const intent = options.intent ?? "auto";
+    const limit = Math.min(10, Math.max(1, Number(options.limit) || 3));
+    const search = this.searchDetailed(query, { ...options, limit });
+    const candidates = new Map();
+    const add = (result, relation, anchorRank, distance) => {
+      const key = result.documentId ?? result.id;
+      let priority;
+      if (intent === "workflow") {
+        if (anchorRank === 1 && relation === "anchor") priority = 0;
+        else if (anchorRank === 1 && relation === "after") priority = distance;
+        else if (anchorRank === 1 && relation === "before") priority = 50 + distance;
+        else if (relation === "anchor") priority = 100 + anchorRank;
+        else priority = 200 + anchorRank * 20 + distance;
+      } else {
+        priority = relation === "anchor"
+          ? anchorRank
+          : 100 + anchorRank * 20 + (relation === "after" ? distance : 10 + distance);
+      }
+      const current = candidates.get(key);
+      if (!current || priority < current.priority) {
+        candidates.set(key, { result, relation, anchorRank, distance, priority });
+      }
+    };
+    search.results.forEach((result, index) => add(result, "anchor", index + 1, 0));
+    const before = Number.isSafeInteger(options.before)
+      ? Math.min(8, Math.max(0, options.before))
+      : intent === "state" ? 0 : 1;
+    const after = Number.isSafeInteger(options.after)
+      ? Math.min(16, Math.max(0, options.after))
+      : intent === "workflow" ? 8 : intent === "state" ? 0 : 3;
+    const neighborhoodAnchors = search.results.slice(
+      0,
+      Math.min(5, Math.max(1, Number(options.neighborhoodAnchors) || 2)),
+    );
+    let hasMore = false;
+    neighborhoodAnchors.forEach((anchor, anchorIndex) => {
+      for (const [direction, neighborLimit] of [["before", before], ["after", after]]) {
+        if (neighborLimit === 0) continue;
+        const projectScoped = options.scope !== "session";
+        const traversal = this.traverseDetailed(anchor.id, {
+          direction,
+          sessionId: projectScoped ? anchor.sessionId : options.sessionId,
+          sessionIds: projectScoped ? [anchor.sessionId] : options.sessionIds,
+          project: options.project,
+          scope: "session",
+          limit: neighborLimit,
+        });
+        hasMore ||= traversal.hasMore;
+        traversal.results.forEach((result, index) => {
+          add(result, direction, anchorIndex + 1, index + 1);
+        });
+      }
+    });
+    const maxEvidence = Math.min(24, Math.max(1, Number(options.maxEvidence) || 12));
+    const selected = [...candidates.values()]
+      .sort((left, right) => left.priority - right.priority)
+      .slice(0, maxEvidence)
+      .map((item) => ({
+        relation: item.relation,
+        anchorRank: item.anchorRank,
+        distance: item.distance,
+        id: item.result.id,
+        locator: item.result.id,
+        document: this.get(item.result.id),
+      }))
+      .filter((item) => item.document)
+      .sort((left, right) => Number(left.document.createdAt) - Number(right.document.createdAt));
+    const truncated = hasMore || candidates.size > selected.length || search.results.length === limit;
+    return {
+      status: selected.length > 0 ? "resolved" : "not-found",
+      mode: search.mode,
+      intent,
+      anchorCount: search.results.length,
+      candidateCount: candidates.size,
+      returnedTokens: 0,
+      truncated,
+      hasMore: truncated,
+      evidence: selected,
+    };
+  }
+
+  traverseDetailed(anchorId, {
+    direction = "before",
+    sessionId,
+    sessionIds,
+    project,
+    scope = "session",
+    limit = 128,
+  } = {}) {
+    const anchor = prepare(this.db, "SELECT * FROM documents WHERE id = ?").get(anchorId);
+    if (!anchor || (project && anchor.project !== project)) {
+      return { mode: "chronological", status: "not-found", direction, scanned: 0, truncated: false, hasMore: false, results: [], candidates: [] };
+    }
+    const scopedSessionIds = Array.isArray(sessionIds)
+      ? sessionIds.filter(Boolean)
+      : (sessionId ? [sessionId] : []);
+    if (scope === "session" && !scopedSessionIds.includes(anchor.session_id)) {
+      return { mode: "chronological", status: "not-found", direction, scanned: 0, truncated: false, hasMore: false, results: [], candidates: [] };
+    }
+    const boundedLimit = Math.min(128, Math.max(1, Number(limit) || 128));
+    const comparison = direction === "after" ? ">" : "<";
+    const order = direction === "after" ? "ASC" : "DESC";
+    let where = `(created_at ${comparison} ? OR (created_at = ? AND id ${comparison} ?))`;
+    const params = [anchor.created_at, anchor.created_at, anchor.id];
+    if (scope === "session") {
+      where += ` AND session_id IN (${scopedSessionIds.map(() => "?").join(", ")})`;
+      params.push(...scopedSessionIds);
+    }
+    if (project) {
+      where += " AND project = ?";
+      params.push(project);
+    }
+    params.push(boundedLimit + 1);
+    const rows = prepare(this.db, `
+      SELECT * FROM documents
+      WHERE ${where}
+      ORDER BY created_at ${order}, id ${order}
+      LIMIT ?
+    `).all(...params);
+    const truncated = rows.length > boundedLimit;
+    const results = rows.slice(0, boundedLimit).map((row) => {
+      const document = documentFromRow(row);
+      return { ...document, snippet: document.text.slice(0, 512) };
+    });
+    return {
+      mode: "chronological",
+      status: results.length > 0 ? "resolved" : "not-found",
+      direction,
+      scanned: rows.length,
+      truncated,
+      hasMore: truncated,
+      results,
+      candidates: results.map(({ id }) => ({ id, granularity: "document" })),
+    };
+  }
+
   searchLexical(query, { sessionId, sessionIds, project, scope = "session", limit = 3 } = {}) {
     const expression = matchExpression(query);
     if (!expression) return [];

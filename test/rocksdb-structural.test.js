@@ -8,8 +8,9 @@ import { IndexWorker } from "../src/rocksdb/indexer.js";
 import {
   createStructuralIndexHandler,
   lookupStructural,
+  lookupStructuralAsync,
 } from "../src/rocksdb/index/structural.js";
-import { lookupDecisionEvidence } from "../src/rocksdb/index/decisions.js";
+import { DECISION_KEYSPACE, lookupDecisionEvidence } from "../src/rocksdb/index/decisions.js";
 import { readDocumentRange } from "../src/rocksdb/document-range.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument } from "../src/rocksdb/manifests.js";
@@ -504,4 +505,210 @@ test("structural posting fan-out is skipped before source reads or mutation cons
     > drained.publications[0].skippedHandlers[0].limit);
   assert.equal(sourceReads, 0);
   assert.equal(store.scan([KEYSPACE.RELATION], { limit: 1 }).length, 0);
+});
+
+test("daemon structural and decision scans page and yield between bounded text batches", async () => {
+  const text = `${"alpha ".repeat(10_000)}omega`;
+  const structural = Array.from({ length: 130 }, (_, index) => ({
+    keyBytes: Buffer.from(String(index).padStart(6, "0")),
+    payload: {
+      generation: 1,
+      documentId: `structural-${index}`,
+      documentVersion: 1,
+      sessionId: "session",
+      project: "/project",
+      relation: "latest-question",
+      relationConfidence: 100,
+      outboxSequence: index,
+      messageIndex: 0,
+      legacy: false,
+      textSharded: false,
+      text,
+    },
+  }));
+  const decisions = Array.from({ length: 130 }, (_, index) => ({
+    keyBytes: Buffer.from(String(index).padStart(6, "0")),
+    payload: {
+      generation: 1,
+      documentId: `decision-${index}`,
+      documentVersion: 1,
+      sessionId: "session",
+      project: "/project",
+      createdAt: index,
+      outboxSequence: index,
+      excerpt: text,
+      verbatim: true,
+    },
+  }));
+  const page = (records, options) => {
+    const start = options.after === undefined
+      ? 0
+      : records.findIndex(({ keyBytes }) => Buffer.compare(keyBytes, options.after) > 0);
+    if (start < 0) return [];
+    return records.slice(start, start + options.limit);
+  };
+  const store = {
+    scan(prefix, options = {}) {
+      if (prefix[0] === KEYSPACE.META) return [{ payload: { generation: 1 } }];
+      if (prefix[0] === KEYSPACE.SUPERSESSION) return [];
+      if (prefix[0] === KEYSPACE.RELATION) return page(structural, options);
+      if (prefix[0] === "decision") return page(decisions, options);
+      return [];
+    },
+  };
+  let yields = 0;
+  const yieldControl = async () => {
+    yields += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  const structuralResult = await lookupStructuralAsync(store, {
+    relation: "latest-question",
+    query: "missing",
+    scope: "all",
+    scanLimit: structural.length,
+  }, { yieldControl });
+  assert.equal(structuralResult.status, "not-found");
+  const structuralYields = yields;
+  assert.ok(structuralYields >= 2, `structural scan yielded ${structuralYields} time(s)`);
+
+  const decisionResult = await lookupStructuralAsync(store, {
+    relation: "latest-decision",
+    query: "missing",
+    scope: "all",
+    scanLimit: decisions.length,
+  }, { yieldControl });
+  assert.equal(decisionResult.status, "not-found");
+  assert.ok(yields - structuralYields >= 2, `decision scan yielded ${yields - structuralYields} time(s)`);
+
+  for (const relation of ["latest-question", "latest-decision"]) {
+    let eventLoopTurnObserved = false;
+    setImmediate(() => { eventLoopTurnObserved = true; });
+    await lookupStructuralAsync(store, {
+      relation,
+      query: "missing",
+      scope: "all",
+      scanLimit: structural.length,
+    });
+    assert.equal(eventLoopTurnObserved, true, `${relation} did not yield to the event loop`);
+  }
+});
+
+test("real RocksDB cooperative lookups preserve matches beyond two page boundaries", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-structural-pages-"));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+  const recordCount = 130;
+  const matchIndex = 128;
+  await store.transaction(async (transaction) => {
+    await transaction.put([KEYSPACE.META, "published-index-generation"], { generation: 1 }, {
+      kind: "index-publication",
+    });
+    for (let index = 0; index < recordCount; index += 1) {
+      const structuralPayload = {
+        structuralIndexVersion: 1,
+        relation: "latest-question",
+        relationConfidence: 100,
+        granularity: "message",
+        legacy: false,
+        project: "/project",
+        sessionId: "session",
+        documentId: `structural-${index}`,
+        documentVersion: 1,
+        documentKind: "turn",
+        documentCreatedAt: index,
+        messageKey: `message-${index}`,
+        messageIndex: 0,
+        role: "user",
+        createdAt: index,
+        text: index === matchIndex ? "boundaryneedle" : "other value",
+        startByte: 0,
+        endByte: index === matchIndex ? 14 : 11,
+        generation: 1,
+        outboxSequence: recordCount - index,
+      };
+      await transaction.put([
+        KEYSPACE.RELATION,
+        "latest-question",
+        "session",
+        "/project",
+        "session",
+        index,
+        structuralPayload.documentId,
+        1,
+        0,
+      ], structuralPayload, { kind: "structural-posting" });
+
+      const decisionPayload = {
+        decisionIndexVersion: 1,
+        documentId: `decision-${index}`,
+        documentVersion: 1,
+        project: "/project",
+        sessionId: "session",
+        createdAt: index,
+        generation: 1,
+        outboxSequence: recordCount - index,
+        sourceTurnId: `turn-${index}`,
+        sourceMessageKeys: [`message-${index}`],
+        excerpt: index === matchIndex ? "boundaryneedle" : "other value",
+        verbatim: true,
+      };
+      await transaction.put([
+        DECISION_KEYSPACE,
+        "all",
+        index,
+        "/project",
+        "session",
+        decisionPayload.documentId,
+        1,
+        0,
+      ], decisionPayload, { kind: "decision-evidence" });
+      await transaction.put([
+        DECISION_KEYSPACE,
+        "session",
+        "/project",
+        "session",
+        index,
+        decisionPayload.documentId,
+        1,
+        0,
+      ], decisionPayload, { kind: "decision-evidence" });
+    }
+  });
+
+  const scanLimits = [];
+  const observedStore = {
+    scan(prefix, options) {
+      if (prefix[0] === KEYSPACE.RELATION || prefix[0] === DECISION_KEYSPACE) {
+        scanLimits.push(options.limit);
+      }
+      return store.scan(prefix, options);
+    },
+  };
+  for (const relation of ["latest-question", "latest-decision"]) {
+    const request = {
+      relation,
+      query: "boundaryneedle",
+      scope: "all",
+      limit: 1,
+      scanLimit: recordCount,
+    };
+    const synchronous = lookupStructural(store, request);
+    const cooperative = await lookupStructuralAsync(observedStore, request);
+    assert.deepEqual(cooperative, synchronous);
+    assert.equal(cooperative.results[0].id, `${relation === "latest-decision" ? "decision" : "structural"}-${matchIndex}`);
+
+    const lineageRequest = {
+      ...request,
+      scope: "session",
+      project: "/project",
+      sessionIds: ["current", "session"],
+    };
+    const synchronousLineage = lookupStructural(store, lineageRequest);
+    const cooperativeLineage = await lookupStructuralAsync(observedStore, lineageRequest);
+    assert.deepEqual(cooperativeLineage, synchronousLineage);
+    assert.equal(cooperativeLineage.results[0].structural.lineageDepth, 1);
+  }
+  assert.ok(scanLimits.length >= 6);
+  assert.ok(scanLimits.every((limit) => limit <= 64), `observed scan limits: ${scanLimits.join(",")}`);
 });

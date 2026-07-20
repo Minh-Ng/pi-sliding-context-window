@@ -14,6 +14,7 @@ import {
 } from "../src/archive-checkpoint.js";
 import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
 import { archiveDocumentProvenance } from "../src/provenance.js";
+import { MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT } from "../src/store-contract.js";
 import { estimateTokens, messageKey, serializeMessage, serializeMessages } from "../src/window.js";
 
 const config = {
@@ -347,6 +348,45 @@ test("session controller rotates, archives source turns, and emits durable state
     archivedDocuments: 2,
     dbPath: "/tmp/archive.db",
   });
+});
+
+test("rotation segments a message-heavy turn within archive provenance bounds", () => {
+  const archive = memoryArchive();
+  const put = archive.put.bind(archive);
+  archive.put = (document) => {
+    const sourceMessageKeys = document.metadata?.sourceMessageKeys ?? [];
+    assert.ok(sourceMessageKeys.length <= MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT);
+    return put(document);
+  };
+  const heavyTurn = [
+    user("message-heavy turn", 1),
+    ...Array.from({ length: 300 }, (_, index) =>
+      assistant(`step ${index + 1}`, index + 2)),
+  ];
+  const secondTurn = [user("second turn", 400), assistant("second answer", 401)];
+  const retainedTurn = [user("retained turn", 500), assistant("retained answer", 501)];
+  const messages = [...heavyTurn, ...secondTurn, ...retainedTurn];
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "message-heavy-session",
+    project: "/project",
+  });
+
+  const active = session.process(messages, { contextWindow: 200_000 });
+
+  const documents = [...archive.documents.values()];
+  assert.equal(documents.length, 3);
+  assert.deepEqual(
+    documents.flatMap((document) => document.metadata.sourceMessageKeys),
+    [...heavyTurn, ...secondTurn].map((message) => messageKey(message)),
+  );
+  assert.equal(
+    documents.map((document) => document.text).join("\n\n"),
+    serializeMessages([...heavyTurn, ...secondTurn]),
+  );
+  assert.equal(session.rotationState().toc.length, 3);
+  assert.deepEqual(active.slice(1), retainedTurn);
 });
 
 test("rotation does not advance its boundary when a required turn cannot be archived", () => {
@@ -2039,6 +2079,64 @@ test("split-turn compaction checkpoints exact sources and preserves protection a
     new Set(archive.protectionRequests.at(-1).documentIds).has(forgedPartId),
     false,
   );
+});
+
+test("large compaction spans split into bounded exact-provenance checkpoint sources", () => {
+  const archive = trackingMemoryArchive();
+  const messages = Array.from({ length: 650 }, (_, index) =>
+    user(`large checkpoint message ${index}`, index + 1),
+  );
+  const preparation = {
+    firstKeptEntryId: "kept-after-large-span",
+    messagesToSummarize: messages,
+    turnPrefixMessages: [],
+    isSplitTurn: false,
+    tokensBefore: 300_000,
+    fileOps: {},
+    settings: { keepRecentTokens: 20_000 },
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "large-compaction-checkpoint-session",
+    project: "/project",
+  });
+
+  const result = session.checkpointCompaction(preparation, { branchEntries: [] });
+  assert.ok(result);
+  const entries = result.details.contextWindowArchive.entries;
+  assert.equal(entries.length, 3);
+  assert.deepEqual(entries.map((entry) => entry.kind), [
+    "compaction-span",
+    "compaction-span",
+    "compaction-span",
+  ]);
+  const reconstructed = entries.map((entry) =>
+    reconstructCheckpointSource(archive, entry.rootId),
+  );
+  assert.deepEqual(
+    reconstructed.map((source) => source.root.sourceMessageKeys.length),
+    [256, 256, 138],
+  );
+  assert.deepEqual(
+    reconstructed.flatMap((source) => source.root.sourceMessageKeys),
+    messages.map(messageKey),
+  );
+  assert.deepEqual(
+    reconstructed.map((source) => source.text),
+    [
+      serializeMessages(messages.slice(0, 256)),
+      serializeMessages(messages.slice(256, 512)),
+      serializeMessages(messages.slice(512)),
+    ],
+  );
+
+  const writesAfterFirstCheckpoint = archive.putCalls;
+  assert.deepEqual(
+    session.checkpointCompaction(preparation, { branchEntries: [] }),
+    result,
+  );
+  assert.equal(archive.putCalls, writesAfterFirstCheckpoint);
 });
 
 test("compaction carries only the strictly trusted latest extension catalog", () => {

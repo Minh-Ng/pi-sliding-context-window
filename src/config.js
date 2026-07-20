@@ -1,6 +1,14 @@
-import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { defaultSocketPath } from "./daemon/paths.js";
 
 export const DEFAULT_CONFIG = Object.freeze({
@@ -36,6 +44,12 @@ export const DEFAULT_CONFIG = Object.freeze({
   statusLabelAccent: true,
   archiveBackend: "rocksdb",
   rocksdbPath: join(homedir(), ".pi", "context-window", "archive.rocks"),
+  semanticRetrieval: true,
+  semanticModel: "Xenova/all-MiniLM-L6-v2",
+  semanticModelRevision: "751bff37182d3f1213fa05d7196b954e230abad9",
+  semanticModelCachePath: join(homedir(), ".pi", "context-window", "models"),
+  semanticIndexPath: join(homedir(), ".pi", "context-window", "semantic-index"),
+  semanticCandidates: 40,
   socketPath: undefined,
   // Existing archives remain here until an explicit offline cutover.
   dbPath: join(homedir(), ".pi", "context-window", "archive.db"),
@@ -56,6 +70,32 @@ function readNamespacedJson(path) {
   const settings = readJson(path);
   const config = settings["context-window"];
   return config && typeof config === "object" && !Array.isArray(config) ? config : {};
+}
+
+export function saveGlobalConfig(updates, { home = homedir() } = {}) {
+  if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
+    throw new TypeError("Context-window config updates must be an object.");
+  }
+  const path = join(home, ".pi", "agent", "settings.json");
+  const settings = readJson(path);
+  const current = settings["context-window"];
+  const next = current && typeof current === "object" && !Array.isArray(current)
+    ? { ...current }
+    : {};
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+  }
+  const serialized = `${JSON.stringify({ ...settings, "context-window": next }, null, 2)}\n`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = join(dirname(path), `.settings.json.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    renameSync(temporary, path);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
+  return next;
 }
 
 function parsePositiveInteger(value) {
@@ -149,11 +189,90 @@ function mergeModelProfiles(lowerProfiles, higherProfiles) {
   return merged;
 }
 
+function literalPosition(candidate, literal, start, end) {
+  const table = new Uint32Array(literal.length);
+  for (let index = 1, matched = 0; index < literal.length; index += 1) {
+    while (matched > 0 && literal[index] !== literal[matched]) matched = table[matched - 1];
+    if (literal[index] === literal[matched]) matched += 1;
+    table[index] = matched;
+  }
+  for (let index = start, matched = 0; index < end; index += 1) {
+    while (matched > 0 && candidate[index] !== literal[matched]) matched = table[matched - 1];
+    if (candidate[index] !== literal[matched]) continue;
+    matched += 1;
+    if (matched === literal.length) return index - literal.length + 1;
+  }
+  return -1;
+}
+
+const CASE_FOLD_EXCEPTIONS = new Map();
+
+function exceptionalCaseFold(character, candidate) {
+  const cached = CASE_FOLD_EXCEPTIONS.get(character);
+  if (cached !== undefined) return cached;
+  let folded = character.toLowerCase();
+  try {
+    const codePoint = character.codePointAt(0).toString(16);
+    if (new RegExp(`^\\u{${codePoint}}$`, "iu").test(candidate)) folded = candidate;
+  } catch { /* preserve the ordinary lowercase form for malformed scalar input */ }
+  CASE_FOLD_EXCEPTIONS.set(character, folded);
+  return folded;
+}
+
+function simpleCaseFold(value) {
+  const folded = [];
+  for (const character of String(value)) {
+    const lower = character.toLowerCase();
+    const upper = character.toUpperCase();
+    const candidate = [...upper].length === 1 ? upper.toLowerCase() : lower;
+    folded.push(candidate === lower ? lower : exceptionalCaseFold(character, candidate));
+  }
+  return folded;
+}
+
+function sameTokens(left, right) {
+  return left.length === right.length
+    && left.every((token, index) => token === right[index]);
+}
+
+function tokensAt(candidate, literal, start) {
+  return start >= 0
+    && start + literal.length <= candidate.length
+    && literal.every((token, index) => token === candidate[start + index]);
+}
+
 function globMatches(pattern, value) {
-  const expression = pattern
-    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-    .replaceAll("*", ".*");
-  return new RegExp(`^${expression}$`, "iu").test(value);
+  // Match the former /iu regexp's one-code-point case equivalences without
+  // compiling user-controlled wildcard patterns into a backtracking regexp.
+  const needle = String(pattern);
+  const candidate = simpleCaseFold(value);
+  if (!needle.includes("*")) return sameTokens(simpleCaseFold(needle), candidate);
+  const anchoredStart = !needle.startsWith("*");
+  const anchoredEnd = !needle.endsWith("*");
+  const literals = needle.split("*")
+    .filter((literal) => literal.length > 0)
+    .map(simpleCaseFold);
+  if (literals.length === 0) return true;
+
+  let start = 0;
+  let end = candidate.length;
+  if (anchoredStart) {
+    const prefix = literals.shift();
+    if (!tokensAt(candidate, prefix, 0)) return false;
+    start = prefix.length;
+  }
+  if (anchoredEnd) {
+    const suffix = literals.pop();
+    if (!tokensAt(candidate, suffix, candidate.length - suffix.length)
+      || candidate.length - suffix.length < start) return false;
+    end = candidate.length - suffix.length;
+  }
+  for (const literal of literals) {
+    const position = literalPosition(candidate, literal, start, end);
+    if (position < 0) return false;
+    start = position + literal.length;
+  }
+  return start <= end;
 }
 
 export function findModelProfile(models, model) {
@@ -210,6 +329,8 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     ...DEFAULT_CONFIG,
     dbPath: join(home, ".pi", "context-window", "archive.db"),
     rocksdbPath: join(home, ".pi", "context-window", "archive.rocks"),
+    semanticModelCachePath: join(home, ".pi", "context-window", "models"),
+    semanticIndexPath: join(home, ".pi", "context-window", "semantic-index"),
   };
   const merged = Object.assign({}, defaultConfig, ...layers);
   const values = (key) => layers.map((layer) => layer[key]).reverse();
@@ -343,6 +464,31 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     ),
     preventAutoCompaction: booleanValue(env.CONTEXT_WINDOW_PREVENT_AUTO_COMPACTION ?? merged.preventAutoCompaction, DEFAULT_CONFIG.preventAutoCompaction),
     statusLabelAccent: booleanValue(env.CONTEXT_WINDOW_STATUS_LABEL_ACCENT ?? merged.statusLabelAccent, DEFAULT_CONFIG.statusLabelAccent),
+    semanticRetrieval: booleanValue(
+      env.CONTEXT_WINDOW_SEMANTIC_RETRIEVAL ?? merged.semanticRetrieval,
+      DEFAULT_CONFIG.semanticRetrieval,
+    ),
+    semanticModel: String(env.CONTEXT_WINDOW_SEMANTIC_MODEL ?? merged.semanticModel),
+    semanticModelRevision: String(
+      env.CONTEXT_WINDOW_SEMANTIC_MODEL_REVISION ?? merged.semanticModelRevision,
+    ),
+    semanticModelCachePath: resolvedPath(
+      env.CONTEXT_WINDOW_SEMANTIC_MODEL_CACHE
+        ?? merged.semanticModelCachePath
+        ?? defaultConfig.semanticModelCachePath,
+      home,
+    ),
+    semanticIndexPath: resolvedPath(
+      env.CONTEXT_WINDOW_SEMANTIC_INDEX
+        ?? merged.semanticIndexPath
+        ?? defaultConfig.semanticIndexPath,
+      home,
+    ),
+    semanticCandidates: numeric(
+      "semanticCandidates",
+      parsePositiveInteger,
+      env.CONTEXT_WINDOW_SEMANTIC_CANDIDATES,
+    ),
     // Existing SQLite users stay on SQLite until they explicitly complete the
     // offline migration and opt into RocksDB. Fresh installations use RocksDB.
     archiveBackend,

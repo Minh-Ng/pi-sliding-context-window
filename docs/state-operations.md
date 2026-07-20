@@ -1,6 +1,6 @@
 **Deployment and default policy**
 
-Pi may load the extension directly from a checkout; no package publication is required. Fresh installations default to RocksDB, while an existing SQLite archive remains authoritative until the documented offline migration succeeds. Runtime authority, archive contents, and local overrides are machine state and are intentionally not recorded here; inspect them with `/window` and `/window archive status`.
+Pi may load the extension directly from a checkout; no package publication is required. After code changes, `/reload` loads the new extension. The client compares its production-code fingerprint and required capabilities with the daemon generation that owns the configured store; a stale daemon is gracefully replaced and clients reconnect through the normal store-lock arbitration. Do not manually search for or broadly kill daemon PIDs during routine updates. Fresh installations default to RocksDB, while an existing SQLite archive remains authoritative until the documented offline migration succeeds. Runtime authority, archive contents, and local overrides are machine state and are intentionally not recorded here; inspect them with `/window` and `/window archive status`.
 
 The shipped defaults are:
 

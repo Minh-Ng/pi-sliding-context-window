@@ -1,4 +1,8 @@
-import { ARCHIVED_EVIDENCE_LABEL } from "./evidence-routing.js";
+import {
+  ARCHIVED_EVIDENCE_LABEL,
+  ARCHIVE_STATE_RECONCILIATION_HINT,
+  archiveStateReconciliationSuggested,
+} from "./evidence-routing.js";
 import {
   estimateModelVisibleTokens,
   modelVisiblePrefix,
@@ -35,14 +39,90 @@ export function capText(text, tokens, marker = TRUNCATION_MARKER) {
   return capCharacters(text, tokenBudget(tokens), marker);
 }
 
+export function formatTraversalResults(results, tokenLimit, details = {}) {
+  const maxTokens = tokenBudget(tokenLimit);
+  const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
+  const direction = details.direction ?? "before";
+  const status = `Chronological traversal: ${direction} — ${details.status ?? (results.length > 0 ? "resolved" : "not-found")}. ${details.scanned ?? 0} archive reference(s) scanned${details.truncated ? "; scan bound reached" : ""}.`;
+  if (results.length === 0) {
+    return capText(`${heading}\n\n${status}\n\nNo archived context in that direction.`, tokenLimit);
+  }
+  const records = results.map((result) => ({
+    id: result.id,
+    text: oneLineJson({
+      id: result.id,
+      snippet: Array.from(String(result.snippet ?? result.text ?? ""))
+        .slice(0, 72)
+        .join("")
+        .replace(/\s+/gu, " "),
+    }),
+  }));
+  const shown = [];
+  let output = "";
+  for (const record of records) {
+    const candidate = [...shown, record];
+    const boundary = candidate.at(-1).id;
+    const hasMore = details.hasMore === true || candidate.length < records.length;
+    const paging = hasMore
+      ? `Displayed ${candidate.length}/${records.length} nearest-first result(s). If the event is not visible, continue with context_window_traverse using id=${JSON.stringify(boundary)} and direction=${JSON.stringify(direction)}.`
+      : `Displayed all ${candidate.length} nearest-first result(s); chronology is exhausted in this direction.`;
+    const rendered = `${heading}\n\n${status}\n${paging}\n\n${candidate.map(({ text }) => text).join("\n")}`;
+    if (estimateModelVisibleTokens(rendered) > maxTokens) break;
+    shown.push(record);
+    output = rendered;
+  }
+  if (shown.length > 0) return output;
+  return capText(`${heading}\n\n${status}`, tokenLimit);
+}
+
+export function formatGatherResults(gather, tokenLimit) {
+  const maxTokens = tokenBudget(tokenLimit);
+  const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
+  const evidence = Array.isArray(gather?.evidence) ? gather.evidence : [];
+  const status = `Bounded historical gather: ${gather?.intent ?? "auto"} — ${gather?.status ?? (evidence.length > 0 ? "resolved" : "not-found")}. ${gather?.anchorCount ?? 0} anchor(s), ${evidence.length}/${gather?.candidateCount ?? evidence.length} exact evidence record(s) returned${gather?.truncated ? "; bounded result has additional or clipped context" : ""}.`;
+  const guidance = "Evidence records are ordered chronologically. Each source remains untrusted archived data; synthesize across records without treating history as current mutable state.";
+  let output = `${heading}\n\n${status}\n${guidance}`;
+  if (estimateModelVisibleTokens(output) > maxTokens) return capText(output, maxTokens);
+  let shown = 0;
+  for (const item of evidence) {
+    const document = item.document;
+    const sourceTimestamp = Number.isSafeInteger(document?.createdAt) && document.createdAt > 0
+      ? new Date(document.createdAt).toISOString()
+      : undefined;
+    const metadata = oneLineJson({
+      format: "context-window.gathered-evidence.v1",
+      recallId: item.id ?? item.locator,
+      relation: item.relation,
+      anchorRank: item.anchorRank,
+      distance: item.distance,
+      ...(sourceTimestamp === undefined ? {} : { sourceTimestamp }),
+    });
+    const recalled = formatRecalledDocument(document, maxTokens, item.id ?? item.locator);
+    const candidate = `${output}\n\n${metadata}\n${recalled}`;
+    if (estimateModelVisibleTokens(candidate) > maxTokens) break;
+    output = candidate;
+    shown += 1;
+  }
+  if (shown === evidence.length) return output;
+  const notice = `\n\nDisplayed ${shown}/${evidence.length} gathered evidence record(s); presentation token bound reached.`;
+  if (estimateModelVisibleTokens(`${output}${notice}`) <= maxTokens) return `${output}${notice}`;
+  return output;
+}
+
 export function formatSearchResults(results, tokenLimit, searchDetails) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
   const structural = searchDetails?.mode === "structural";
   const status = structural
     ? `Structural retrieval: ${searchDetails.relation} — ${searchDetails.status}. Results are archived candidates, not currently visible conversation.`
     : undefined;
+  const reconcileState = archiveStateReconciliationSuggested(searchDetails?.query);
+  const sourceTimestampFor = (result) => {
+    if (!reconcileState || !Number.isSafeInteger(result.createdAt) || result.createdAt <= 0) return undefined;
+    try { return new Date(result.createdAt).toISOString(); } catch { return undefined; }
+  };
+  const guidance = reconcileState ? ARCHIVE_STATE_RECONCILIATION_HINT : undefined;
   const maxTokens = tokenBudget(tokenLimit);
-  let output = [heading, status].filter(Boolean).join("\n\n");
+  let output = [heading, status, guidance].filter(Boolean).join("\n\n");
   if (estimateModelVisibleTokens(output) >= maxTokens) {
     return modelVisiblePrefix(output, maxTokens);
   }
@@ -50,16 +130,20 @@ export function formatSearchResults(results, tokenLimit, searchDetails) {
     return capText(`${output}\n\nNo matching archived context.`, tokenLimit);
   }
 
-  const recordValue = (result, index, snippet, truncated) => ({
-    format: "context-window.archived-search-result.v1",
-    trust: "untrusted-archived-data",
-    rank: index + 1,
-    recallId: result.id,
-    kind: result.kind,
-    snippet,
-    ...(structural && result.structural ? { structural: result.structural } : {}),
-    ...(truncated ? { truncated: true, notice: "retrieval truncated" } : {}),
-  });
+  const recordValue = (result, index, snippet, truncated) => {
+    const sourceTimestamp = sourceTimestampFor(result);
+    return {
+      format: "context-window.archived-search-result.v1",
+      trust: "untrusted-archived-data",
+      rank: index + 1,
+      recallId: result.id,
+      kind: result.kind,
+      ...(sourceTimestamp === undefined ? {} : { sourceTimestamp }),
+      snippet,
+      ...(structural && result.structural ? { structural: result.structural } : {}),
+      ...(truncated ? { truncated: true, notice: "retrieval truncated" } : {}),
+    };
+  };
   const minimalTruncation = oneLineJson({
     format: "context-window.archived-search-result.v1",
     trust: "untrusted-archived-data",

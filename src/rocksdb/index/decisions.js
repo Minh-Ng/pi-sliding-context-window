@@ -5,6 +5,13 @@ import { semanticIdentifier } from "../../semantic-identifiers.js";
 export const DECISION_INDEX_VERSION = 1;
 export const DECISION_KEYSPACE = "decision";
 const MAX_DECISION_EXCERPT_BYTES = 64 * 1_024;
+const SEARCH_YIELD_RECORDS = 128;
+const SEARCH_YIELD_CHARACTERS = 1 * 1_024 * 1_024;
+const SEARCH_SCAN_PAGE = 64;
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 function identifier(value, label) {
   if (typeof value !== "string" || value.length === 0) {
@@ -116,23 +123,36 @@ function allowedScope(evidence, { project, sessionIds, scope, generation, store 
   return true;
 }
 
-function decisionRecords(store, { project, sessionIds, scope, scanLimit }) {
+function decisionPrefixes({ project, sessionIds, scope }) {
   if (scope === "session") {
-    return sessionIds.flatMap((lineageSessionId) => store.scan([
+    return sessionIds.map((lineageSessionId) => [
       DECISION_KEYSPACE,
       "session",
       project,
       lineageSessionId,
-    ], { limit: scanLimit }));
+    ]);
   }
   if (scope === "project") {
-    return store.scan([DECISION_KEYSPACE, "project", project], { limit: scanLimit });
+    return [[DECISION_KEYSPACE, "project", project]];
   }
-  return store.scan([DECISION_KEYSPACE, "all"], { limit: scanLimit });
+  return [[DECISION_KEYSPACE, "all"]];
 }
 
-/** Return newest verbatim decisions with explicit source linkage. */
-export function lookupDecisionEvidence(store, {
+function decisionRecords(store, options) {
+  return decisionPrefixes(options).flatMap((prefix) =>
+    store.scan(prefix, { limit: options.scanLimit }));
+}
+
+function containsDecisionTerm(excerpt, terms) {
+  if (terms.size === 0) return true;
+  const normalized = String(excerpt).toLocaleLowerCase();
+  for (const match of normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)) {
+    if (terms.has(match[0])) return true;
+  }
+  return false;
+}
+
+function decisionLookupContext(store, {
   query = "",
   project,
   sessionId,
@@ -160,34 +180,140 @@ export function lookupDecisionEvidence(store, {
     throw new TypeError("Scoped decision lookup requires project.");
   }
   const resolvedGeneration = resolvePublishedGeneration(store, generation);
-  const terms = [...new Set(String(query).toLocaleLowerCase().match(/[\p{L}\p{N}_-]{2,}/gu) ?? [])];
+  const terms = new Set(String(query).toLocaleLowerCase().match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
   const boundedScan = Math.min(100_000, Math.max(boundedLimit, Number(scanLimit) || 10_000));
-  const records = decisionRecords(store, { project, sessionIds: lineage, scope, scanLimit: boundedScan });
+  return {
+    project,
+    scope,
+    lineage,
+    resolvedGeneration,
+    terms,
+    boundedLimit,
+    boundedScan,
+  };
+}
+
+function decisionResult(payload, lineage) {
+  return Object.freeze({
+    ...payload,
+    relation: "latest-decision",
+    granularity: "decision-excerpt",
+    relationConfidence: 100,
+    lineageDepth: Math.max(0, lineage.indexOf(payload.sessionId)),
+    snippet: payload.excerpt,
+  });
+}
+
+function* decisionLookupWork(store, request) {
+  const context = decisionLookupContext(store, request);
+  const {
+    project,
+    scope,
+    lineage,
+    resolvedGeneration,
+    terms,
+    boundedLimit,
+    boundedScan,
+  } = context;
+  const records = decisionRecords(store, {
+    project,
+    sessionIds: lineage,
+    scope,
+    scanLimit: boundedScan,
+  });
   const results = [];
   const seen = new Set();
+  let recordsSinceYield = 0;
+  let charactersSinceYield = 0;
   for (const { payload } of records) {
-    if (!payload?.verbatim || !allowedScope(payload, {
+    recordsSinceYield += 1;
+    charactersSinceYield += typeof payload?.excerpt === "string" ? payload.excerpt.length : 0;
+    if (payload?.verbatim && allowedScope(payload, {
       project,
       sessionIds: lineage,
       scope,
       generation: resolvedGeneration,
       store,
-    })) continue;
-    const excerptTerms = new Set(String(payload.excerpt).toLocaleLowerCase()
-      .match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
-    if (terms.length > 0 && !terms.some((term) => excerptTerms.has(term))) continue;
-    const identity = `${payload.documentId}\0${payload.documentVersion}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    results.push(Object.freeze({
-      ...payload,
-      relation: "latest-decision",
-      granularity: "decision-excerpt",
-      relationConfidence: 100,
-      lineageDepth: Math.max(0, lineage.indexOf(payload.sessionId)),
-      snippet: payload.excerpt,
-    }));
-    if (results.length >= boundedLimit) break;
+    }) && containsDecisionTerm(payload.excerpt, terms)) {
+      const identity = `${payload.documentId}\0${payload.documentVersion}`;
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        results.push(decisionResult(payload, lineage));
+        if (results.length >= boundedLimit) break;
+      }
+    }
+    if (recordsSinceYield >= SEARCH_YIELD_RECORDS
+      || charactersSinceYield >= SEARCH_YIELD_CHARACTERS) {
+      recordsSinceYield = 0;
+      charactersSinceYield = 0;
+      yield;
+    }
+  }
+  return Object.freeze(results);
+}
+
+function runDecisionLookup(work) {
+  let step = work.next();
+  while (!step.done) step = work.next();
+  return step.value;
+}
+
+/** Return newest verbatim decisions with explicit source linkage. */
+export function lookupDecisionEvidence(store, request = {}) {
+  return runDecisionLookup(decisionLookupWork(store, request));
+}
+
+/** Cooperative variant for daemon request paths that must remain responsive. */
+export async function lookupDecisionEvidenceAsync(store, request = {}, {
+  yieldControl = yieldToEventLoop,
+} = {}) {
+  const context = decisionLookupContext(store, request);
+  const results = [];
+  const seen = new Set();
+  let recordsSinceYield = 0;
+  let charactersSinceYield = 0;
+  for (const prefix of decisionPrefixes({
+    project: context.project,
+    sessionIds: context.lineage,
+    scope: context.scope,
+  })) {
+    let remaining = context.boundedScan;
+    let after;
+    while (remaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, remaining);
+      const page = store.scan(prefix, {
+        limit: pageLimit,
+        ...(after === undefined ? {} : { after }),
+      });
+      for (const { payload } of page) {
+        recordsSinceYield += 1;
+        charactersSinceYield += typeof payload?.excerpt === "string" ? payload.excerpt.length : 0;
+        if (payload?.verbatim && allowedScope(payload, {
+          project: context.project,
+          sessionIds: context.lineage,
+          scope: context.scope,
+          generation: context.resolvedGeneration,
+          store,
+        }) && containsDecisionTerm(payload.excerpt, context.terms)) {
+          const identity = `${payload.documentId}\0${payload.documentVersion}`;
+          if (!seen.has(identity)) {
+            seen.add(identity);
+            results.push(decisionResult(payload, context.lineage));
+            if (results.length >= context.boundedLimit) return Object.freeze(results);
+          }
+        }
+        if (recordsSinceYield >= SEARCH_YIELD_RECORDS
+          || charactersSinceYield >= SEARCH_YIELD_CHARACTERS) {
+          recordsSinceYield = 0;
+          charactersSinceYield = 0;
+          await yieldControl();
+        }
+      }
+      remaining -= page.length;
+      if (page.length < pageLimit || page.at(-1)?.keyBytes === undefined) break;
+      after = page.at(-1).keyBytes;
+      await yieldControl();
+    }
   }
   return Object.freeze(results);
 }

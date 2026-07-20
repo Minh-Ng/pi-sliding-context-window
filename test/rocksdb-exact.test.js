@@ -102,6 +102,71 @@ test("extractor recognizes referent families with exact UTF-8 coordinates", () =
   });
 });
 
+test("camel-case extraction rejects dense underscore candidates without backtracking", () => {
+  // The old nested camel-case regexp explored exponentially many partitions
+  // before its trailing word boundary failed against the underscore.
+  const adversarial = `A${"aA".repeat(25)}_`;
+  const startedAt = performance.now();
+  const anchors = extractExactAnchors(`${adversarial} camelCase TypeError`);
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs < 250, `exact extraction took ${elapsedMs.toFixed(1)} ms`);
+  assert.deepEqual(
+    anchors.filter(({ type }) => type === "symbol" || type === "error")
+      .map(({ type, value }) => ({ type, value })),
+    [
+      { type: "symbol", value: "camelCase" },
+      { type: "error", value: "TypeError" },
+    ],
+  );
+  assert.deepEqual(classifyExactValue("camel-Case"), {
+    type: "value",
+    value: "camel-Case",
+  });
+});
+
+test("dense exact anchors compute UTF-8 offsets in linear time", () => {
+  const unit = "camelCase ";
+  const text = unit.repeat(Math.ceil((256 * 1_024) / unit.length)).slice(0, 256 * 1_024);
+  const startedAt = performance.now();
+  const anchors = extractExactAnchors(text);
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(anchors.length > 20_000);
+  assert.ok(elapsedMs < 250, `dense exact extraction took ${elapsedMs.toFixed(1)} ms`);
+});
+
+test("exact offset mapping agrees with UTF-8 prefixes across randomized scalars", () => {
+  const scalars = ["a", "é", "雪", "🙂"];
+  let seed = 0x5eed1234;
+  const random = () => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return seed >>> 0;
+  };
+  let text = "";
+  const expectedStarts = [];
+  for (let index = 0; index < 200; index += 1) {
+    const prefixLength = 1 + (random() % 8);
+    for (let offset = 0; offset < prefixLength; offset += 1) {
+      text += scalars[random() % scalars.length];
+    }
+    text += " ";
+    expectedStarts.push(Buffer.byteLength(text, "utf8"));
+    text += `camelCase${index} `;
+  }
+  const symbols = extractExactAnchors(text)
+    .filter(({ type, value }) => type === "symbol" && value.startsWith("camelCase"));
+  assert.equal(symbols.length, expectedStarts.length);
+  for (let index = 0; index < symbols.length; index += 1) {
+    assert.equal(symbols[index].startByte, expectedStarts[index]);
+    assert.equal(
+      Buffer.from(text).subarray(symbols[index].startByte, symbols[index].endByte).toString("utf8"),
+      `camelCase${index}`,
+    );
+  }
+  assert.throws(() => extractExactAnchors("bad\ud800 camelCase"), /unpaired UTF-16 surrogates/u);
+});
+
 test("query planning preserves exact-looking input before broadening", () => {
   for (const [query, type] of [
     ["REAP_DRAIN", "symbol"],

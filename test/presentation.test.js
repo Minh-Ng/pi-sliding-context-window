@@ -8,10 +8,12 @@ import {
   formatArchiveStorage,
   formatAutomaticRetrievalDiagnostics,
   formatByteSize,
+  formatGatherResults,
   formatRecalledDocument,
   formatSearchResults,
   formatStatusDetails,
   formatStatusLine,
+  formatTraversalResults,
   statusUrgency,
 } from "../src/presentation.js";
 import { renderRecalledEvidence } from "../src/retrieval/render.js";
@@ -42,6 +44,66 @@ test("archive search and recall outputs carry a concise staleness label", () => 
   assert.match(recall, /Exact earlier wording/);
   assert.match(recall, /legacy-unavailable/);
   assert.match(missingRecall, /No archived document with id missing-id\./);
+});
+
+test("time-sensitive archive searches receive bounded reconciliation guidance and source timestamps", () => {
+  const results = [
+    { id: "older", kind: "turn", createdAt: Date.parse("2026-01-02T03:04:00.000Z"), snippet: "The recorded count was four." },
+    { id: "newer", kind: "turn", createdAt: Date.parse("2026-02-03T04:05:00.000Z"), snippet: "The recorded count was five." },
+  ];
+  const update = formatSearchResults(results, 1_000, {
+    mode: "lexical",
+    query: "What is the current recorded count?",
+  });
+  assert.match(update, /Time-sensitive archive query: one match may be stale or partial/);
+  assert.match(update, /inspect every returned snippet and sourceTimestamp/i);
+  assert.match(update, /comparing event dates or old→new values/);
+  assert.match(update, /"sourceTimestamp":"2026-01-02T03:04:00.000Z"/);
+  assert.match(update, /"sourceTimestamp":"2026-02-03T04:05:00.000Z"/);
+  assert.ok(estimateModelVisibleTokens(update) <= 1_000);
+
+  const historical = formatSearchResults(results, 1_000, {
+    mode: "lexical",
+    query: "What was the recorded count on January 2?",
+  });
+  assert.doesNotMatch(historical, /Time-sensitive archive query/);
+  assert.doesNotMatch(historical, /sourceTimestamp/);
+});
+
+test("gather presentation preserves chronological exact records and strict aggregate caps", () => {
+  const framed = (id, createdAt, value) => ({
+    id,
+    documentId: id,
+    kind: "turn",
+    createdAt,
+    modelVisibleFramed: true,
+    text: `[${ARCHIVED_EVIDENCE_LABEL}]\n\n${JSON.stringify({
+      format: "context-window.archived-evidence.v1",
+      trust: "untrusted-archived-data",
+      source: value,
+    })}`,
+  });
+  const gather = {
+    status: "resolved",
+    mode: "hybrid",
+    intent: "state",
+    anchorCount: 2,
+    candidateCount: 2,
+    truncated: false,
+    evidence: [
+      { id: "r1", relation: "anchor", anchorRank: 1, distance: 0, document: framed("old", 100, "exactly 24") },
+      { id: "r2", relation: "anchor", anchorRank: 2, distance: 0, document: framed("new", 200, "close to 30") },
+    ],
+  };
+  const output = formatGatherResults(gather, 1_000);
+  assert.ok(output.indexOf("exactly 24") < output.indexOf("close to 30"));
+  assert.match(output, /"recallId":"r1"/u);
+  assert.match(output, /"recallId":"r2"/u);
+  assert.ok(estimateModelVisibleTokens(output) <= 1_000);
+
+  const bounded = formatGatherResults(gather, 80);
+  assert.ok(estimateModelVisibleTokens(bounded) <= 80);
+  assert.doesNotMatch(bounded, /\{[^}]*$/u, "must not cut a framed JSON record open");
 });
 
 test("daemon-framed recall is never truncated into invalid JSON", () => {
@@ -268,6 +330,24 @@ test("search output is strictly capped and keeps a deterministic follow-up id", 
   assert.match(first, /follow-up-id/);
   assert.match(first, /retrieval truncated/);
   assert.ok(formatSearchResults([], 1).length <= 4);
+});
+
+test("chronological traversal always exposes a safe visible continuation boundary", () => {
+  const results = Array.from({ length: 128 }, (_, index) => ({
+    id: `r${index + 1}`,
+    kind: "turn",
+    snippet: `historical event ${index + 1} ${"detail ".repeat(20)}`,
+  }));
+  const output = formatTraversalResults(results, 500, {
+    direction: "before",
+    status: "resolved",
+    scanned: 280,
+  });
+  assert.ok(estimateModelVisibleTokens(output) <= 500);
+  const match = /continue with context_window_traverse using id="(?<id>r\d+)" and direction="before"/u.exec(output);
+  assert.ok(match?.groups?.id);
+  assert.match(output, new RegExp(`"id":"${match.groups.id}"`, "u"));
+  assert.doesNotMatch(output, /retrieval truncated/u);
 });
 
 test("structural search output exposes relation status and message granularity", () => {

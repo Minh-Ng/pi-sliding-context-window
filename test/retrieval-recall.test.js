@@ -184,6 +184,58 @@ test("large tool recall remains token-bounded and returns authenticated continua
   assert.notDeepEqual(continuationClaims[0].matchRange, continuationClaims[1].matchRange);
 });
 
+test("expandToBudget widens a recalled excerpt beyond the fixed neighbor window without exceeding the token budget", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "recall-expand"));
+  t.after(() => store.close());
+  const words = Array.from({ length: 80 }, (_, index) => index === 40 ? "MID_TARGET" : `word${index}`);
+  const document = candidate("expand", words.join(" "));
+  await admit(store, document, { maxChunkBytes: 37, windowTokens: 12, overlapTokens: 2 });
+  const { locator } = await locatorFor(store, document, "MID_TARGET");
+
+  const baseline = await recallArchive(store, { locator, neighbors: 1, maxTokens: 120 }, auth(document));
+  const expanded = await recallArchive(
+    store,
+    { locator, neighbors: 1, maxTokens: 120 },
+    { ...auth(document), expandToBudget: true },
+  );
+  assert.equal(baseline.status, "resolved");
+  assert.equal(expanded.status, "resolved");
+  assert.match(expanded.text, /MID_TARGET/u);
+  // Widening only spends headroom the fixed neighbors:1 selection left
+  // unused; it never shrinks the excerpt relative to the unexpanded call.
+  assert.ok(expanded.text.length > baseline.text.length);
+  assert.ok(estimateModelVisibleTokens(expanded.renderedText) <= 120);
+  assert.ok(expanded.returnedTokens <= 120);
+
+  const again = await recallArchive(
+    store,
+    { locator, neighbors: 1, maxTokens: 120 },
+    { ...auth(document), expandToBudget: true },
+  );
+  assert.equal(again.text, expanded.text);
+});
+
+test("expandToBudget growth stops at the document boundary and stays within a generous budget", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "recall-expand-bounded"));
+  t.after(() => store.close());
+  const words = Array.from({ length: 80 }, (_, index) => index === 40 ? "MID_TARGET" : `word${index}`);
+  const document = candidate("expand-bounded", words.join(" "));
+  await admit(store, document, { maxChunkBytes: 37, windowTokens: 12, overlapTokens: 2 });
+  const { locator } = await locatorFor(store, document, "MID_TARGET");
+  const result = await recallArchive(
+    store,
+    { locator, neighbors: 1, maxTokens: 10_000 },
+    { ...auth(document), expandToBudget: true },
+  );
+  assert.equal(result.status, "resolved");
+  assert.ok(estimateModelVisibleTokens(result.renderedText) <= 10_000);
+  assert.ok(result.returnedTokens <= 10_000);
+  // A budget far larger than the document lets growth reach both edges.
+  assert.match(result.text, /word0\b/u);
+  assert.match(result.text, /word79\b/u);
+  assert.deepEqual(result.continuationLocators, []);
+});
+
 test("locator recall never reads chunks outside its selected window neighborhood", async (t) => {
   const store = await RocksStore.open(temporaryStorePath(t, "recall-range-only"));
   t.after(() => store.close());

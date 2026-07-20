@@ -151,6 +151,41 @@ export function formatGatherResults(gather, tokenLimit) {
   return output;
 }
 
+// Bytes-per-token used to convert a widened excerpt's *byte* budget back into
+// an approximate token count. This is an estimate, not a bound: an
+// opaque-identifier- or CJK-heavy excerpt can cost close to 1 model-visible
+// token per byte (see estimateModelVisibleTokens), so a widened snippet is not
+// individually guaranteed to stay within its share of the request's token
+// budget. The overall render cap in formatSearchResults still enforces the
+// deterministic total: it truncates the combined output to tokenLimit, so a
+// single over-wide snippet can only crowd out later results, never inflate
+// the total returned to the model past its budget.
+const SNIPPET_BYTES_PER_TOKEN_ESTIMATE = 4;
+
+/**
+ * Deterministic per-evidence excerpt budget for one search candidate: split
+ * the request's overall evidence token budget across the requested result
+ * count, then clamp into the caller's [min, max] excerpt-size range. This
+ * lets excerpt materialization widen a matched span symmetrically up to
+ * whatever headroom the request actually has, instead of always using a
+ * small fixed snippet size regardless of available budget.
+ */
+export function perEvidenceSnippetBudget(hintBudgetTokens, resultLimit, { min, max }) {
+  if (!Number.isSafeInteger(min) || min <= 0) {
+    throw new TypeError("perEvidenceSnippetBudget requires a positive safe integer min.");
+  }
+  if (!Number.isSafeInteger(max) || max < min) {
+    throw new TypeError("perEvidenceSnippetBudget requires max to be a safe integer at least min.");
+  }
+  const tokens = Number(hintBudgetTokens);
+  const limit = Number(resultLimit);
+  const perResultTokens = Number.isFinite(tokens) && tokens > 0 && Number.isFinite(limit) && limit > 0
+    ? Math.floor(tokens / limit)
+    : 0;
+  const wanted = perResultTokens * SNIPPET_BYTES_PER_TOKEN_ESTIMATE;
+  return Math.max(min, Math.min(max, wanted));
+}
+
 export function formatSearchResults(results, tokenLimit, searchDetails) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
   const structural = searchDetails?.mode === "structural";

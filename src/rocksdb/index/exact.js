@@ -17,6 +17,7 @@ export const DEFAULT_EXACT_WORK_LIMIT = 2_048;
 export const DEFAULT_EXACT_BUCKET_LIMIT = 32;
 export const DEFAULT_EXACT_ANCHOR_LIMIT = 50_000;
 export const DEFAULT_EXACT_SNIPPET_BYTES = 320;
+export const MAX_EXACT_SNIPPET_BYTES = 16_384;
 
 const MAX_SCAN_LIMIT = 100_000;
 const MAX_ANCHOR_BYTES = 512;
@@ -671,7 +672,7 @@ function normalizedLookupOptions(request) {
     maxSnippetBytes: positiveInteger(
       request.maxSnippetBytes ?? DEFAULT_EXACT_SNIPPET_BYTES,
       "maxSnippetBytes",
-      16_384,
+      MAX_EXACT_SNIPPET_BYTES,
     ),
     allowCaseFold: request.allowCaseFold !== false,
   });

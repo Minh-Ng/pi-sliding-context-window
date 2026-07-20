@@ -1042,6 +1042,7 @@ export class EpochWindowSession {
       limit: options.limit ?? this.config.searchResults,
       relation: options.relation,
       expansionTerms: options.expansionTerms,
+      ...(Number.isSafeInteger(options.hintBudgetTokens) ? { hintBudgetTokens: options.hintBudgetTokens } : {}),
     };
     if (this.archive.searchDetailed) {
       return this.archive.searchDetailed(query, searchOptions);

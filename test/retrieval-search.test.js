@@ -26,6 +26,9 @@ import {
   searchArchive,
 } from "../src/retrieval/search.js";
 import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
+import { perEvidenceSnippetBudget } from "../src/presentation.js";
+import { DEFAULT_EXACT_SNIPPET_BYTES, MAX_EXACT_SNIPPET_BYTES } from "../src/rocksdb/index/exact.js";
+import { DEFAULT_BM25_SEARCH_LIMITS, MAX_BM25_SNIPPET_CHARACTERS } from "../src/rocksdb/index/bm25.js";
 
 function temporaryStorePath(t, name) {
   const directory = mkdtempSync(join(tmpdir(), `context-window-${name}-`));
@@ -222,8 +225,8 @@ function request(id, text, overrides = {}) {
 
 async function admit(store, id, text, overrides = {}) {
   return admitDocument(store, request(id, text, overrides), {
-    chunking: { maxChunkBytes: 48, minLineSplitBytes: 0 },
-    windows: { windowTokens: 8, overlapTokens: 2 },
+    chunking: { maxChunkBytes: overrides.maxChunkBytes ?? 48, minLineSplitBytes: 0 },
+    windows: { windowTokens: overrides.windowTokens ?? 8, overlapTokens: 2 },
   });
 }
 
@@ -320,6 +323,114 @@ test("exact-first search returns a signed leased locator that recalls exact sour
   });
   assert.equal(recalled.status, "resolved");
   assert.match(recalled.text, /REAP_DRAIN/u);
+});
+
+test("render-time excerpt widening expands an exact match symmetrically within its evidence budget", async (t) => {
+  const { store, worker } = await fixture(t, "search-widen-exact");
+  const before = "leading context sentence about routing. ".repeat(6);
+  const after = " trailing context sentence about routing.".repeat(6);
+  const text = `${before}WIDEN_TARGET${after}`;
+  await admit(store, "widen-exact", text);
+  await worker.drain();
+
+  const narrow = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("WIDEN_TARGET", { limit: 1, hintBudgetTokens: 160 })),
+    { now: 1_000 },
+  );
+  assert.equal(narrow.results.length, 1);
+  assert.ok(Buffer.byteLength(narrow.results[0].snippet, "utf8") <= DEFAULT_EXACT_SNIPPET_BYTES);
+
+  const wideRequest = withoutUndefined(searchRequest("WIDEN_TARGET", { limit: 1, hintBudgetTokens: 2_000 }));
+  const expectedBudget = perEvidenceSnippetBudget(2_000, 1, {
+    min: DEFAULT_EXACT_SNIPPET_BYTES,
+    max: MAX_EXACT_SNIPPET_BYTES,
+  });
+  const widened = await searchArchive(store, wideRequest, { now: 1_000, expandSnippetsToBudget: true });
+  assert.equal(widened.results.length, 1);
+  const widenedSnippet = widened.results[0].snippet;
+  assert.ok(Buffer.byteLength(widenedSnippet, "utf8") <= expectedBudget, "widened snippet stays within its computed budget");
+  assert.ok(
+    widenedSnippet.length > narrow.results[0].snippet.length,
+    "widening consumes available budget headroom instead of returning the small fixed default",
+  );
+  assert.match(widenedSnippet, /WIDEN_TARGET/u);
+  assert.match(widenedSnippet, /leading context sentence/u);
+  assert.match(widenedSnippet, /trailing context sentence/u);
+
+  // A caller that never opts in sees byte-identical behavior to before this
+  // change (this is the property the automatic preflight path depends on).
+  const optedOut = await searchArchive(store, wideRequest, { now: 1_000 });
+  assert.equal(optedOut.results[0].snippet, narrow.results[0].snippet);
+
+  // Deterministic for a fixed (document, query, budget): repeating the same
+  // widened request produces byte-identical output.
+  const repeat = await searchArchive(store, wideRequest, { now: 1_000, expandSnippetsToBudget: true });
+  assert.equal(repeat.results[0].snippet, widenedSnippet);
+});
+
+test("render-time excerpt widening expands a lexical match symmetrically within its evidence budget", async (t) => {
+  const { store, worker } = await fixture(t, "search-widen-lexical");
+  const before = "orbital telemetry review discussion notes. ".repeat(6);
+  const after = " orbital telemetry review discussion continues.".repeat(6);
+  const text = `${before}unique lexical anchor phrase here${after}`;
+  // A widened logical window (unrelated to storage-side chunking) is required
+  // so the match's containing window itself is not the bottleneck: BM25
+  // snippets never read past their own logical window, by design.
+  await admit(store, "widen-lexical", text, { windowTokens: 400 });
+  await admit(store, "widen-lexical-decoy", "unrelated document with different subject matter entirely.", {
+    createdAt: 50,
+  });
+  await worker.drain();
+
+  const narrow = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("unique lexical anchor phrase", { limit: 1, hintBudgetTokens: 160 })),
+    { now: 1_000 },
+  );
+  assert.equal(narrow.mode, "lexical");
+  assert.equal(narrow.results.length, 1);
+  assert.ok(
+    Array.from(narrow.results[0].snippet).length <= DEFAULT_BM25_SEARCH_LIMITS.maxSnippetCharacters,
+  );
+
+  const wideRequest = withoutUndefined(
+    searchRequest("unique lexical anchor phrase", { limit: 1, hintBudgetTokens: 2_000 }),
+  );
+  const expectedBudget = perEvidenceSnippetBudget(2_000, 1, {
+    min: DEFAULT_BM25_SEARCH_LIMITS.maxSnippetCharacters,
+    max: MAX_BM25_SNIPPET_CHARACTERS,
+  });
+  const widened = await searchArchive(store, wideRequest, { now: 1_000, expandSnippetsToBudget: true });
+  assert.equal(widened.results.length, 1);
+  const widenedSnippet = widened.results[0].snippet;
+  assert.ok(
+    Array.from(widenedSnippet).length <= expectedBudget,
+    "widened lexical snippet stays within its computed budget",
+  );
+  assert.ok(
+    widenedSnippet.length > narrow.results[0].snippet.length,
+    "widening consumes available lexical budget headroom",
+  );
+  assert.match(widenedSnippet, /lexical anchor phrase/u);
+  assert.match(widenedSnippet, /orbital telemetry review/u);
+
+  const optedOut = await searchArchive(store, wideRequest, { now: 1_000 });
+  assert.equal(optedOut.results[0].snippet, narrow.results[0].snippet);
+});
+
+test("explicit maxSnippetBytes/maxSnippetCharacters overrides win over automatic widening", async (t) => {
+  const { store, worker } = await fixture(t, "search-widen-override");
+  const text = `${"context sentence around the target. ".repeat(6)}OVERRIDE_TARGET${" more surrounding context.".repeat(6)}`;
+  await admit(store, "widen-override", text);
+  await worker.drain();
+
+  const response = await searchArchive(
+    store,
+    withoutUndefined(searchRequest("OVERRIDE_TARGET", { limit: 1, hintBudgetTokens: 2_000 })),
+    { now: 1_000, expandSnippetsToBudget: true, exact: { maxSnippetBytes: DEFAULT_EXACT_SNIPPET_BYTES } },
+  );
+  assert.ok(Buffer.byteLength(response.results[0].snippet, "utf8") <= DEFAULT_EXACT_SNIPPET_BYTES);
 });
 
 test("explicit correction is excluded at commit across exact, lexical, structural, and automatic retrieval", async (t) => {

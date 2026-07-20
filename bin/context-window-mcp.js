@@ -275,6 +275,11 @@ function callTool(name, args = {}) {
         scope: args.scope ?? "project",
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
+        // The render step below already commits to config.searchResultTokens
+        // as the total output budget; hand that same headroom to render-time
+        // excerpt widening instead of leaving it unused behind a small fixed
+        // snippet size. formatSearchResults' own cap still bounds the total.
+        hintBudgetTokens: config.searchResultTokens,
       });
       return textResult(formatSearchResults(search.results, config.searchResultTokens, {
         ...search,

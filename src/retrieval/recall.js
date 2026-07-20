@@ -21,6 +21,10 @@ import { estimateModelVisibleTokens } from "../model-token-budget.js";
 import { MAX_SESSION_LINEAGE_IDS } from "../store-contract.js";
 
 const MAX_FULL_TURN_RECALL_BYTES = 64 * 1_024;
+// Safety valve on symmetric span widening: bounds how many additional
+// windows a single excerpt can absorb, so a document built from many
+// unusually small windows cannot turn one recall into an unbounded scan.
+const MAX_SPAN_GROWTH_WINDOWS = 256;
 
 function unresolved(status, reason, claims) {
   const result = { status, reason };
@@ -74,6 +78,53 @@ function fitsRecallBudget(text, maxTokens) {
     && Buffer.byteLength(text, "utf8") <= byteBudget(maxTokens);
 }
 
+/**
+ * Render-time-only span widening: opt-in per caller (never for the fixed
+ * `neighbors` shape an explicit recall request asked for), grows a window
+ * range symmetrically around the match, one stored window at a time, while
+ * headroom remains in the per-evidence token budget. Growth stays inside the
+ * document boundary and never re-shrinks; once a side no longer fits it is
+ * marked exhausted so the loop cannot re-attempt a doomed direction.
+ */
+async function growWindowRange(view, manifest, claims, target, firstWindow, lastWindow, maxTokens) {
+  let first = firstWindow;
+  let last = lastWindow;
+  const budget = byteBudget(maxTokens);
+  let leftExhausted = first.ordinal === 0;
+  let rightExhausted = false;
+  for (let step = 0; step < MAX_SPAN_GROWTH_WINDOWS && (!leftExhausted || !rightExhausted); step += 1) {
+    const leftDistance = target.ordinal - first.ordinal;
+    const rightDistance = last.ordinal - target.ordinal;
+    const growLeft = !leftExhausted && (rightExhausted || leftDistance <= rightDistance);
+    if (growLeft) {
+      const candidate = await readWindow(view, claims.documentId, claims.documentVersion, first.ordinal - 1);
+      if (candidate === undefined || last.endByte - candidate.startByte > budget) {
+        leftExhausted = true;
+        continue;
+      }
+      const materialized = await readDocumentRange(view, manifest, candidate.startByte, last.endByte);
+      if (!fitsRecallBudget(materialized.text, maxTokens)) {
+        leftExhausted = true;
+        continue;
+      }
+      first = candidate;
+    } else {
+      const candidate = await readWindow(view, claims.documentId, claims.documentVersion, last.ordinal + 1);
+      if (candidate === undefined || candidate.endByte - first.startByte > budget) {
+        rightExhausted = true;
+        continue;
+      }
+      const materialized = await readDocumentRange(view, manifest, first.startByte, candidate.endByte);
+      if (!fitsRecallBudget(materialized.text, maxTokens)) {
+        rightExhausted = true;
+        continue;
+      }
+      last = candidate;
+    }
+  }
+  return { first, last };
+}
+
 async function selectedWindowRange(
   view,
   manifest,
@@ -82,6 +133,7 @@ async function selectedWindowRange(
   neighbors,
   maxTokens,
   kind,
+  expandToBudget,
 ) {
   if (kind === "turn"
     && manifest.byteLength <= MAX_FULL_TURN_RECALL_BYTES
@@ -141,11 +193,21 @@ async function selectedWindowRange(
       windows[last].endByte,
     );
   }
+  let firstWindow = windows[first];
+  let lastWindow = windows[last];
+  if (expandToBudget) {
+    const grown = await growWindowRange(view, manifest, claims, target, firstWindow, lastWindow, maxTokens);
+    if (grown.first !== firstWindow || grown.last !== lastWindow) {
+      firstWindow = grown.first;
+      lastWindow = grown.last;
+      materialized = await readDocumentRange(view, manifest, firstWindow.startByte, lastWindow.endByte);
+    }
+  }
   return {
-    startByte: windows[first].startByte,
-    endByte: windows[last].endByte,
-    firstWindow: windows[first],
-    lastWindow: windows[last],
+    startByte: firstWindow.startByte,
+    endByte: lastWindow.endByte,
+    firstWindow,
+    lastWindow,
     wholeDocument: false,
     materialized,
   };
@@ -338,6 +400,7 @@ async function recallSnapshot(view, request, options, secret, claims) {
     request.neighbors,
     request.maxTokens,
     manifest.kind,
+    options.expandToBudget === true,
   );
   if (selected === undefined) {
     return unresolved("locator-invalid", "The locator window neighborhood is incomplete.", claims);

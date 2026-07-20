@@ -216,7 +216,16 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       neighbors: 1,
       maxTokens: perEvidenceTokens,
       sessionIds: recallSessionIds,
-    }, { ...options, project: request.project, sessionIds: recallSessionIds });
+    }, {
+      ...options,
+      project: request.project,
+      sessionIds: recallSessionIds,
+      // Each evidence excerpt already has its own slice of the gather's
+      // token budget (perEvidenceTokens); widen it symmetrically to spend
+      // that budget on real surrounding turns instead of leaving headroom
+      // unused past the fixed neighbors:1 window.
+      expandToBudget: true,
+    });
     if (document.status !== "resolved") {
       recallIncomplete = true;
       continue;

@@ -2,9 +2,16 @@ import {
   assertStoreRequest,
   assertStoreResult,
 } from "../store-contract.js";
-import { lookupExact, planExactQuery } from "../rocksdb/index/exact.js";
+import {
+  DEFAULT_EXACT_SNIPPET_BYTES,
+  lookupExact,
+  MAX_EXACT_SNIPPET_BYTES,
+  planExactQuery,
+} from "../rocksdb/index/exact.js";
 import {
   bm25InverseDocumentFrequency,
+  DEFAULT_BM25_SEARCH_LIMITS,
+  MAX_BM25_SNIPPET_CHARACTERS,
   readBm25Statistics,
   readDocumentTermVocabulary,
   searchBm25,
@@ -20,6 +27,7 @@ import { KEYSPACE } from "../rocksdb/keys.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { semanticIdentifier } from "../semantic-identifiers.js";
 import { manifestKeys } from "../rocksdb/manifests.js";
+import { perEvidenceSnippetBudget } from "../presentation.js";
 import {
   getOrCreateLocatorSecret,
   signLocator,
@@ -555,6 +563,24 @@ function preserveCandidateMargins(candidates) {
   }));
 }
 
+// Render-time-only excerpt widening: opt-in per caller (never for automatic
+// preflight, whose frozen hint bytes must stay unaffected by this). When
+// enabled, split the request's evidence budget across its requested result
+// count and let the underlying exact/BM25 snippet materializer widen its
+// match-centered excerpt symmetrically up to that budget instead of always
+// using the small fixed default. An explicit maxSnippetBytes/maxSnippetCharacters
+// override always wins, preserving caller control.
+function widenedSnippetOptions(mode, explicit, request, options) {
+  if (!options.expandSnippetsToBudget) return explicit;
+  const key = mode === "exact" ? "maxSnippetBytes" : "maxSnippetCharacters";
+  if (explicit[key] !== undefined) return explicit;
+  const bounds = mode === "exact"
+    ? { min: DEFAULT_EXACT_SNIPPET_BYTES, max: MAX_EXACT_SNIPPET_BYTES }
+    : { min: DEFAULT_BM25_SEARCH_LIMITS.maxSnippetCharacters, max: MAX_BM25_SNIPPET_CHARACTERS };
+  const budget = perEvidenceSnippetBudget(request.hintBudgetTokens, request.limit, bounds);
+  return { ...explicit, [key]: budget };
+}
+
 function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, semanticAttempted }) {
   const count = Number(Boolean(exactAttempted)) + Number(Boolean(lexicalAttempted))
     + Number(Boolean(structuralAttempted)) + Number(Boolean(semanticAttempted));
@@ -589,7 +615,7 @@ async function collectCandidates(view, request, options) {
       excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
       limit: candidateLimit,
       generation,
-      ...(options.exact ?? {}),
+      ...widenedSnippetOptions("exact", options.exact ?? {}, request, options),
     });
     candidates.push(...exactCandidates(exact));
   }
@@ -608,7 +634,7 @@ async function collectCandidates(view, request, options) {
       excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
       limit: candidateLimit,
       ...(generation > 0 ? { generation } : {}),
-    }, options.bm25);
+    }, widenedSnippetOptions("bm25", options.bm25 ?? {}, request, options));
     candidates.push(...lexicalCandidates(lexical));
     expiredMatches = lexical.work.expiredMatches;
   }

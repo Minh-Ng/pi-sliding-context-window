@@ -34,6 +34,7 @@ export const DEFAULT_BM25_SEARCH_LIMITS = Object.freeze({
   maxSnippetCharacters: 280,
   maxLineageSessions: 64,
 });
+export const MAX_BM25_SNIPPET_CHARACTERS = 2_000;
 
 // A tokenizer or posting-format bump gets a fresh derived namespace. Canonical
 // sources remain unchanged and can be replayed to rebuild the new namespace.
@@ -1593,7 +1594,7 @@ function normalizeSearchOptions(options = {}) {
       options.maxSnippetCharacters,
       DEFAULT_BM25_SEARCH_LIMITS.maxSnippetCharacters,
       "maxSnippetCharacters",
-      2_000,
+      MAX_BM25_SNIPPET_CHARACTERS,
     ),
     maxLineageSessions: bounded(
       options.maxLineageSessions,

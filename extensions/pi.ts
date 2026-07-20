@@ -938,6 +938,10 @@ export function createContextEpochWindow({
           scope: params.scope ?? "session",
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
+          // Hand render-time excerpt widening the same budget this call
+          // already commits to below via formatSearchResults; its own cap
+          // still bounds the total.
+          hintBudgetTokens: active.config.searchResultTokens,
         });
         const results = exposeRecallHandles(search.results);
         return {

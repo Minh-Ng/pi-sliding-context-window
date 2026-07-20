@@ -582,6 +582,9 @@ export class DaemonOperations {
     const now = Date.now();
     await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
     await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
+    // Explicit search may widen each candidate's excerpt to use its own
+    // requested evidence budget; automatic preflight calls searchArchive
+    // directly and never sets this, so frozen-hint bytes are unaffected.
     const readProjects = readProjectsFor(context);
     // Dedup is a per-request opt-in on the explicit store.search surface
     // (payload.dedupe), never a daemon-forced default: two genuinely distinct
@@ -604,6 +607,7 @@ export class DaemonOperations {
         applyImportancePrior: true,
         now,
         recencyDecay: true,
+        expandSnippetsToBudget: true,
       });
     }
     return this.#searchAcrossProjects(payload, readProjects, context, now);
@@ -634,6 +638,7 @@ export class DaemonOperations {
         now,
         recencyDecay: true,
         dedupe: payload.dedupe === true,
+        expandSnippetsToBudget: true,
       });
       modes.add(result.mode);
       indexGeneration = Math.max(indexGeneration, result.indexGeneration);

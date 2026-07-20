@@ -16,6 +16,7 @@ import {
   formatStatusLine,
   formatTraversalResults,
   formatWindowUsage,
+  perEvidenceSnippetBudget,
   relevanceBand,
   statusUrgency,
   toolResultBudgetState,
@@ -450,6 +451,40 @@ test("chronological traversal always exposes a safe visible continuation boundar
   assert.ok(match?.groups?.id);
   assert.match(output, new RegExp(`"id":"${match.groups.id}"`, "u"));
   assert.doesNotMatch(output, /retrieval truncated/u);
+});
+
+test("per-evidence snippet budget splits the request budget and clamps deterministically", () => {
+  const bounds = { min: 320, max: 16_384 };
+  // Below the floor (no budget, or budget too thin to widen past today's
+  // default) always returns the floor, never less.
+  assert.equal(perEvidenceSnippetBudget(0, 1, bounds), bounds.min);
+  assert.equal(perEvidenceSnippetBudget(undefined, 1, bounds), bounds.min);
+  assert.equal(perEvidenceSnippetBudget(10, 1, bounds), bounds.min);
+
+  // Splits proportionally across the requested result count, at 4 UTF-8
+  // bytes per token, matching this codebase's other conservative estimates.
+  assert.equal(perEvidenceSnippetBudget(400, 2, bounds), 800);
+  assert.equal(perEvidenceSnippetBudget(400, 10, bounds), bounds.min);
+
+  // Never exceeds the caller's ceiling even for an enormous budget.
+  assert.equal(perEvidenceSnippetBudget(1_000_000, 1, bounds), bounds.max);
+
+  // Deterministic for fixed inputs.
+  assert.equal(
+    perEvidenceSnippetBudget(2_000, 3, bounds),
+    perEvidenceSnippetBudget(2_000, 3, bounds),
+  );
+
+  assert.throws(() => perEvidenceSnippetBudget(100, 1, { min: 0, max: 10 }), TypeError);
+  assert.throws(() => perEvidenceSnippetBudget(100, 1, { min: 10, max: 5 }), TypeError);
+});
+
+test("a widened search snippet still keeps the complete formatted output within its token limit", () => {
+  const widenedSnippet = "widened evidence text ".repeat(200);
+  const results = [{ id: "wide-id", kind: "turn", snippet: widenedSnippet }];
+  const output = formatSearchResults(results, 150);
+  assert.ok(estimateModelVisibleTokens(output) <= 150);
+  assert.match(output, /wide-id/);
 });
 
 test("structural search output exposes relation status and message granularity", () => {

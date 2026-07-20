@@ -21,7 +21,7 @@ import {
   serializeMessage,
   shouldRotateWindow,
   sliceFromBoundary,
-} from "../src/window.js";
+} from "../src/session/window.js";
 
 function user(text, timestamp) {
   return { role: "user", content: [{ type: "text", text }], timestamp };

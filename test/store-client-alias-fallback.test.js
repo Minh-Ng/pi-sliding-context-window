@@ -4,9 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import { ensureSecureSocketDirectory, defaultSocketPath } from "../src/daemon/paths.js";
-import { STORE_PROTOCOL_VERSION, STORE_SCHEMA_VERSION } from "../src/store-protocol.js";
+import { STORE_PROTOCOL_VERSION, STORE_SCHEMA_VERSION } from "../src/store/store-protocol.js";
 
 // Simulates a still-running daemon that predates alias-widened reads: its
 // handshake schema has no aliasProjects field, so it rejects any handshake

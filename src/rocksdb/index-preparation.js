@@ -1,7 +1,7 @@
 import {
   MAX_STRUCTURAL_MESSAGE_BYTES_PER_DOCUMENT,
   MAX_STRUCTURAL_MESSAGES_PER_DOCUMENT,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 
 export const MAX_INDEX_WINDOWS_PER_DOCUMENT = 4_096;
 export const MAX_HANDLER_PREPARED_MUTATIONS = 2_500;

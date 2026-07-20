@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { defaultDaemonLaunchLogPath } from "../src/daemon/log-file.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {

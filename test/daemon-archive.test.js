@@ -4,29 +4,29 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Archive } from "../src/archive.js";
-import { claimSqliteBackendAuthority } from "../src/backend-authority.js";
+import { Archive } from "../src/archive/archive.js";
+import { claimSqliteBackendAuthority } from "../src/archive/backend-authority.js";
 import { loadConfig } from "../src/config.js";
 import {
   ArchiveMigrationGuardError,
   ArchiveRecallError,
   DaemonArchive,
-} from "../src/daemon-archive.js";
+} from "../src/archive/daemon-archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import { startMigration, verifyMigration } from "../src/migration/index.js";
 import { formatRecalledDocument } from "../src/presentation.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
 import { RocksStore } from "../src/rocksdb/store.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import {
   MAX_VISIBLE_SOURCE_KEYS,
   MAX_VISIBLE_SOURCE_KEY_BYTES,
   MAX_ACTIVE_HINT_MESSAGE_KEYS,
   MAX_PROTECTED_DOCUMENT_VERSIONS,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 
-const FACADE_MODULE_URL = new URL("../src/daemon-archive.js", import.meta.url).href;
-const AUTHORITY_MODULE_URL = new URL("../src/backend-authority.js", import.meta.url).href;
+const FACADE_MODULE_URL = new URL("../src/archive/daemon-archive.js", import.meta.url).href;
+const AUTHORITY_MODULE_URL = new URL("../src/archive/backend-authority.js", import.meta.url).href;
 
 function fixture(prefix) {
   const directory = mkdtempSync(join(tmpdir(), prefix));

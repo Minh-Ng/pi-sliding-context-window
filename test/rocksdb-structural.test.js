@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { MAX_SESSION_LINEAGE_IDS } from "../src/store-contract.js";
+import { MAX_SESSION_LINEAGE_IDS } from "../src/store/store-contract.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
 import {
   createStructuralIndexHandler,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 
 const [storePath, socketPath, project] = process.argv.slice(2);
 if (!storePath || !socketPath || !project) throw new Error("storePath, socketPath, and project are required.");

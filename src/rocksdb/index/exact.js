@@ -2,8 +2,8 @@ import { encodeKey, KEYSPACE } from "../keys.js";
 import { readDocumentRange } from "../document-range.js";
 import { manifestKeys, retiredDocumentStatus } from "../manifests.js";
 import { windowForByteRange } from "../windows.js";
-import { semanticIdentifier } from "../../semantic-identifiers.js";
-import { assertVisibleSourceKeys } from "../../store-contract.js";
+import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
+import { assertVisibleSourceKeys } from "../../store/store-contract.js";
 import { DEFAULT_RETENTION_CLASS_BY_KIND } from "../../daemon/retention-policy.js";
 import {
   MAX_EXACT_INDEX_ANCHORS,

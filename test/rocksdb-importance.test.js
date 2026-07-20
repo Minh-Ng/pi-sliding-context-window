@@ -25,7 +25,7 @@ import {
   recordRecalledLocator,
   recordShownResults,
 } from "../src/retrieval/relevance-feedback.js";
-import { assertStoreResult } from "../src/store-contract.js";
+import { assertStoreResult } from "../src/store/store-contract.js";
 
 function temporaryStorePath(t, name) {
   const directory = mkdtempSync(join(tmpdir(), `context-window-${name}-`));

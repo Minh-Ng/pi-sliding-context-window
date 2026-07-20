@@ -1,5 +1,5 @@
 import { KEYSPACE } from "../keys.js";
-import { MAX_SESSION_LINEAGE_IDS } from "../../store-contract.js";
+import { MAX_SESSION_LINEAGE_IDS } from "../../store/store-contract.js";
 import {
   createDecisionEvidence,
   decisionMutation,

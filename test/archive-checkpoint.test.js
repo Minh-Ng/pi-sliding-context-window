@@ -13,15 +13,15 @@ import {
   createArchiveCheckpoint,
   inspectCheckpointManifest,
   reconstructCheckpointSource,
-} from "../src/archive-checkpoint.js";
-import { DaemonArchive } from "../src/daemon-archive.js";
+} from "../src/archive/archive-checkpoint.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {
   estimateModelVisibleTokens,
   modelVisiblePrefix,
-} from "../src/model-token-budget.js";
+} from "../src/session/model-token-budget.js";
 import { contentHash } from "../src/rocksdb/chunks.js";
-import { MAX_DOCUMENT_TEXT_BYTES } from "../src/store-contract.js";
+import { MAX_DOCUMENT_TEXT_BYTES } from "../src/store/store-contract.js";
 
 class MemoryArchive {
   constructor(state = {}, { failAt, returnFalsyAt } = {}) {

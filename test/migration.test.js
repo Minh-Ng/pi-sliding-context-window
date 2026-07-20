@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Archive } from "../src/archive.js";
+import { Archive } from "../src/archive/archive.js";
 import {
   MIGRATION_COMPARISON_DETAIL_BYTES,
   MIGRATION_COMPARISON_DETAIL_LIMIT,
@@ -1346,7 +1346,7 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
   const storePath = join(directory, "archive.rocks");
   const migrationUrl = new URL("../src/migration/index.js", import.meta.url).href;
   const storeUrl = new URL("../src/rocksdb/store.js", import.meta.url).href;
-  const contractUrl = new URL("../src/store-contract.js", import.meta.url).href;
+  const contractUrl = new URL("../src/store/store-contract.js", import.meta.url).href;
   const setupSource = `
     import { DatabaseSync } from "node:sqlite";
     import { MAX_DOCUMENT_TEXT_BYTES } from ${JSON.stringify(contractUrl)};

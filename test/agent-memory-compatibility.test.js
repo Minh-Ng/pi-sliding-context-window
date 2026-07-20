@@ -11,7 +11,7 @@ import {
   queryLongMemEvalV2,
   runLongMemEvalRetrieval,
 } from "../eval/agent-memory/compatibility.js";
-import { Archive } from "../src/archive.js";
+import { Archive } from "../src/archive/archive.js";
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), "context-window-agent-memory-fit-"));

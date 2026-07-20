@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Archive } from "../../src/archive.js";
+import { Archive } from "../../src/archive/archive.js";
 import { RETRIEVAL_BACKEND_API_VERSION } from "./schema.js";
 
 export function createSqliteEvaluationBackend() {

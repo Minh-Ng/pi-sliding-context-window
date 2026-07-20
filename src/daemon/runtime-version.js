@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { STORE_OPERATIONS } from "../store-contract.js";
+import { STORE_OPERATIONS } from "../store/store-contract.js";
 
 const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const DAEMON_SOURCE_ROOT = resolve(PACKAGE_ROOT, "src");

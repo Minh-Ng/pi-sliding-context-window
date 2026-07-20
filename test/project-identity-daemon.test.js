@@ -3,9 +3,9 @@ import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
-import { canonicalProjectId } from "../src/project-identity.js";
+import { canonicalProjectId } from "../src/identity/project-identity.js";
 
 // Resolve the tmp base so a real repo directory created under it carries no
 // symlink of its own; only the alias we add below should differ from realpath.

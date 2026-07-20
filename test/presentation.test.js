@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ARCHIVED_EVIDENCE_LABEL } from "../src/evidence-routing.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
 import { tokenizeWithByteOffsets } from "../src/rocksdb/windows.js";
 import {
   capText,

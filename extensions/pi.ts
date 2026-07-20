@@ -15,7 +15,7 @@ import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
   EpochWindowSession,
   ROTATION_STATE_ENTRY,
-} from "../src/epoch-window.js";
+} from "../src/session/epoch-window.js";
 import {
   formatArchiveStorage,
   formatAutomaticRetrievalDiagnostics,
@@ -30,10 +30,10 @@ import {
   formatTraversalResults,
   formatWindowUsage,
 } from "../src/presentation.js";
-import { archiveDocumentProvenance } from "../src/provenance.js";
-import { canonicalProjectId, projectIdentityAlias } from "../src/project-identity.js";
-import { ancestorSessionIds, stableSessionId } from "../src/session-id.js";
-import { STRUCTURAL_RELATIONS } from "../src/structural.js";
+import { archiveDocumentProvenance } from "../src/identity/provenance.js";
+import { canonicalProjectId, projectIdentityAlias } from "../src/identity/project-identity.js";
+import { ancestorSessionIds, stableSessionId } from "../src/session/session-id.js";
+import { STRUCTURAL_RELATIONS } from "../src/structural-annotations.js";
 import { Type } from "typebox";
 
 const CONTEXT_PREPARATION_FAILURE_NOTICE =
@@ -370,9 +370,9 @@ export function createContextEpochWindow({
         { DaemonArchive: RocksArchive },
         { claimSqliteBackendAuthority: claimSqliteAuthority },
       ] = await Promise.all([
-        import("../src/archive.js"),
-        import("../src/daemon-archive.js"),
-        import("../src/backend-authority.js"),
+        import("../src/archive/archive.js"),
+        import("../src/archive/daemon-archive.js"),
+        import("../src/archive/backend-authority.js"),
       ]);
     }
     let session: EpochWindowSession | undefined;

@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { SynchronousStoreBridge } from "../src/daemon-client/sync-bridge.js";
 import {
   DEFAULT_MAX_BUFFERED_FRAME_BYTES,
@@ -27,7 +27,7 @@ import {
   StoreDaemon,
   startStoreDaemon,
 } from "../src/daemon/server.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import { DEFAULT_MAX_FRAME_BYTES, LineFramer } from "../src/daemon/framing.js";
 import {
   MAX_DOCUMENT_METADATA_BYTES,
@@ -37,7 +37,7 @@ import {
   MAX_STRUCTURAL_MESSAGE_BYTES_PER_DOCUMENT,
   MAX_STRUCTURAL_MESSAGE_KEY_BYTES_PER_DOCUMENT,
   MAX_STRUCTURAL_MESSAGES_PER_DOCUMENT,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 import {
   assertDaemonPlatform,
   defaultSocketPath,

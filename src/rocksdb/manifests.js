@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import {
   assertStoreRequest,
   assertStoreResult,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import { KEYSPACE, keyFor } from "./keys.js";
 import {
   contentHash,

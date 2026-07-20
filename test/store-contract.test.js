@@ -35,7 +35,7 @@ import {
   assertStoreRequest,
   assertStoreResult,
   assertStoreSchemaMetadata,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 import { DEFAULT_MAX_FRAME_BYTES } from "../src/daemon/framing.js";
 import {
   PROTOCOL_FRAME_TYPES,
@@ -48,7 +48,7 @@ import {
   createSuccessResponse,
   decodeProtocolLine,
   encodeProtocolFrame,
-} from "../src/store-protocol.js";
+} from "../src/store/store-protocol.js";
 
 const document = Object.freeze({
   documentId: "doc/\u0000/雪",

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { contentHash } from "./rocksdb/chunks.js";
-import { stableJson } from "./rocksdb/schema.js";
+import { contentHash } from "../rocksdb/chunks.js";
+import { stableJson } from "../rocksdb/schema.js";
 
 function requiredContentHash(document) {
   if (typeof document?.text === "string") return contentHash(document.text);

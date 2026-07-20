@@ -1,7 +1,7 @@
 import { createDaemonOperations } from "../src/daemon/operations.js";
 import { startStoreDaemon } from "../src/daemon/server.js";
 import { RocksStore } from "../src/rocksdb/store.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 
 if (typeof global.gc !== "function") {
   throw new Error("daemon egress memory verifier requires --expose-gc");

@@ -1,3 +1,7 @@
+// Layering: this is the raw RPC client over the daemon socket. The
+// synchronous worker-thread wrapper is src/daemon-client/sync-bridge.js,
+// and the archive-facing facade built on top of that is
+// src/archive/daemon-archive.js.
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import {
@@ -9,7 +13,7 @@ import {
   encodeProtocolFrame,
 } from "./store-protocol.js";
 import { ContractError } from "./store-contract.js";
-import { DEFAULT_MAX_FRAME_BYTES, LineFramer } from "./daemon/framing.js";
+import { DEFAULT_MAX_FRAME_BYTES, LineFramer } from "../daemon/framing.js";
 
 const RETRY_SAFE_OPERATIONS = new Set([
   "daemon.ping",

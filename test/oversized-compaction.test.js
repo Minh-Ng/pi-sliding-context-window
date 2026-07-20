@@ -10,21 +10,21 @@ import {
   ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS,
   ARCHIVE_CHECKPOINT_PART_PAYLOAD_MAX_BYTES,
   reconstructCheckpointSource,
-} from "../src/archive-checkpoint.js";
-import { DaemonArchive } from "../src/daemon-archive.js";
+} from "../src/archive/archive-checkpoint.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {
   EpochWindowSession,
   OversizedInputArchiveError,
-} from "../src/epoch-window.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
+} from "../src/session/epoch-window.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
 import { contentHash } from "../src/rocksdb/chunks.js";
 import {
   contentToText,
   messageKey,
   serializeMessage,
   serializeMessages,
-} from "../src/window.js";
+} from "../src/session/window.js";
 
 const ROOT_REFERENCE = /root=(checkpoint-root:[a-f0-9]{64})/u;
 

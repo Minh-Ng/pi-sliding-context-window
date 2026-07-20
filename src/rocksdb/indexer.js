@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { boundedStoreErrorMessage } from "../store-contract.js";
+import { boundedStoreErrorMessage } from "../store/store-contract.js";
 import { addDerivedReferences } from "./derived.js";
 import {
   applyGenerationTablets,

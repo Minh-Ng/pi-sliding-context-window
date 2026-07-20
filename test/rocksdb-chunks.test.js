@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ContractError } from "../src/store-contract.js";
+import { ContractError } from "../src/store/store-contract.js";
 import {
   ChunkIntegrityError,
   contentHash,

@@ -6,7 +6,7 @@ import {
   createCompactionCatalog,
   inspectCheckpointManifest,
   reconstructCheckpointSource,
-} from "./archive-checkpoint.js";
+} from "../archive/archive-checkpoint.js";
 import { estimateModelVisibleTokens } from "./model-token-budget.js";
 import {
   buildTocMarkerText,
@@ -28,11 +28,11 @@ import {
   TOC_TOKEN_BUDGET,
   turnTopic,
 } from "./window.js";
-import { structuralMessageScores } from "./structural.js";
+import { structuralMessageScores } from "../structural-annotations.js";
 import {
   MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT,
   MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT,
-} from "./store-contract.js";
+} from "../store/store-contract.js";
 
 // Bounds persisted rotation-state growth; the marker text is separately
 // bounded by the token budget in buildTocMarkerText.

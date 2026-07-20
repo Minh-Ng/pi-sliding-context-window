@@ -1,7 +1,7 @@
 import {
   assertStoreRequest,
   assertStoreResult,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import {
   readNearDuplicateSignature,
   selectNearDuplicateRepresentatives,

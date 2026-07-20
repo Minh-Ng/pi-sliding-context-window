@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { MAX_STORE_ERROR_MESSAGE_LENGTH } from "../src/store-contract.js";
+import { MAX_STORE_ERROR_MESSAGE_LENGTH } from "../src/store/store-contract.js";
 import { createBm25IndexHandler, searchBm25 } from "../src/rocksdb/index/bm25.js";
 import { createExactIndexHandler, lookupExact } from "../src/rocksdb/index/exact.js";
 import { createStructuralIndexHandler } from "../src/rocksdb/index/structural.js";

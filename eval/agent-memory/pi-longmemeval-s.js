@@ -14,7 +14,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { StoreClient } from "../../src/store-client.js";
+import { StoreClient } from "../../src/store/store-client.js";
 
 const DEFAULT_CASE_IDS = Object.freeze(["06f04340", "0977f2af"]);
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });

@@ -5,8 +5,8 @@ import {
   MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT,
   MAX_STRUCTURAL_MESSAGE_BYTES_PER_DOCUMENT,
   MAX_STRUCTURAL_MESSAGE_KEY_BYTES_PER_DOCUMENT,
-} from "../src/store-contract.js";
-import { assertRequestFrame } from "../src/store-protocol.js";
+} from "../src/store/store-contract.js";
+import { assertRequestFrame } from "../src/store/store-protocol.js";
 
 if (typeof global.gc !== "function") {
   throw new Error("framing memory verifier requires --expose-gc");

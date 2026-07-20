@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { startMemoryArenaServer } from "../eval/agent-memory/memoryarena-http-server.js";
-import { Archive } from "../src/archive.js";
+import { Archive } from "../src/archive/archive.js";
 
 async function post(baseUrl, path, body) {
   const response = await fetch(`${baseUrl}${path}`, {

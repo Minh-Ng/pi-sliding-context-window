@@ -15,12 +15,12 @@ import {
   SUPERSEDE_TOOL_DESCRIPTION,
   TRAVERSE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
-import { Archive } from "../src/archive.js";
+import { Archive } from "../src/archive/archive.js";
 import { loadConfig } from "../src/config.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
-import { EpochWindowSession, ROTATION_STATE_ENTRY } from "../src/epoch-window.js";
-import { StoreClient } from "../src/store-client.js";
-import { messageKey } from "../src/window.js";
+import { EpochWindowSession, ROTATION_STATE_ENTRY } from "../src/session/epoch-window.js";
+import { StoreClient } from "../src/store/store-client.js";
+import { messageKey } from "../src/session/window.js";
 
 function processExists(processId) {
   try {

@@ -1,5 +1,5 @@
 import { RETRIEVAL_SUITES, hintRuntimePolicy } from "./schema.js";
-import { estimateModelVisibleTokens } from "../../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../../src/session/model-token-budget.js";
 import { renderContinuityMarker } from "../../src/retrieval/continuity-policy.js";
 import { oneLineJson } from "../../src/retrieval/render.js";
 

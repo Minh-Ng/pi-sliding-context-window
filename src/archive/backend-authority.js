@@ -1,5 +1,5 @@
-import { defaultSocketPath, resolveStorePath } from "./daemon/paths.js";
-import { SynchronousStoreBridge } from "./daemon-client/sync-bridge.js";
+import { defaultSocketPath, resolveStorePath } from "../daemon/paths.js";
+import { SynchronousStoreBridge } from "../daemon-client/sync-bridge.js";
 
 function requiredString(value, label) {
   if (typeof value !== "string" || value.length === 0) {

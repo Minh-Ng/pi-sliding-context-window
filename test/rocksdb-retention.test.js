@@ -54,7 +54,7 @@ import {
   recordRecalledLocator,
   recordShownResults,
 } from "../src/retrieval/relevance-feedback.js";
-import { MAX_PROTECTED_DOCUMENT_VERSIONS } from "../src/store-contract.js";
+import { MAX_PROTECTED_DOCUMENT_VERSIONS } from "../src/store/store-contract.js";
 
 const protectMemoryFixture = new URL("../test-support/protect-memory-child.js", import.meta.url);
 const MAX_PROTECT_RSS_BYTES = 256 * 1_024 * 1_024;

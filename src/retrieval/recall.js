@@ -1,7 +1,7 @@
 import {
   assertStoreRequest,
   assertStoreResult,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import {
   manifestKeys,
@@ -17,8 +17,8 @@ import {
 } from "./locator.js";
 import { validateRetrievalLease } from "./leases.js";
 import { historicalStalenessLabel, renderRecalledEvidence } from "./render.js";
-import { estimateModelVisibleTokens } from "../model-token-budget.js";
-import { MAX_SESSION_LINEAGE_IDS } from "../store-contract.js";
+import { estimateModelVisibleTokens } from "../session/model-token-budget.js";
+import { MAX_SESSION_LINEAGE_IDS } from "../store/store-contract.js";
 
 const MAX_FULL_TURN_RECALL_BYTES = 64 * 1_024;
 // Safety valve on symmetric span widening: bounds how many additional

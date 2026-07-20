@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const piExecutable = join(repositoryRoot, "node_modules", ".bin", "pi");

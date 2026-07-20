@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { Archive } from "../src/archive.js";
-import { claimSqliteBackendAuthority } from "../src/backend-authority.js";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { Archive } from "../src/archive/archive.js";
+import { claimSqliteBackendAuthority } from "../src/archive/backend-authority.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { loadConfig } from "../src/config.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import { LineFramer } from "../src/daemon/framing.js";
-import { canonicalProjectId, projectIdentityAlias } from "../src/project-identity.js";
+import { canonicalProjectId, projectIdentityAlias } from "../src/identity/project-identity.js";
 import {
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
@@ -22,11 +22,11 @@ import {
   formatSearchResults,
   formatSupersedeResult,
 } from "../src/presentation.js";
-import { STRUCTURAL_RELATIONS } from "../src/structural.js";
+import { STRUCTURAL_RELATIONS } from "../src/structural-annotations.js";
 import {
   MAX_DOCUMENT_TEXT_BYTES,
   MAX_STORE_IDENTIFIER_LENGTH,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 
 // Canonicalize so a repository reached through a symlink or alternate spelling
 // shares one archive namespace. The literal spelling is carried as a read-only

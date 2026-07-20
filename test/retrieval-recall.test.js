@@ -15,7 +15,7 @@ import {
 import { createRetrievalLease } from "../src/retrieval/leases.js";
 import { recallArchive } from "../src/retrieval/recall.js";
 import { renderRecalledEvidence } from "../src/retrieval/render.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
 
 function temporaryStorePath(t, name) {
   const directory = mkdtempSync(join(tmpdir(), `context-window-${name}-`));

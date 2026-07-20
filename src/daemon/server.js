@@ -3,8 +3,8 @@ import { chmodSync, existsSync, rmSync } from "node:fs";
 import { createServer, createConnection } from "node:net";
 import { join } from "node:path";
 import { fileLockRelease, tryFileLock } from "@harperfast/rocksdb-js";
-import { ContractError } from "../store-contract.js";
-import { canonicalProjectId } from "../project-identity.js";
+import { ContractError } from "../store/store-contract.js";
+import { canonicalProjectId } from "../identity/project-identity.js";
 import {
   STORE_OPERATIONS,
   STORE_PROTOCOL_VERSION,
@@ -16,7 +16,7 @@ import {
   createHandshakeAccepted,
   createHandshakeRejected,
   encodeProtocolFrame,
-} from "../store-protocol.js";
+} from "../store/store-protocol.js";
 import { DEFAULT_MAX_FRAME_BYTES, LineFramer } from "./framing.js";
 import {
   defaultSocketPath,

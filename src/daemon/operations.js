@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { statfsSync } from "node:fs";
 import { basename } from "node:path";
-import { canonicalDocumentIdentityHash } from "../document-identity.js";
+import { canonicalDocumentIdentityHash } from "../identity/document-identity.js";
 import {
   admitDocument,
   manifestKeys,
@@ -55,7 +55,7 @@ import {
   STORE_ERROR_CODES,
   assertStoreResult,
   boundedStoreErrorMessage,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import { DaemonMaintenance } from "./maintenance.js";
 
 const STATUS_SCAN_PAGE = 10_000;

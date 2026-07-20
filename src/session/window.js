@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { resolveModelConfig } from "./config.js";
+import { resolveModelConfig } from "../config.js";
 
 // Matches Pi's provider-neutral image proxy. Actual image tokenization varies
 // by provider and dimensions; provider-reported usage remains authoritative.

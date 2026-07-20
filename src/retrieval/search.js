@@ -1,7 +1,7 @@
 import {
   assertStoreRequest,
   assertStoreResult,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import {
   DEFAULT_EXACT_SNIPPET_BYTES,
   lookupExact,
@@ -25,7 +25,7 @@ import {
 } from "../rocksdb/index/simhash.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
-import { semanticIdentifier } from "../semantic-identifiers.js";
+import { semanticIdentifier } from "../identity/semantic-identifiers.js";
 import { manifestKeys } from "../rocksdb/manifests.js";
 import { perEvidenceSnippetBudget } from "../presentation.js";
 import {

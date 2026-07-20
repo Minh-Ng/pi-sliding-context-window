@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks";
 import { parentPort, workerData } from "node:worker_threads";
-import { Archive } from "../../src/archive.js";
+import { Archive } from "../../src/archive/archive.js";
 import { archiveWarmupOperationCount, benchmarkDocumentAt } from "./fixture.js";
 
 const {

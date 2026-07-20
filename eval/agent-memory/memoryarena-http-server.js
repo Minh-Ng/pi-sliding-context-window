@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Archive } from "../../src/archive.js";
+import { Archive } from "../../src/archive/archive.js";
 import { ArchiveAgentMemoryAdapter } from "./compatibility.js";
 
 const MAX_REQUEST_BYTES = 1 * 1_024 * 1_024;

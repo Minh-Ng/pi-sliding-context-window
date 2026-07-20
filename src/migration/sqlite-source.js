@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
-import { archiveDocumentProvenance } from "../provenance.js";
+import { archiveDocumentProvenance } from "../identity/provenance.js";
 import { stableJson } from "../rocksdb/schema.js";
 
 export const SQLITE_SOURCE_FORMAT_VERSION = 1;

@@ -8,13 +8,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { Archive } from "../../src/archive.js";
+import { Archive } from "../../src/archive/archive.js";
 import { compactDeletionWave } from "../../src/rocksdb/compaction.js";
 import { KEYSPACE } from "../../src/rocksdb/keys.js";
 import { admitDocument } from "../../src/rocksdb/manifests.js";
 import { SCHEMA_FINGERPRINT, STORE_SCHEMA_VERSION } from "../../src/rocksdb/schema.js";
 import { RocksStore } from "../../src/rocksdb/store.js";
-import { STORE_PROTOCOL_VERSION } from "../../src/store-contract.js";
+import { STORE_PROTOCOL_VERSION } from "../../src/store/store-contract.js";
 import { collectEvaluationEnvironment } from "../../eval/retrieval/environment.js";
 import {
   createArchiveBenchmarkArtifact,

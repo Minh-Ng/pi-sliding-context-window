@@ -30,7 +30,7 @@ import {
   MAX_SESSION_LINEAGE_IDS,
   assertActiveHintMessageKeys,
   assertVisibleSourceKeys,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 
 export { DEFAULT_HINT_SOURCE_COOLDOWN_MS };
 export const DEFAULT_HINT_LEASE_MS = 60 * 60 * 1_000;

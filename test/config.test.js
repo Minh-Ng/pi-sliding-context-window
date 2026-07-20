@@ -17,7 +17,7 @@ import {
   saveGlobalConfig,
 } from "../src/config.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
-import { resolveContextLimits, shouldRotateWindow } from "../src/window.js";
+import { resolveContextLimits, shouldRotateWindow } from "../src/session/window.js";
 
 test("trusted project config can disable the footer label accent", () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-config-"));

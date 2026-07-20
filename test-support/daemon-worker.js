@@ -1,6 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { startStoreDaemon } from "../src/daemon/server.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 
 let daemon;
 let heldClient;

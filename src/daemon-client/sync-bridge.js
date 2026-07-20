@@ -1,3 +1,6 @@
+// Layering: wraps src/store/store-client.js (the raw RPC client) in a
+// worker thread so callers can make synchronous request/response calls;
+// src/archive/daemon-archive.js is the archive-facing facade built on top.
 import { randomUUID } from "node:crypto";
 import {
   MessageChannel,

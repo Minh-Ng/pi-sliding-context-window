@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import {
   estimateModelVisibleTokens,
   modelVisiblePrefix,
-} from "./model-token-budget.js";
+} from "../session/model-token-budget.js";
 import {
   MAX_DIRECT_DOCUMENT_SOURCE_BYTES,
   MAX_DOCUMENT_METADATA_BYTES,
@@ -10,9 +10,9 @@ import {
   MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT,
   MAX_SOURCE_MESSAGE_KEY_BYTES_PER_DOCUMENT,
   MAX_STORE_IDENTIFIER_LENGTH,
-} from "./store-contract.js";
-import { contentHash } from "./rocksdb/chunks.js";
-import { extractSalientTerms } from "./window.js";
+} from "../store/store-contract.js";
+import { contentHash } from "../rocksdb/chunks.js";
+import { extractSalientTerms } from "../session/window.js";
 
 export const ARCHIVE_CHECKPOINT_FORMAT_VERSION = 1;
 export const ARCHIVE_CHECKPOINT_CATALOG_MAX_TOKENS = 1_000;

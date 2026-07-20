@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { archiveDocumentProvenance } from "./provenance.js";
-import { relationScoreField } from "./structural.js";
+import { archiveDocumentProvenance } from "../identity/provenance.js";
+import { relationScoreField } from "../structural-annotations.js";
 
 // Pi is distributed as a Bun executable, while the MCP server and tests run
 // under Node. Prefer Node's built-in API, then use Bun's compatible SQLite API

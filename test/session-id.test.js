@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { ancestorSessionIds } from "../src/session-id.js";
+import { ancestorSessionIds } from "../src/session/session-id.js";
 
 function header(path, value) {
   writeFileSync(path, `${JSON.stringify({

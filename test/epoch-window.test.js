@@ -7,15 +7,15 @@ import {
   OversizedInputArchiveError,
   ROTATION_STATE_ENTRY,
   TOC_MAX_ENTRIES,
-} from "../src/epoch-window.js";
+} from "../src/session/epoch-window.js";
 import {
   createCompactionCatalog,
   reconstructCheckpointSource,
-} from "../src/archive-checkpoint.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
-import { archiveDocumentProvenance } from "../src/provenance.js";
-import { MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT } from "../src/store-contract.js";
-import { estimateTokens, messageKey, serializeMessage, serializeMessages } from "../src/window.js";
+} from "../src/archive/archive-checkpoint.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
+import { archiveDocumentProvenance } from "../src/identity/provenance.js";
+import { MAX_SOURCE_MESSAGE_KEYS_PER_DOCUMENT } from "../src/store/store-contract.js";
+import { estimateTokens, messageKey, serializeMessage, serializeMessages } from "../src/session/window.js";
 
 const config = {
   rotationTokens: 100_000,

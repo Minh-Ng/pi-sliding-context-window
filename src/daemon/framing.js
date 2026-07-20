@@ -1,4 +1,4 @@
-import { ContractError } from "../store-contract.js";
+import { ContractError } from "../store/store-contract.js";
 
 // Bound encoded transport independently from logical field limits. Ordinary
 // maximum store.put content occupies 12 MiB plus bounded envelope overhead;

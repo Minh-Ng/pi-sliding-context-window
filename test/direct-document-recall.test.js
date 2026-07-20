@@ -3,11 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Archive } from "../src/archive.js";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { Archive } from "../src/archive/archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { DaemonOperations } from "../src/daemon/operations.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
-import { canonicalDocumentIdentityHash } from "../src/document-identity.js";
+import { canonicalDocumentIdentityHash } from "../src/identity/document-identity.js";
 import {
   createChunkReferences,
   splitPhysicalChunks,
@@ -17,12 +17,12 @@ import { createDocumentManifest } from "../src/rocksdb/manifests.js";
 import { readDocumentRange } from "../src/rocksdb/document-range.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 import { startMigration } from "../src/migration/index.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import {
   MAX_DIRECT_DOCUMENT_SOURCE_BYTES,
   assertStoreRequest,
   assertStoreResult,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 
 function canonicalDocument(text, overrides = {}) {
   return {

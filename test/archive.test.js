@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Archive, matchExpression } from "../src/archive.js";
+import { Archive, matchExpression } from "../src/archive/archive.js";
 
 test("archives and BM25-searches documents by scope", () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-"));

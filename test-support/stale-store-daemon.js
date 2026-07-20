@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { startStoreDaemon } from "../src/daemon/server.js";
-import { STORE_OPERATIONS } from "../src/store-contract.js";
+import { STORE_OPERATIONS } from "../src/store/store-contract.js";
 
 const [
   storePath,

@@ -2,7 +2,7 @@ import {
   assertStoreRequest,
   assertStoreResult,
   RETENTION_CLASSES,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import {
   cleanupExpiredLeases,
   hasActiveDocumentLease,

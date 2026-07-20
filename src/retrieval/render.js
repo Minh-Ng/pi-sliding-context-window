@@ -1,4 +1,4 @@
-import { estimateModelVisibleTokens } from "../model-token-budget.js";
+import { estimateModelVisibleTokens } from "../session/model-token-budget.js";
 
 const DEFAULT_STALENESS_LABEL = "Archived historical evidence; verify current files and runtime state before relying on it.";
 

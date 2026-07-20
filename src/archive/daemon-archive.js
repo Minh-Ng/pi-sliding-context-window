@@ -1,17 +1,21 @@
+// Layering: StoreClient (src/store/store-client.js) is the raw RPC client;
+// SynchronousStoreBridge (src/daemon-client/sync-bridge.js) wraps it for
+// synchronous worker-thread use; this module is the archive-facing facade
+// built on top of that bridge.
 import { createHash, randomUUID } from "node:crypto";
-import { archiveDocumentProvenance } from "./provenance.js";
-import { canonicalDocumentIdentityHash } from "./document-identity.js";
-import { defaultSocketPath, resolveStorePath } from "./daemon/paths.js";
+import { archiveDocumentProvenance } from "../identity/provenance.js";
+import { canonicalDocumentIdentityHash } from "../identity/document-identity.js";
+import { defaultSocketPath, resolveStorePath } from "../daemon/paths.js";
 import {
   normalizeArchiveRetentionPolicy,
   retentionForAdmission,
-} from "./daemon/retention-policy.js";
+} from "../daemon/retention-policy.js";
 import {
   DAEMON_REQUIRED_CAPABILITIES,
   DAEMON_RUNTIME_VERSION,
-} from "./daemon/runtime-version.js";
-import { SynchronousStoreBridge } from "./daemon-client/sync-bridge.js";
-import { stableJson } from "./rocksdb/schema.js";
+} from "../daemon/runtime-version.js";
+import { SynchronousStoreBridge } from "../daemon-client/sync-bridge.js";
+import { stableJson } from "../rocksdb/schema.js";
 import {
   MAX_SESSION_LINEAGE_IDS,
   MAX_PROTECTED_DOCUMENT_VERSIONS,
@@ -22,7 +26,7 @@ import {
   assertActiveHintMessageKeys,
   assertContract,
   assertVisibleSourceKeys,
-} from "./store-contract.js";
+} from "../store/store-contract.js";
 
 const PROTECTION_LEASE_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_RETENTION_BATCH_SIZE = 1_000;

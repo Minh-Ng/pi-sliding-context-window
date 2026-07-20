@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   relationScoreField,
   structuralMessageScores,
-} from "../src/structural.js";
+} from "../src/structural-annotations.js";
 
 test("scores explicit questions, requests, corrections, and answers deterministically", () => {
   assert.deepEqual(structuralMessageScores({ role: "user", text: "Were liveserving workloads scaled up?" }), {

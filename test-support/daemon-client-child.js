@@ -1,4 +1,4 @@
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 
 const [socketPath, project, nonce] = process.argv.slice(2);
 const client = new StoreClient({

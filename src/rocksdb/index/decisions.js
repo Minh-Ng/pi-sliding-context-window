@@ -1,6 +1,6 @@
 import { KEYSPACE } from "../keys.js";
-import { MAX_SESSION_LINEAGE_IDS } from "../../store-contract.js";
-import { semanticIdentifier } from "../../semantic-identifiers.js";
+import { MAX_SESSION_LINEAGE_IDS } from "../../store/store-contract.js";
+import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
 
 export const DECISION_INDEX_VERSION = 1;
 export const DECISION_KEYSPACE = "decision";

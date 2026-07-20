@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { hashJson } from "../eval/retrieval/schema.js";
 import { SCHEMA_FINGERPRINT, STORE_SCHEMA_VERSION } from "../src/rocksdb/schema.js";
-import { STORE_PROTOCOL_VERSION } from "../src/store-contract.js";
+import { STORE_PROTOCOL_VERSION } from "../src/store/store-contract.js";
 import {
   tokenizeBm25,
   tokenizeBm25Query,

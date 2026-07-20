@@ -6,7 +6,7 @@ import {
   startMigration,
   verifyMigration,
 } from "../src/migration/index.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 
 const USAGE = `Usage:

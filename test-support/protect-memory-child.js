@@ -3,7 +3,7 @@ import {
   admitDocument,
 } from "../src/rocksdb/manifests.js";
 import { retentionKeys } from "../src/rocksdb/retention.js";
-import { MAX_PROTECTED_DOCUMENT_VERSIONS } from "../src/store-contract.js";
+import { MAX_PROTECTED_DOCUMENT_VERSIONS } from "../src/store/store-contract.js";
 import { DaemonOperations } from "../src/daemon/operations.js";
 
 const [mode, storePath] = process.argv.slice(2);

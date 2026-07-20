@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
-import { Archive } from "../src/archive.js";
+import { Archive } from "../src/archive/archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {
   ARCHIVED_EVIDENCE_LABEL,
@@ -15,11 +15,11 @@ import {
   SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import {
   MAX_DOCUMENT_TEXT_BYTES,
   MAX_STORE_IDENTIFIER_LENGTH,
-} from "../src/store-contract.js";
+} from "../src/store/store-contract.js";
 
 function startServer(databasePath, extraEnvironment = {}) {
   const directory = dirname(databasePath);

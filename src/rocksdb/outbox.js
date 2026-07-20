@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { boundedStoreErrorMessage } from "../store-contract.js";
+import { boundedStoreErrorMessage } from "../store/store-contract.js";
 import { decodeKey, encodeKey, encodedKey, KEYSPACE } from "./keys.js";
 import { decodeRecord, encodeRecord, stableJson } from "./schema.js";
 

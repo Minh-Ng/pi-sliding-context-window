@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { keyFor, KEYSPACE } from "../rocksdb/keys.js";
-import { assertStoreResult } from "../store-contract.js";
+import { assertStoreResult } from "../store/store-contract.js";
 
 /**
  * Local implicit relevance feedback: the machine's own click log. Each served

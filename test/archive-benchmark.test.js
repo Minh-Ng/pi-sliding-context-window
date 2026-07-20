@@ -23,7 +23,7 @@ import {
 } from "../bench/archive/cli.js";
 import { collectEvaluationEnvironment } from "../eval/retrieval/environment.js";
 import { SCHEMA_FINGERPRINT, STORE_SCHEMA_VERSION } from "../src/rocksdb/schema.js";
-import { STORE_PROTOCOL_VERSION } from "../src/store-contract.js";
+import { STORE_PROTOCOL_VERSION } from "../src/store/store-contract.js";
 
 function syntheticBaselineScenarios(fixture) {
   const scenarios = {};

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   assertContract,
   LEASE_SCHEMA,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import {
   bumpGuard,

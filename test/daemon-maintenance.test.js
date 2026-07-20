@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DaemonArchive } from "../src/daemon-archive.js";
+import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { DaemonMaintenance } from "../src/daemon/maintenance.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import {

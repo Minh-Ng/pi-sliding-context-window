@@ -6,11 +6,11 @@ import {
 import {
   estimateModelVisibleTokens,
   modelVisiblePrefix,
-} from "./model-token-budget.js";
-import { archiveDocumentProvenance } from "./provenance.js";
+} from "./session/model-token-budget.js";
+import { archiveDocumentProvenance } from "./identity/provenance.js";
 import { oneLineJson } from "./retrieval/render.js";
 import { DEFAULT_RETENTION_LIFETIMES_MS } from "./daemon/retention-policy.js";
-import { estimateMessageTokens } from "./window.js";
+import { estimateMessageTokens } from "./session/window.js";
 
 const TRUNCATION_MARKER = "[… retrieval truncated …]";
 const DAY_MS = 24 * 60 * 60 * 1_000;

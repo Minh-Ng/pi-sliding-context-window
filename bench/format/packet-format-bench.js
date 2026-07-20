@@ -17,7 +17,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { estimateModelVisibleTokens } from "../../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../../src/session/model-token-budget.js";
 import {
   historicalStalenessLabel,
   oneLineJson,

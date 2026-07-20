@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { MAX_STORE_ERROR_MESSAGE_LENGTH } from "../src/store-contract.js";
+import { MAX_STORE_ERROR_MESSAGE_LENGTH } from "../src/store/store-contract.js";
 import { createDaemonOperations, DaemonOperations } from "../src/daemon/operations.js";
 import { startStoreDaemon } from "../src/daemon/server.js";
-import { StoreClient } from "../src/store-client.js";
+import { StoreClient } from "../src/store/store-client.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
 import { createBm25IndexHandler } from "../src/rocksdb/index/bm25.js";
 import { createExactIndexHandler } from "../src/rocksdb/index/exact.js";
@@ -87,7 +87,7 @@ test("daemon admission reports durable, retryable disk-low state", async (t) => 
 
 test("daemon.status reports catalog-derived semantic dimensions and pooling over the wire", async (t) => {
   // Regression coverage: the versioned daemon.status wire contract
-  // (src/store-contract.js) allowlists the fields inside `semantic`, so
+  // (src/store/store-contract.js) allowlists the fields inside `semantic`, so
   // adding dimensions/pooling to LocalSemanticIndex.status() without also
   // widening that contract makes every daemon.status response fail client-side
   // validation as an unknown field, not just this one.

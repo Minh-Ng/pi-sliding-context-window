@@ -7,7 +7,7 @@ import {
   normalizeRenderFormat,
   renderRecalledEvidence,
 } from "../src/retrieval/render.js";
-import { estimateModelVisibleTokens } from "../src/model-token-budget.js";
+import { estimateModelVisibleTokens } from "../src/session/model-token-budget.js";
 
 function resolvedRecall(text, overrides = {}) {
   return {

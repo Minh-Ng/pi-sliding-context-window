@@ -5,7 +5,7 @@ import {
   assertStoreRequest,
   assertStoreResult,
   MAX_SESSION_LINEAGE_IDS,
-} from "../store-contract.js";
+} from "../store/store-contract.js";
 import {
   createRetrievalLease,
   RetrievalLeaseTargetUnavailableError,

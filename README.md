@@ -8,13 +8,13 @@ The Pi adapter provides the complete implementation because Pi exposes a pre-req
 
 The implementation separates portable policy from host wiring:
 
-- `src/epoch-window.js` — the host-independent session state machine. Storage and rotation persistence are injected through `archive` and `onRotation`.
-- `src/window.js` — pure message grouping, filtering, token estimation, and epoch-boundary functions.
+- `src/session/epoch-window.js` — the host-independent session state machine. Storage and rotation persistence are injected through `archive` and `onRotation`.
+- `src/session/window.js` — pure message grouping, filtering, token estimation, and epoch-boundary functions.
 - `src/daemon/**`, `src/rocksdb/**`, and `src/retrieval/**` — the single-owner RocksDB service, immutable canonical records, indexes, locators, leases, recall, retention, and automatic hint preflight.
-- `src/archive.js` — the SQLite compatibility backend and pre-authority rollback source; custom adapters can still provide the small archive interface.
+- `src/archive/archive.js` — the SQLite compatibility backend and pre-authority rollback source; custom adapters can still provide the small archive interface.
 - `src/presentation.js` — shared output truncation and status/search formatting.
 - `src/evidence-routing.js` — production archive-vs-live policy, tool descriptions, agent guidelines, and stale-evidence label. Benchmark fixtures and helpers are isolated under `eval/evidence-routing/` and are not imported by production modules.
-- `src/session-id.js` — stable session identity and bounded, failure-tolerant Pi session-header lineage discovery.
+- `src/session/session-id.js` — stable session identity and bounded, failure-tolerant Pi session-header lineage discovery.
 - `extensions/pi.ts` — a thin Pi lifecycle, tool, command, and UI adapter. `createContextEpochWindow()` accepts custom `configLoader` and `archiveFactory` dependencies.
 - `bin/context-windowd.js` — the sole RocksDB owner and versioned local RPC endpoint.
 - `bin/context-window-mcp.js` — the portable MCP adapter over the same daemon-backed archive and presentation modules.

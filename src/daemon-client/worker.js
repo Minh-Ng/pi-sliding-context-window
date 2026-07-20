@@ -11,7 +11,7 @@ import {
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { workerData } from "node:worker_threads";
-import { StoreClient } from "../store-client.js";
+import { StoreClient } from "../store/store-client.js";
 import { ensureSecureSocketDirectory } from "../daemon/paths.js";
 import { semanticLaunchArguments } from "./semantic-launch-arguments.js";
 import {

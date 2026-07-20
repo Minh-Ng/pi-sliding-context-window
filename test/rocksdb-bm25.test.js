@@ -3,11 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { MAX_VISIBLE_SOURCE_KEYS } from "../src/store-contract.js";
+import { MAX_VISIBLE_SOURCE_KEYS } from "../src/store/store-contract.js";
 import { RETRIEVAL_REGRESSION_FIXTURE } from "../eval/retrieval/fixtures.js";
 import { scoreRetrievalSuite } from "../eval/retrieval/scoring.js";
 import { createSqliteEvaluationBackend } from "../eval/retrieval/sqlite-backend.js";
-import { structuralMessageScores } from "../src/structural.js";
+import { structuralMessageScores } from "../src/structural-annotations.js";
 import {
   bm25InverseDocumentFrequency,
   bm25Keys,

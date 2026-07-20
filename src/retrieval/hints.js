@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { stableJson } from "../rocksdb/schema.js";
-import { estimateModelVisibleTokens } from "../model-token-budget.js";
+import { estimateModelVisibleTokens } from "../session/model-token-budget.js";
 import { leaseKeys, releaseLeaseFromView } from "./leases.js";
 
 export const HINT_FORMAT_VERSION = 1;

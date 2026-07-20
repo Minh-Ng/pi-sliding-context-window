@@ -10,6 +10,7 @@ import {
   EVIDENCE_ROUTING_GUIDELINES,
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_EFFORT_DESCRIPTION,
   SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
   SUPERSEDE_TOOL_DESCRIPTION,
@@ -85,6 +86,11 @@ test("archive tools advertise evidence-source routing", async () => {
     assert.equal(tool.parameters.additionalProperties, false);
     assert.equal(tool.parameters.properties.workingSet.items.minLength, 1);
     assert.equal(tool.parameters.properties.workingSet.maxItems, 16);
+    // searchEffort is the caller's own per-call uncertainty signal, mirrored
+    // on both explicit tools; "normal" is the default, so an agent that
+    // never mentions it gets today's behavior.
+    assert.equal(tool.parameters.properties.searchEffort.default, "normal");
+    assert.equal(tool.parameters.properties.searchEffort.description, SEARCH_EFFORT_DESCRIPTION);
   }
   assert.equal(search.parameters.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
   assert.match(search.parameters.properties.scope.description, /all.*does not bypass project authorization/i);

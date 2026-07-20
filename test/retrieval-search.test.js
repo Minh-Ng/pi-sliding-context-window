@@ -24,6 +24,7 @@ import {
   findStoredWindowForByteRange,
   fuseCandidates,
   normalizeModeScore,
+  resolveCandidateLimit,
   searchArchive,
 } from "../src/retrieval/search.js";
 import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
@@ -264,6 +265,7 @@ function searchRequest(query, overrides = {}) {
     hintBudgetTokens: overrides.hintBudgetTokens ?? 160,
     expansionPolicy: overrides.expansionPolicy,
     workingSet: overrides.workingSet,
+    searchEffort: overrides.searchEffort,
   };
 }
 
@@ -1502,6 +1504,31 @@ test("cross-encoder rerank does not widen the candidate pool once the reranker i
   assert.equal(client.calls.length, 0, "a latched-unavailable reranker never calls the client");
 });
 
+test("searchEffort: wide doubles resolveCandidateLimit's fused candidate pool, hard-capped at the existing 100-candidate ceiling", () => {
+  // No reranker: plain limit-scaled pool, then wide's 2x multiplier.
+  assert.equal(resolveCandidateLimit(3, undefined, "normal"), 9);
+  assert.equal(resolveCandidateLimit(3, undefined, "wide"), 18);
+  assert.equal(resolveCandidateLimit(3, undefined, undefined), 9, "omitted searchEffort behaves exactly like normal");
+  // The 100-candidate ceiling applies before AND after doubling: a
+  // request.limit already large enough to hit the ceiling on its own must not
+  // grow past it under wide.
+  assert.equal(resolveCandidateLimit(40, undefined, "normal"), 100);
+  assert.equal(resolveCandidateLimit(40, undefined, "wide"), 100);
+  assert.equal(resolveCandidateLimit(100, undefined, "wide"), 100);
+
+  // An operational reranker's own candidateWindow floor (default 40) is
+  // unaffected by searchEffort either way -- wide only ever grows the
+  // limit-scaled base it is compared against, never the window itself.
+  const reranker = { isOperational: () => true, candidateWindow: 40 };
+  assert.equal(resolveCandidateLimit(3, reranker, "normal"), 40, "base (9) loses to the reranker's own window");
+  assert.equal(resolveCandidateLimit(3, reranker, "wide"), 40, "widened base (18) still loses to the same window");
+  assert.equal(
+    resolveCandidateLimit(30, reranker, "wide"),
+    100,
+    "once the widened base (min(100, 90*2)=100) exceeds the window, it wins instead",
+  );
+});
+
 test("cross-encoder rerank degrades silently to the pre-rerank fused order when the model is unavailable", async (t) => {
   const { store, worker } = await fixture(t, "search-rerank-degraded");
   await seedRerankFixture(store);
@@ -1768,4 +1795,149 @@ test("RM3 requery does not throw when the published generation advances between 
   );
   assert.equal(expanded.mode, "lexical");
   assert.ok(expanded.results.some(({ documentId }) => documentId === "expansion-target"));
+});
+
+// Same shape as seedExpansionFixture, except the first-pass lexical anchor
+// ("primary") matches every query term instead of just one, so the auto-mode
+// weak-evidence threshold (lexical.normalizedScore/termCoverage) is
+// deliberately satisfied and would suppress both semantic broadening and RM3
+// expansion on the normal path.
+async function seedStrongEvidenceFixture(store) {
+  await admit(store, "primary", "gadget widget contraption zephyrindex updates important");
+  await admit(store, "expansion-target", "zephyrindex rotation cadence review important", { createdAt: 150 });
+  await admit(store, "filler-1", "maintenance notes for the archive process are important", { createdAt: 160 });
+  await admit(store, "filler-2", "schedule updates happen every maintenance cycle", { createdAt: 170 });
+  await admit(store, "filler-3", "important notes about schedule updates continue", { createdAt: 180 });
+}
+
+test("searchEffort: wide runs RM3 expansion unconditionally, past the auto gate's strong-first-pass threshold", async (t) => {
+  const { store, worker } = await fixture(t, "search-effort-wide-expansion");
+  await seedStrongEvidenceFixture(store);
+  await worker.drain();
+  const query = "gadget widget contraption";
+
+  const normal = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10 })),
+    { now: 1_000, allowExpansion: true },
+  );
+  assert.ok(normal.results[0].termCoverage >= 0.5, "fixture precondition: strong first-pass coverage");
+  assert.equal(
+    normal.results.some(({ documentId }) => documentId === "expansion-target"),
+    false,
+    "the auto gate must suppress expansion once first-pass evidence is already strong",
+  );
+
+  const wide = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10, searchEffort: "wide" })),
+    { now: 1_001, allowExpansion: true },
+  );
+  assert.ok(
+    wide.results.some(({ documentId }) => documentId === "expansion-target"),
+    "searchEffort: wide must run RM3 expansion even though first-pass evidence already looked adequate",
+  );
+
+  // searchEffort: "wide" alone, without the explicit-search-only server opt-in
+  // (options.allowExpansion), still never runs RM3 -- it moves an existing
+  // threshold, it does not bypass the machinery boundary that keeps
+  // expansion off the automatic preflight path.
+  const wideWithoutOptIn = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10, searchEffort: "wide" })),
+    { now: 1_002 },
+  );
+  assert.equal(
+    wideWithoutOptIn.results.some(({ documentId }) => documentId === "expansion-target"),
+    false,
+  );
+});
+
+test("searchEffort: wide runs semantic broadening unconditionally, past the auto gate's strong-first-pass threshold", async (t) => {
+  const { store, worker } = await fixture(t, "search-effort-wide-semantic");
+  await seedStrongEvidenceFixture(store);
+  // candidateStillLive (src/retrieval/search.js) requires a real manifest for
+  // any candidate that reaches locateCandidates, semantic candidates
+  // included, so the stubbed semantic.search result below must name a
+  // document actually admitted to the store, not a synthetic id.
+  await admit(store, "semantic-only", "unrelated filler content for the semantic-only stub document.", { createdAt: 140 });
+  await worker.drain();
+  const query = "gadget widget contraption";
+
+  const semanticResult = {
+    documentId: "semantic-only",
+    version: 1,
+    kind: "turn",
+    createdAt: 100,
+    score: 0.9,
+    text: "semantic-only span text",
+    project: "/workspace/search",
+    sessionId: "session-main",
+    sourceMessageKeys: [],
+    windowOrdinal: 0,
+    startByte: 0,
+    endByte: 10,
+  };
+
+  let normalSemanticCalls = 0;
+  const normal = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10 })),
+    {
+      now: 1_000,
+      semantic: {
+        search: async () => {
+          normalSemanticCalls += 1;
+          return [semanticResult];
+        },
+      },
+    },
+  );
+  assert.equal(normalSemanticCalls, 0, "the auto gate must never call semantic.search once first-pass evidence is strong");
+  assert.equal(normal.results.some(({ documentId }) => documentId === "semantic-only"), false);
+
+  let wideSemanticCalls = 0;
+  const wide = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10, searchEffort: "wide" })),
+    {
+      now: 1_001,
+      semantic: {
+        search: async () => {
+          wideSemanticCalls += 1;
+          return [semanticResult];
+        },
+      },
+    },
+  );
+  assert.equal(wideSemanticCalls, 1, "searchEffort: wide must call semantic.search even though first-pass evidence already looked adequate");
+  assert.equal(wide.results.some(({ documentId }) => documentId === "semantic-only"), true);
+});
+
+test("searchEffort omitted and searchEffort: \"normal\" leave search behavior byte-identical", async (t) => {
+  const { store, worker } = await fixture(t, "search-effort-normal-default");
+  await seedStrongEvidenceFixture(store);
+  await worker.drain();
+  const query = "gadget widget contraption";
+  const commonOptions = { allowExpansion: true, semantic: { search: async () => [] } };
+
+  const omitted = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10 })),
+    { ...commonOptions, now: 1_000 },
+  );
+  const explicitNormal = await searchArchive(
+    store,
+    withoutUndefined(searchRequest(query, { limit: 10, searchEffort: "normal" })),
+    { ...commonOptions, now: 1_000 },
+  );
+  // Every field except `locator` is fully deterministic given the same
+  // request/options/now; `locator` alone embeds a fresh random leaseId per
+  // call (src/retrieval/leases.js), so it is the one field this comparison
+  // must exclude to prove the two requests are otherwise byte-identical.
+  const withoutLocators = (response) => ({
+    ...response,
+    results: response.results.map(({ locator, ...rest }) => rest),
+  });
+  assert.deepEqual(withoutLocators(omitted), withoutLocators(explicitNormal));
 });

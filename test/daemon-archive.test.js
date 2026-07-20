@@ -1116,6 +1116,86 @@ test("searchDetailed forwards the workingSet ranking boost's anchor provenance i
   }
 });
 
+test("searchDetailed and gatherDetailed forward searchEffort only when the caller actually asks for wide", async () => {
+  const paths = fixture("context-window-daemon-search-effort-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/search-effort-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    const forwardedPayloads = [];
+    archive.request = (operation, payload) => {
+      if (operation === "store.search") {
+        forwardedPayloads.push({ operation, searchEffort: payload.searchEffort });
+        return {
+          mode: "lexical",
+          status: "not-found",
+          indexGeneration: 0,
+          expiredMatches: { count: 0, retentionClasses: [] },
+          results: [],
+        };
+      }
+      if (operation === "store.gather") {
+        forwardedPayloads.push({ operation, searchEffort: payload.searchEffort });
+        return {
+          status: "not-found",
+          mode: "lexical",
+          intent: payload.intent ?? "auto",
+          anchorCount: 0,
+          candidateCount: 0,
+          returnedTokens: 0,
+          truncated: false,
+          hasMore: false,
+          evidence: [],
+          expiredMatches: { count: 0, retentionClasses: [] },
+        };
+      }
+      throw new Error(`unexpected operation ${operation}`);
+    };
+
+    archive.searchDetailed("anything", {
+      sessionId: "session-a",
+      project: "/project/search-effort-wiring",
+      scope: "session",
+    });
+    archive.searchDetailed("anything", {
+      sessionId: "session-a",
+      project: "/project/search-effort-wiring",
+      scope: "session",
+      searchEffort: "wide",
+    });
+    archive.gatherDetailed("anything", {
+      sessionId: "session-a",
+      project: "/project/search-effort-wiring",
+      scope: "session",
+    });
+    archive.gatherDetailed("anything", {
+      sessionId: "session-a",
+      project: "/project/search-effort-wiring",
+      scope: "session",
+      searchEffort: "wide",
+    });
+
+    assert.deepEqual(forwardedPayloads, [
+      { operation: "store.search", searchEffort: undefined },
+      { operation: "store.search", searchEffort: "wide" },
+      { operation: "store.gather", searchEffort: undefined },
+      { operation: "store.gather", searchEffort: "wide" },
+    ]);
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("gatherDetailed forwards the store's expired-match summary instead of dropping it", async () => {
   const paths = fixture("context-window-daemon-gather-expired-wiring-");
   let archive;

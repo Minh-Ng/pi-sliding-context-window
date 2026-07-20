@@ -9,6 +9,7 @@ import { canonicalProjectId, projectIdentityAlias } from "../src/identity/projec
 import {
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_EFFORT_DESCRIPTION,
   SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
   SUPERSEDE_TOOL_DESCRIPTION,
@@ -136,6 +137,12 @@ const tools = [
           description: SEARCH_SCOPE_DESCRIPTION,
         },
         limit: { type: "integer", minimum: 1, maximum: 10, default: 3 },
+        searchEffort: {
+          type: "string",
+          enum: ["normal", "wide"],
+          default: "normal",
+          description: SEARCH_EFFORT_DESCRIPTION,
+        },
       },
       required: ["query"],
       additionalProperties: false,
@@ -166,6 +173,12 @@ const tools = [
           description: SEARCH_SCOPE_DESCRIPTION,
         },
         limit: { type: "integer", minimum: 1, maximum: 10, default: 3 },
+        searchEffort: {
+          type: "string",
+          enum: ["normal", "wide"],
+          default: "normal",
+          description: SEARCH_EFFORT_DESCRIPTION,
+        },
       },
       anyOf: [{ required: ["query"] }, { required: ["relation"] }],
       additionalProperties: false,
@@ -269,6 +282,7 @@ function callTool(name, args = {}) {
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
         workingSet: args.workingSet,
+        searchEffort: args.searchEffort,
         maxEvidence: 12,
         maxTokens: Math.max(39, totalBudget - 640),
       });
@@ -287,6 +301,7 @@ function callTool(name, args = {}) {
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
         workingSet: args.workingSet,
+        searchEffort: args.searchEffort,
         // The render step below already commits to config.searchResultTokens
         // as the total output budget; hand that same headroom to render-time
         // excerpt widening instead of leaving it unused behind a small fixed

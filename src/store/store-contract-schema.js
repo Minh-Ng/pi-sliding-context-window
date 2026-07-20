@@ -397,6 +397,15 @@ const searchRequest = object({
   // src/rocksdb/index/exact.js) -- never a filter, never widens what a
   // request can retrieve. Absent entirely on the automatic preflight path.
   workingSet: array(identifier, { maxItems: 16 }),
+  // Optional (not in the required list): the caller's own uncertainty signal
+  // for this one call. "normal" (the default whenever omitted) is today's
+  // behavior, byte-for-byte. "wide" relaxes existing retrieval gates for this
+  // call only -- semantic broadening runs unconditionally, RM3 expansion runs
+  // unconditionally, and the candidate pool doubles (still hard-capped at the
+  // existing 100-candidate ceiling) -- see src/retrieval/search.js's
+  // SEARCH_EFFORT_POLICY. It moves existing thresholds; it adds no new
+  // retrieval machinery. Absent entirely on the automatic preflight path.
+  searchEffort: enumeration(["normal", "wide"]),
 }, ["query", "relation", "scope", "limit", "excludeVisibleSourceKeys", "hintBudgetTokens"]);
 
 const searchResult = object({
@@ -810,6 +819,10 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       // above (optional, not required): forwarded into gather's internal
       // search call so its anchor evidence gets the same boost.
       workingSet: array(identifier, { maxItems: 16 }),
+      // Same caller-uncertainty signal as store.search's searchEffort above
+      // (optional, not required): forwarded into gather's internal search
+      // call so its anchor search gets the same widened gates.
+      searchEffort: enumeration(["normal", "wide"]),
     }, [
       "query",
       "intent",

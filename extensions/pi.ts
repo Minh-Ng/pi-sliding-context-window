@@ -355,6 +355,7 @@ export function createContextEpochWindow({
       EVIDENCE_ROUTING_GUIDELINES,
       GATHER_TOOL_DESCRIPTION,
       RECALL_TOOL_DESCRIPTION,
+      SEARCH_EFFORT_DESCRIPTION,
       SEARCH_SCOPE_DESCRIPTION,
       SEARCH_TOOL_DESCRIPTION,
       SUPERSEDE_TOOL_DESCRIPTION,
@@ -884,6 +885,10 @@ export function createContextEpochWindow({
           Type.Literal("all"),
         ], { default: "session", description: SEARCH_SCOPE_DESCRIPTION })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+        searchEffort: Type.Optional(Type.Union([
+          Type.Literal("normal"),
+          Type.Literal("wide"),
+        ], { default: "normal", description: SEARCH_EFFORT_DESCRIPTION })),
       }, { additionalProperties: false }),
       async execute(_id, params): Promise<ContextToolResult> {
         const active = requireSession();
@@ -895,6 +900,7 @@ export function createContextEpochWindow({
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
           workingSet: params.workingSet,
+          searchEffort: params.searchEffort,
           maxEvidence: 12,
           maxTokens: Math.max(39, totalBudget - 640),
         }));
@@ -943,6 +949,10 @@ export function createContextEpochWindow({
           description: SEARCH_SCOPE_DESCRIPTION,
         })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+        searchEffort: Type.Optional(Type.Union([
+          Type.Literal("normal"),
+          Type.Literal("wide"),
+        ], { default: "normal", description: SEARCH_EFFORT_DESCRIPTION })),
       }, { additionalProperties: false }),
       async execute(_id, params): Promise<ContextToolResult> {
         const active = requireSession();
@@ -957,6 +967,7 @@ export function createContextEpochWindow({
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
           workingSet: params.workingSet,
+          searchEffort: params.searchEffort,
           // Hand render-time excerpt widening the same budget this call
           // already commits to below via formatSearchResults; its own cap
           // still bounds the total.

@@ -205,6 +205,69 @@ test("gather carries a search-ranked score only on anchor evidence, never on tra
   assert.equal(Object.hasOwn(after, "retrievalMode"), false);
 });
 
+// Same RM3 fixture shape as test/retrieval-search.test.js's
+// seedExpansionFixture, except the first-pass lexical anchor ("primary")
+// matches every query term (full coverage) instead of just one: gather never
+// sets options.allowExpansion on its own (RM3 stays off for gather by
+// default, unlike explicit search), so this fixture must isolate
+// searchEffort's own wide-vs-normal wiring rather than the weak-evidence
+// threshold retrieval-search.test.js already covers.
+async function seedGatherExpansionFixture(admit) {
+  await admit("primary", "gadget widget contraption zephyrindex updates important", 100);
+  await admit("expansion-target", "zephyrindex rotation cadence review important", 150);
+  await admit("filler-1", "maintenance notes for the archive process are important", 160);
+  await admit("filler-2", "schedule updates happen every maintenance cycle", 170);
+  await admit("filler-3", "important notes about schedule updates continue", 180);
+}
+
+test("gather never runs RM3 expansion by default, even with strong first-pass evidence", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await seedGatherExpansionFixture(admit);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "gadget widget contraption",
+    intent: "state",
+    limit: 10,
+    maxEvidence: 10,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.deepEqual(gather.evidence.map(({ document }) => document.documentId), ["primary"]);
+});
+
+test("gather's searchEffort: wide grants its internal search call the RM3 expansion opt-in it never grants by default", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await seedGatherExpansionFixture(admit);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "gadget widget contraption",
+    intent: "state",
+    limit: 10,
+    maxEvidence: 10,
+    searchEffort: "wide",
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  // The RM3 requery's literalTerms (e.g. "important"/"updates") also widen the
+  // underlying BM25 query itself, so filler documents sharing that vocabulary
+  // legitimately join the result too; the assertion that matters here is that
+  // the expansion-only target -- absent above with the identical fixture and
+  // request minus searchEffort -- is now reachable at all.
+  assert.ok(
+    gather.evidence.some(({ document }) => document.documentId === "expansion-target"),
+    "searchEffort: wide must surface the RM3-expansion-only document",
+  );
+  assert.ok(gather.evidence.some(({ document }) => document.documentId === "primary"));
+});
+
 test("gather forwards workingSet through to its internal search call and surfaces boosted-anchor provenance", async (t) => {
   const { store, worker, admit } = await fixture(t);
   await admit("anchor", "Reusable migration procedure PALLET_ROUTE_PLANNER anchor.", 100);

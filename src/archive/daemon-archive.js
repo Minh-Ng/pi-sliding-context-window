@@ -865,6 +865,11 @@ export class DaemonArchive {
       hintBudgetTokens: Number.isSafeInteger(options.hintBudgetTokens)
         ? options.hintBudgetTokens
         : 0,
+      // Caller uncertainty signal, forwarded only when the caller actually
+      // asks for it: "normal" is the default byte-for-byte behavior whenever
+      // this is omitted, so there is nothing to widen unless the caller opts
+      // in per call.
+      ...(options.searchEffort === "wide" ? { searchEffort: "wide" } : {}),
     });
     const results = [];
     for (const candidate of response.results) {
@@ -1007,6 +1012,8 @@ export class DaemonArchive {
         positiveInteger(options.maxTokens, this.recallMaxTokens, MAX_RECALL_TOKENS),
       ),
       excludeVisibleSourceKeys: normalizedVisibleSourceKeys(options.excludeVisibleSourceKeys),
+      // Same caller-uncertainty forwarding as searchDetailed above.
+      ...(options.searchEffort === "wide" ? { searchEffort: "wide" } : {}),
     });
     const evidence = response.evidence.map((item) => {
       const authorizedSessionIds = [...new Set([...sessionIds, item.document.sessionId])];

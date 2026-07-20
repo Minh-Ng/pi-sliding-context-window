@@ -137,7 +137,18 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     limit: request.limit,
     excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
     hintBudgetTokens: 0,
-  }, options);
+    ...(request.searchEffort === undefined ? {} : { searchEffort: request.searchEffort }),
+  }, {
+    ...options,
+    // RM3 expansion additionally requires this explicit-search-only
+    // server-side opt-in (options.allowExpansion, src/retrieval/search.js);
+    // gather's own internal search call never sets it on the normal path, so
+    // RM3 stays off for gather by default exactly as before. searchEffort:
+    // "wide" is the caller's own per-call signal that this gather is worth
+    // the extra requery, so it also grants the opt-in gather never grants on
+    // its own -- shouldTryExpansion's unconditional branch then takes over.
+    ...(request.searchEffort === "wide" ? { allowExpansion: true } : {}),
+  });
 
   if (search.results.length === 0) {
     return assertStoreResult("store.gather", {

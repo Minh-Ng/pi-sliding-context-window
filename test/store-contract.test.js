@@ -871,6 +871,25 @@ test("workingSet is an optional ranking-boost field on store.search/store.gather
   assert.deepEqual(boostedAnchorEvidence.evidence[0].workingSetAnchors, ["REAP_DRAIN"]);
 });
 
+test("searchEffort is an optional caller-uncertainty field on store.search/store.gather requests, defaulting to normal", () => {
+  for (const operation of ["store.search", "store.gather"]) {
+    // Absent entirely remains valid: searchEffort is optional, not required,
+    // and its absence is what keeps default behavior byte-for-byte.
+    assertStoreRequest(operation, requests[operation]);
+
+    const wide = assertStoreRequest(operation, { ...requests[operation], searchEffort: "wide" });
+    assert.equal(wide.searchEffort, "wide");
+
+    const normal = assertStoreRequest(operation, { ...requests[operation], searchEffort: "normal" });
+    assert.equal(normal.searchEffort, "normal");
+
+    expectContractError(
+      () => assertStoreRequest(operation, { ...requests[operation], searchEffort: "maximum" }),
+      { code: "INVALID_REQUEST", path: "$.payload.searchEffort" },
+    );
+  }
+});
+
 test("unknown operations and fields fail with stable codes and paths", () => {
   expectContractError(
     () => assertStoreRequest("store.destroy", {}),

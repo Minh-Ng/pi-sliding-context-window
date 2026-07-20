@@ -12,6 +12,7 @@ import {
   ARCHIVED_EVIDENCE_LABEL,
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
+  SEARCH_EFFORT_DESCRIPTION,
   SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
@@ -210,6 +211,12 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
       assert.equal(tool.inputSchema.additionalProperties, false);
       assert.equal(tool.inputSchema.properties.workingSet.maxItems, 16);
       assert.equal(tool.inputSchema.properties.workingSet.items.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
+      // searchEffort is the caller's own per-call uncertainty signal, mirrored
+      // on both explicit tools; "normal" is the default, so an agent that
+      // never mentions it gets today's behavior.
+      assert.deepEqual(tool.inputSchema.properties.searchEffort.enum, ["normal", "wide"]);
+      assert.equal(tool.inputSchema.properties.searchEffort.default, "normal");
+      assert.equal(tool.inputSchema.properties.searchEffort.description, SEARCH_EFFORT_DESCRIPTION);
     }
     assert.match(search.description, /historical evidence candidates/);
     assert.match(search.description, /context_recall.*exact original wording or source evidence/);

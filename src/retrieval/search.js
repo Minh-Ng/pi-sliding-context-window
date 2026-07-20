@@ -49,6 +49,28 @@ import {
 const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, semantic: 1 });
 
 /**
+ * The caller's own per-call uncertainty signal (request.searchEffort on the
+ * explicit store.search/store.gather surfaces only -- automatic preflight's
+ * request schema carries no such field, so `request.searchEffort` is always
+ * undefined there and every lookup below resolves to the `normal` row).
+ * "wide" relaxes existing retrieval gates for this one call: semantic
+ * broadening and RM3 expansion run unconditionally (see shouldTrySemantic and
+ * shouldTryExpansion below) instead of only past their auto-mode evidence
+ * thresholds, and the fused candidate pool doubles (resolveCandidateLimit).
+ * This is a small policy table moving existing thresholds, not new retrieval
+ * machinery: every gate it touches already exists and already runs on the
+ * normal path.
+ */
+const SEARCH_EFFORT_POLICY = Object.freeze({
+  normal: Object.freeze({ candidateLimitMultiplier: 1, forceUnconditional: false }),
+  wide: Object.freeze({ candidateLimitMultiplier: 2, forceUnconditional: true }),
+});
+
+function searchEffortPolicy(searchEffort) {
+  return SEARCH_EFFORT_POLICY[searchEffort] ?? SEARCH_EFFORT_POLICY.normal;
+}
+
+/**
  * Candidate pool size to fetch per mode and fuse over. Explicit search/gather
  * with an operational cross-encoder reranker (options.reranker, never set by
  * automatic preflight) widens this to at least the reranker's own candidate
@@ -63,14 +85,23 @@ const MODE_PRIORITY = Object.freeze({ exact: 3, structural: 2, lexical: 1, seman
  * simply never installed) all keep the original, cheaper limit-scaled pool:
  * widening it in those cases would only pay the larger fused-tier fetch/rank
  * cost for candidates nothing is ever going to rerank.
+ *
+ * `searchEffort: "wide"` (see SEARCH_EFFORT_POLICY above) additionally
+ * doubles that limit-scaled pool, still hard-capped at the same 100-candidate
+ * ceiling -- it never grows past what the reranker's own `candidateWindow`
+ * would already request, so the reranker's own window (40) is unaffected.
+ * Exported for direct testing of the multiplier/ceiling arithmetic, the same
+ * way fuseCandidates and applyWorkingSetBoost are (see
+ * test/retrieval-search.test.js).
  */
-function resolveCandidateLimit(limit, reranker) {
+export function resolveCandidateLimit(limit, reranker, searchEffort) {
   const base = Math.min(100, Math.max(limit, limit * 3));
-  if (!reranker || typeof reranker.isOperational !== "function" || !reranker.isOperational()) return base;
+  const widened = Math.min(100, base * searchEffortPolicy(searchEffort).candidateLimitMultiplier);
+  if (!reranker || typeof reranker.isOperational !== "function" || !reranker.isOperational()) return widened;
   const window = Number.isSafeInteger(reranker.candidateWindow) && reranker.candidateWindow > 0
     ? reranker.candidateWindow
-    : base;
-  return Math.max(base, window);
+    : widened;
+  return Math.max(widened, window);
 }
 const WINDOW_SCAN_PAGE = 1_000;
 const MAX_LEGACY_STRUCTURAL_LOCATION_BYTES = 64 * 1_024;
@@ -629,7 +660,7 @@ function responseMode({ exactAttempted, lexicalAttempted, structuralAttempted, s
 async function collectCandidates(view, request, options) {
   const generation = await publishedGeneration(view);
   const plan = planExactQuery(request.query);
-  const candidateLimit = resolveCandidateLimit(request.limit, options.reranker);
+  const candidateLimit = resolveCandidateLimit(request.limit, options.reranker, request.searchEffort);
   const candidates = [];
   let exactAttempted = false;
   let lexicalAttempted = false;
@@ -730,10 +761,16 @@ const DEFAULT_EXPANSION_MINIMUM_TERM_COVERAGE = 0.5;
 // behind an explicit `options.allowExpansion` opt-in that only the explicit
 // store.search path sets (see src/daemon/operations.js). preflightArchive
 // never sets it, so this predicate is unreachable from the automatic path
-// regardless of how weak the evidence looks.
+// regardless of how weak the evidence looks. `searchEffort: "wide"`
+// (SEARCH_EFFORT_POLICY above) still requires that same server-side opt-in,
+// but once granted it runs the requery unconditionally instead of only past
+// the weak-evidence thresholds below -- the caller's own signal that this
+// particular query is worth the extra requery even though first-pass
+// evidence already looks adequate.
 function shouldTryExpansion(collected, request, options) {
   if (options.allowExpansion !== true) return false;
   if (request.expansionPolicy === "never" || request.query.trim().length === 0) return false;
+  if (searchEffortPolicy(request.searchEffort).forceUnconditional) return true;
   if (collected.candidates.some(({ retrievalMode }) => retrievalMode === "exact")) return false;
   const lexical = collected.candidates.find(({ retrievalMode }) => retrievalMode === "lexical");
   return lexical === undefined
@@ -810,7 +847,7 @@ async function broadenWithExpansion(store, collected, request, options) {
     scope: request.effectiveScope,
     sessionIds: request.sessionIds,
     excludeVisibleSourceKeys: request.excludeVisibleSourceKeys,
-    limit: resolveCandidateLimit(request.limit, options.reranker),
+    limit: resolveCandidateLimit(request.limit, options.reranker, request.searchEffort),
     // No generation pin here: this requery opens its own snapshot after the
     // first pass has already closed, and searchBm25 only accepts a
     // generation equal to the currently published one. Pinning the
@@ -839,7 +876,7 @@ async function broadenWithExpansion(store, collected, request, options) {
       // implying every attempted expansion term was found here.
       expandedTerms: Object.freeze(result.matchedTerms.filter((term) => expandedTermSet.has(term))),
     }));
-  const limit = resolveCandidateLimit(request.limit, options.reranker);
+  const limit = resolveCandidateLimit(request.limit, options.reranker, request.searchEffort);
   // Re-fuse over the pre-fusion pool, not the already-deduped `candidates`
   // view: fusing over the deduped view would only ever see one surviving
   // mode's copy per document and could never recompute cross-mode RRF credit
@@ -859,7 +896,11 @@ function shouldTrySemantic(collected, request, options) {
     || options.allowSemantic === false
     || request.semanticPolicy === "never"
     || request.query.trim().length === 0) return false;
-  if (request.semanticPolicy === "always") return true;
+  // gather.js already sets semanticPolicy "always" unconditionally on its own
+  // internal search call; `searchEffort: "wide"` gets explicit search there
+  // too, for the same policy/gate this call already trusts (SEARCH_EFFORT_
+  // POLICY above), without requiring the caller to also set semanticPolicy.
+  if (request.semanticPolicy === "always" || searchEffortPolicy(request.searchEffort).forceUnconditional) return true;
   if (collected.candidates.some(({ retrievalMode }) => retrievalMode === "exact")) return false;
   const lexical = collected.candidates.find(({ retrievalMode }) => retrievalMode === "lexical");
   return lexical === undefined
@@ -878,7 +919,7 @@ async function broadenWithSemantic(collected, request, options) {
     ...semanticCandidates(results, collected.generation),
   ]);
   const candidates = preserveCandidateMargins(
-    fuseCandidates(rawCandidates, resolveCandidateLimit(request.limit, options.reranker)),
+    fuseCandidates(rawCandidates, resolveCandidateLimit(request.limit, options.reranker, request.searchEffort)),
   );
   return Object.freeze({
     ...collected,
@@ -1209,7 +1250,7 @@ export async function searchArchive(store, request, options = {}) {
   const expanded = await broadenWithExpansion(store, lexical, normalized, resolvedOptions);
   const undecayed = await broadenWithSemantic(expanded, normalized, resolvedOptions);
   const decay = recencyDecayContext(resolvedOptions, now);
-  const candidateLimit = resolveCandidateLimit(normalized.limit, resolvedOptions.reranker);
+  const candidateLimit = resolveCandidateLimit(normalized.limit, resolvedOptions.reranker, normalized.searchEffort);
   const decayed = applyRecencyDecay(undecayed, decay, candidateLimit);
   const ranked = resolvedOptions.applyImportancePrior === true
     ? await rankByImportance(store, decayed, normalized.project)

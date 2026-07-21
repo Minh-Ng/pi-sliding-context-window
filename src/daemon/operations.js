@@ -42,6 +42,9 @@ import { normalizeRenderFormat } from "../retrieval/render.js";
 import { preflightArchive } from "../retrieval/preflight.js";
 import { searchArchive } from "../retrieval/search.js";
 import { traverseArchive } from "../retrieval/traverse.js";
+import { READ_SCOPE_ALL } from "./read-scope.js";
+import { bm25Keys } from "../rocksdb/index/bm25-keys.js";
+import { isArchiveEchoDocument } from "../rocksdb/index/echo.js";
 import { LocatorError } from "../retrieval/locator.js";
 import { LocalSemanticIndex } from "../semantic/index.js";
 import { LocalReranker } from "../semantic/reranker.js";
@@ -98,6 +101,18 @@ function readProjectsFor(context) {
   return Array.isArray(context.readProjects) && context.readProjects.length > 0
     ? context.readProjects
     : [context.project];
+}
+
+// Upper bound on enumerable project namespaces under a global-read grant.
+const MAX_GLOBAL_READ_PROJECTS = 10_000;
+
+// The operator-granted read ceiling, established daemon-side at handshake from
+// the user-global settings file (src/daemon/read-scope.js). Only read
+// operations consult it; the write target is always context.project. The
+// per-request scope stays min(requested, granted): a project- or
+// session-scoped request never widens even under a global grant.
+function grantsAllProjects(context) {
+  return context?.grantedReadScope === READ_SCOPE_ALL;
 }
 
 // Drops cross-encoder rerank provenance (see #searchAcrossProjects and
@@ -529,7 +544,11 @@ export class DaemonOperations {
     } finally {
       this.scheduleIndexing();
     }
-    this.semantic.enqueueDocument(result.documentId, result.version);
+    // Archive-echo documents stay recallable but never enter the semantic
+    // index either (see src/rocksdb/index/echo.js).
+    if (!isArchiveEchoDocument(payload.document)) {
+      this.semantic.enqueueDocument(result.documentId, result.version);
+    }
     if (payload.document.supersedes !== undefined) {
       const dependents = await this.dependentsForSupersededTarget(
         payload.document.supersedes,
@@ -680,7 +699,11 @@ export class DaemonOperations {
     // Explicit search may widen each candidate's excerpt to use its own
     // requested evidence budget; automatic preflight calls searchArchive
     // directly and never sets this, so frozen-hint bytes are unaffected.
-    const readProjects = readProjectsFor(context);
+    // scope=all reads every store project only under the operator-granted
+    // ceiling; otherwise it keeps collapsing to project scope downstream.
+    const readProjects = payload.scope === "all" && grantsAllProjects(context)
+      ? this.#allStoreProjects(context)
+      : readProjectsFor(context);
     // Dedup is a per-request opt-in on the explicit store.search surface
     // (payload.dedupe), never a daemon-forced default: two genuinely distinct
     // documents can share near-identical text, so collapsing near-dup clusters
@@ -828,7 +851,11 @@ export class DaemonOperations {
     } finally {
       recordStageTiming("maintenanceMs", performance.now() - maintenanceStartedAt);
     }
-    const readProjects = readProjectsFor(context);
+    // scope=all gathers across every store project only under the
+    // operator-granted ceiling, mirroring store.search.
+    const readProjects = payload.scope === "all" && grantsAllProjects(context)
+      ? this.#allStoreProjects(context)
+      : readProjectsFor(context);
     // Dedup is a per-request opt-in (payload.dedupe), same as store.search.
     if (readProjects.length <= 1) {
       // gatherArchive forwards its options object to searchArchive as-is
@@ -964,8 +991,35 @@ export class DaemonOperations {
     });
   }
 
+  // Every project namespace with indexed content, for connections whose
+  // operator granted maxReadScope=all. The authenticated project and its
+  // verified aliases always lead, so locator-authorization loops try them
+  // first. Enumeration reads the single corpus-current pointer per project;
+  // a project admitted but never yet indexed is not enumerable and stays
+  // invisible to global reads until its first index publication.
+  #allStoreProjects(context) {
+    const projects = [...readProjectsFor(context)];
+    const seen = new Set(projects);
+    const records = this.store.scan(bm25Keys.corpusCurrentPrefix(), {
+      limit: MAX_GLOBAL_READ_PROJECTS,
+    });
+    for (const record of records) {
+      const project = record?.payload?.project;
+      if (typeof project !== "string" || project.length === 0 || seen.has(project)) continue;
+      seen.add(project);
+      projects.push(project);
+    }
+    return projects;
+  }
+
   async traverse(payload, context) {
-    const readProjects = readProjectsFor(context);
+    // Traversal and recall are reads with no scope parameter, so they take
+    // the granted ceiling directly: a signed locator from a global search
+    // must remain recallable, and each locator still authorizes exactly one
+    // project.
+    const readProjects = grantsAllProjects(context)
+      ? this.#allStoreProjects(context)
+      : readProjectsFor(context);
     // A locator authorizes exactly one project; a mismatched project throws
     // LocatorError. Try each alias until one authorizes, and only surface the
     // authorization failure when none does.
@@ -992,7 +1046,12 @@ export class DaemonOperations {
   }
 
   async recall(payload, context) {
-    const readProjects = readProjectsFor(context);
+    // Same granted-ceiling widening as traverse: the authenticated project
+    // leads, and the loop below stops at the first project the signed
+    // locator authorizes.
+    const readProjects = grantsAllProjects(context)
+      ? this.#allStoreProjects(context)
+      : readProjectsFor(context);
     const sessionIds = payload.sessionIds ?? [];
     let result;
     for (const project of readProjects) {

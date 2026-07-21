@@ -13,8 +13,10 @@ import {
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
   SUPERSEDE_TOOL_DESCRIPTION,
+  DECISION_ABSENCE_HINT,
   archiveGatherSuggested,
   archiveStateReconciliationSuggested,
+  decisionSeekingQuery,
 } from "../src/evidence-routing.js";
 import {
   EFFECTIVE_PRODUCTION_GUIDANCE,
@@ -29,6 +31,8 @@ import {
   EVIDENCE_ROUTING_SUITES,
   EVIDENCE_ROUTING_JARGON_SUITE,
   EVIDENCE_ROUTING_JARGON_PAIRS,
+  DECISION_ABSENCE_BEHAVIORS,
+  EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE,
   EVIDENCE_ROUTING_INTERNALIZED_SUITE,
   JARGON_EVALUATION_INSTRUCTIONS,
   INTERNALIZED_EVALUATION_INSTRUCTIONS,
@@ -152,13 +156,76 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // above bumps it again to "15". The artifact-versioning rule (successive
   // versions of one working artifact under a stable subjectKey; ultracode
   // task #38) bumps it again to "16". Conflict-aware recall guidance bumps
-  // it to "17". Any held-out/reference eval artifact captured against an
+  // it to "17". The asserted-but-unrecorded-decision rule (report absence
+  // and enumerate candidates from source evidence instead of promoting the
+  // most plausible one) bumps it to "18". Any held-out/reference eval
+  // artifact captured against an
   // older version (see the persisted-artifact test below, still pinned at
   // "4") already fails validateEvidenceRoutingEvalRecord's version check by
   // design — once guidance moves, its recorded routing accuracy is
   // regression-only evidence for that snapshot, not a live held-out
   // measurement.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "17");
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "18");
+});
+
+test("asserted-but-unrecorded decisions require reported absence, source-derived candidates, and a structured absence signal", () => {
+  // Guidance layer: absence is the answer when no source-bearing record
+  // asserts the claimed decision.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /asserts that a past decision or commitment was made and no context_window_search result or context_recall record with source-bearing provenance/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /report that no recorded decision exists and enumerate the candidates found in source evidence/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /never an assistant summary treated as the candidate universe/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /do not promote the most plausible candidate/i.test(guideline)));
+
+  // Detection layer: decision-seeking phrasing gates the structured signal.
+  for (const query of [
+    "What was the benchmark we decided to use?",
+    "Which database did we agree on?",
+    "We landed on one of those — which one?",
+    "What convention did we choose?",
+    "Remind me what we settled on.",
+    "Which option was picked?",
+  ]) {
+    assert.equal(decisionSeekingQuery(query), true, query);
+  }
+  for (const query of [
+    "What does the parser do with empty input?",
+    "Show the retention configuration.",
+    undefined,
+    "",
+  ]) {
+    assert.equal(decisionSeekingQuery(query), false, String(query));
+  }
+
+  // Signal layer: the hint names the observable fact and the required
+  // behavior without inventing an answer.
+  assert.match(DECISION_ABSENCE_HINT, /0 decision-kind records matched/);
+  assert.match(DECISION_ABSENCE_HINT, /no recorded decision exists/);
+  assert.match(DECISION_ABSENCE_HINT, /enumerate candidates from source evidence/);
+  assert.match(DECISION_ABSENCE_HINT, /stable subjectKey/);
+});
+
+test("the decision-absence eval suite is balanced, annotated, and anchored by the production regression", () => {
+  assert.ok(Object.isFrozen(EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE));
+  const ids = EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE.map((entry) => entry.id);
+  assert.equal(new Set(ids).size, ids.length);
+  const behaviors = Object.values(DECISION_ABSENCE_BEHAVIORS);
+  const counts = new Map(behaviors.map((behavior) => [behavior, 0]));
+  for (const entry of EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE) {
+    assert.ok(behaviors.includes(entry.expectedBehavior), entry.id);
+    assert.ok(typeof entry.prompt === "string" && entry.prompt.length > 0, entry.id);
+    assert.ok(typeof entry.archiveState === "string" && entry.archiveState.length > 0, entry.id);
+    assert.ok(typeof entry.annotation === "string" && entry.annotation.length > 0, entry.id);
+    counts.set(entry.expectedBehavior, counts.get(entry.expectedBehavior) + 1);
+  }
+  // Balanced: absence must not be the trivially dominant label.
+  const [first, second] = behaviors.map((behavior) => counts.get(behavior));
+  assert.equal(first, second);
+  // The production regression stays pinned: a decision-seeking prompt whose
+  // archive fixture holds candidates but no decision record.
+  const regression = EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE.find((entry) => entry.id === "absence-001");
+  assert.match(regression.prompt, /benchmark we decided to use/i);
+  assert.equal(regression.expectedBehavior, DECISION_ABSENCE_BEHAVIORS.REPORT_ABSENCE);
+  assert.match(regression.archiveState, /no decision-kind record/i);
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

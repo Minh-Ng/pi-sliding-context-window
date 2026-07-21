@@ -131,6 +131,60 @@ test("time-sensitive archive searches receive bounded reconciliation guidance an
   assert.doesNotMatch(historical, /sourceTimestamp/);
 });
 
+test("decision-seeking searches surface a structured absence signal only when no decision-kind record matched", () => {
+  const turns = [
+    { id: "turn-a", kind: "turn", createdAt: Date.parse("2026-01-02T00:00:00Z"), snippet: "We compared LongMemEval, MemoryArena, and CL-Bench." },
+    { id: "tool-b", kind: "tool-result", createdAt: Date.parse("2026-01-02T00:01:00Z"), snippet: "Comparison table row: CL-Bench, continual learning." },
+  ];
+  // Decision-seeking query with only non-decision kinds: the absence signal
+  // fires and names the required behavior.
+  const absent = formatSearchResults(turns, 1_000, {
+    mode: "lexical",
+    query: "What was the benchmark we decided to use?",
+  });
+  assert.match(absent, /Decision-seeking query: 0 decision-kind records matched/);
+  assert.match(absent, /report that no recorded decision exists/);
+  assert.match(absent, /enumerate candidates from source evidence/);
+
+  // A matched decision-kind record silences the signal.
+  const withDecision = formatSearchResults([
+    ...turns,
+    { id: "decision-c", kind: "decision", createdAt: Date.parse("2026-01-03T00:00:00Z"), snippet: "Benchmark decision: use CL-Bench." },
+  ], 1_000, { mode: "lexical", query: "What was the benchmark we decided to use?" });
+  assert.doesNotMatch(withDecision, /0 decision-kind records matched/);
+
+  // Non-decision queries never carry the signal, matched or not.
+  const neutral = formatSearchResults(turns, 1_000, {
+    mode: "lexical",
+    query: "What does the comparison table contain?",
+  });
+  assert.doesNotMatch(neutral, /decision-kind records matched/);
+
+  // Gather packets surface the same signal from their evidence kinds.
+  const gathered = formatGatherResults({
+    intent: "state",
+    status: "resolved",
+    anchorCount: 1,
+    candidateCount: 1,
+    truncated: false,
+    evidence: [{
+      id: "g1",
+      relation: "anchor",
+      anchorRank: 1,
+      distance: 0,
+      score: 0.9,
+      document: {
+        documentId: "turn-a",
+        kind: "turn",
+        createdAt: Date.parse("2026-01-02T00:00:00Z"),
+        text: "We compared LongMemEval, MemoryArena, and CL-Bench.",
+        sessionId: "session-g",
+      },
+    }],
+  }, 1_000, "What was the benchmark we decided to use?");
+  assert.match(gathered, /Decision-seeking query: 0 decision-kind records matched/);
+});
+
 test("gather presentation preserves chronological exact records and strict aggregate caps", () => {
   const framed = (id, createdAt, value) => ({
     id,

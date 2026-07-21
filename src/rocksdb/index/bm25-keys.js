@@ -66,6 +66,12 @@ export const bm25Keys = Object.freeze({
   corpusCurrent(project) {
     return [...ROOT, "corpus-current", identifier(project, "project")];
   },
+  // Prefix over every project's corpus-current pointer. Exactly one such key
+  // exists per project with indexed content, so scanning this prefix is the
+  // cheap canonical enumeration of project namespaces in the store.
+  corpusCurrentPrefix() {
+    return [...ROOT, "corpus-current"];
+  },
   current(project, documentId) {
     return [...ROOT, "current", identifier(project, "project"), identifier(documentId, "documentId")];
   },

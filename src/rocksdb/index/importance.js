@@ -1,3 +1,4 @@
+import { isArchiveEchoDocument } from "./echo.js";
 import { manifestKeys } from "../manifests.js";
 import { documentRecallCount } from "../../retrieval/relevance-feedback.js";
 
@@ -165,6 +166,9 @@ export function createImportanceIndexHandler() {
     id: "importance-v1",
     operations: ["index"],
     async prepare(context) {
+      if (isArchiveEchoDocument(context?.manifest)) {
+        return { mutations: [], metadata: { skipped: "archive-echo" } };
+      }
       const { manifest, view } = context;
       const signals = await importanceSignalsFor(view, manifest);
       const payload = Object.freeze({

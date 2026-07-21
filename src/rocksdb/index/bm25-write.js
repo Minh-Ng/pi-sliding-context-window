@@ -13,6 +13,7 @@ import {
   normalizeBm25Term,
   tokenizeBm25,
 } from "./tokenizer.js";
+import { isArchiveEchoDocument } from "./echo.js";
 import { structuralMessageLocations } from "./structural.js";
 import {
   BM25_INDEX_VERSION,
@@ -783,6 +784,9 @@ export function createBm25IndexHandler(options = {}) {
         );
       }
       if (context.operation === "delete") return prepareDelete(context, project);
+      if (isArchiveEchoDocument(manifest)) {
+        return { mutations: [], metadata: { project, skipped: "archive-echo" } };
+      }
       const analysis = typeof context.readSourceRange === "function"
         ? await analyzeDocumentFromRanges(context)
         : analyzeDocument(context);

@@ -1,4 +1,5 @@
 import { KEYSPACE } from "../keys.js";
+import { isArchiveEchoDocument } from "./echo.js";
 import { MAX_SESSION_LINEAGE_IDS } from "../../store/store-contract.js";
 import {
   createDecisionEvidence,
@@ -301,6 +302,9 @@ export function createStructuralIndexHandler() {
     id: "structural-v1",
     operations: ["index"],
     async prepare(context) {
+      if (isArchiveEchoDocument(context?.manifest)) {
+        return { mutations: [], metadata: { skipped: "archive-echo" } };
+      }
       const mutations = [];
       const textStorage = new Map();
       const storePostingText = (posting) => {

@@ -1,4 +1,5 @@
 import { encodeKey, KEYSPACE } from "../keys.js";
+import { isArchiveEchoDocument } from "./echo.js";
 import { readDocumentRange } from "../document-range.js";
 import { manifestKeys, retiredDocumentStatus } from "../manifests.js";
 import { windowForByteRange } from "../windows.js";
@@ -696,6 +697,9 @@ export function createExactIndexHandler(options = {}) {
     id: EXACT_INDEX_HANDLER_ID,
     operations: Object.freeze(["index"]),
     prepare(context) {
+      if (isArchiveEchoDocument(context?.manifest)) {
+        return { mutations: [], metadata: { skipped: "archive-echo" } };
+      }
       return typeof context?.readSourceRange === "function"
         ? buildExactIndexMutationsFromRanges(context, captured)
         : buildExactIndexMutations(context, captured);

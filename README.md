@@ -199,6 +199,8 @@ Use the `context-window` namespace in Pi's shared settings files:
 - Global: `~/.pi/agent/settings.json`
 - Project-local: `.pi/settings.json` (loaded only for trusted projects)
 
+`maxReadScope` is the operator-granted read ceiling for the search/gather `scope` lattice (`session` ⊂ `project` ⊂ `all`); the effective scope of a request is min(requested, granted). It is honored only from the user-global settings file and is read by the daemon itself at each handshake — never from the client handshake and never from project-local settings — so repository content cannot widen its own authorization. With the default `"project"`, `scope=all` collapses to project scope; with `"all"`, `scope=all` reads every project namespace in the shared store while project- and session-scoped requests stay unchanged and writes remain bound to the authenticated project. It is also editable from the `/window settings` panel and applies to new daemon connections.
+
 ```json
 {
   "context-window": {
@@ -234,6 +236,7 @@ Use the `context-window` namespace in Pi's shared settings files:
     "ephemeralRetentionDays": 14,
     "conversationRetentionDays": 90,
     "derivedRetentionDays": 30,
+    "maxReadScope": "project",
     "archiveBackend": "rocksdb",
     "rocksdbPath": "~/.pi/context-window/archive.rocks",
     "semanticRetrieval": true,

@@ -11,6 +11,7 @@ import {
   SettingsList,
 } from "@earendil-works/pi-tui";
 import { loadConfig, saveGlobalConfig } from "../src/config.js";
+import { readGrantedReadScope } from "../src/daemon/read-scope.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
   EpochWindowSession,
@@ -531,6 +532,11 @@ export function createContextEpochWindow({
         ctx.ui.notify("/window settings requires TUI mode.", "error");
         return;
       }
+      // The granted read ceiling is displayed from the user-global settings
+      // file only — the same file the daemon reads — never from merged
+      // project-local configuration, so the panel always shows the honored
+      // value and cannot be widened by repository content.
+      let readScopeValue = await readGrantedReadScope();
       await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
         const status = active.status();
         const minimumTurns = Number(active.config.retainTurns) + 1;
@@ -549,6 +555,13 @@ export function createContextEpochWindow({
             values: contextCapOptions(active.config),
             description: `Rotate at this estimated message-token cap. Adaptive uses ${Math.round(active.config.rotationContextRatio * 100)}% of the selected model's input budget after Pi's compaction reserve; current effective cap is ${formatTokenCap(status.rotationTokens)}.`,
           },
+          {
+            id: "read-scope",
+            label: "Read scope ceiling",
+            currentValue: readScopeValue,
+            values: ["project", "all"],
+            description: "Granted ceiling for archive search scope=all. project keeps every connection inside its own project; all lets scope=all read every project on this machine. Saved to user-global settings only; applies to new daemon connections.",
+          },
         ];
         let settingsList: SettingsList;
         settingsList = new SettingsList(
@@ -556,6 +569,29 @@ export function createContextEpochWindow({
           items.length + 2,
           getSettingsListTheme(),
           (id, newValue) => {
+            if (id === "read-scope") {
+              const previous = readScopeValue;
+              if (newValue !== "project" && newValue !== "all") {
+                settingsList.updateValue(id, previous);
+                ctx.ui.notify("Read scope ceiling must be project or all.", "error");
+                return;
+              }
+              try {
+                // "project" is the implicit default: persisting it removes the
+                // key instead of pinning a redundant grant.
+                persistConfig({ maxReadScope: newValue === "all" ? "all" : undefined });
+                readScopeValue = newValue;
+                settingsList.updateValue(id, newValue);
+                ctx.ui.notify(
+                  `Context window read scope ceiling: ${newValue} · saved globally · applies to new daemon connections`,
+                  "info",
+                );
+              } catch (error) {
+                settingsList.updateValue(id, previous);
+                ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+              }
+              return;
+            }
             const previousValue = id === "turn-cap"
               ? String(active.status().rotationTurns)
               : contextCapValue(active.config);
@@ -905,7 +941,7 @@ export function createContextEpochWindow({
           maxTokens: Math.max(39, totalBudget - 640),
         }));
         return {
-          content: [{ type: "text", text: formatGatherResults(gather, totalBudget) }],
+          content: [{ type: "text", text: formatGatherResults(gather, totalBudget, params.query) }],
           details: {
             ids: gather.evidence.map((item: any) => item.id),
             count: gather.evidence.length,

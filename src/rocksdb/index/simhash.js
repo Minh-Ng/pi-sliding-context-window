@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { KEYSPACE } from "../keys.js";
+import { isArchiveEchoDocument } from "./echo.js";
 import { MAX_SIMHASH_TOKENS_PER_DOCUMENT } from "../index-preparation.js";
 import { BM25_TOKENIZER_VERSION, tokenizeBm25 } from "./tokenizer.js";
 
@@ -291,6 +292,9 @@ export function createNearDuplicateIndexHandler(options = {}) {
       positiveInteger(context.generation, "generation");
       const project = identifier(context.manifest?.project, "manifest.project");
       if (context.operation === "delete") return prepareDelete(context, project);
+      if (isArchiveEchoDocument(context.manifest)) {
+        return { mutations: [], metadata: Object.freeze({ project, skipped: "archive-echo" }) };
+      }
       const analysis = await analyzeDocument(context);
       const payload = signatureRecord(context, project, analysis);
       return {

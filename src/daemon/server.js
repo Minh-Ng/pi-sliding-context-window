@@ -18,6 +18,7 @@ import {
   encodeProtocolFrame,
 } from "../store/store-protocol.js";
 import { DEFAULT_MAX_FRAME_BYTES, LineFramer } from "./framing.js";
+import { READ_SCOPE_PROJECT, readGrantedReadScope } from "./read-scope.js";
 import {
   defaultSocketPath,
   ensureSecureSocketDirectory,
@@ -200,6 +201,7 @@ export class StoreDaemon {
     beforeStoreClose,
     requestObserver,
     slowRequestMs = DEFAULT_SLOW_REQUEST_MS,
+    userSettingsPath,
   }) {
     if (typeof createStore !== "function") {
       throw new TypeError("StoreDaemon requires an exclusive createStore function.");
@@ -225,6 +227,12 @@ export class StoreDaemon {
       throw new TypeError("requestObserver must expose requestStarted and requestFinished functions.");
     }
     this.requestObserver = requestObserver;
+    if (userSettingsPath !== undefined && (typeof userSettingsPath !== "string" || userSettingsPath.length === 0)) {
+      throw new TypeError("userSettingsPath must be a non-empty string when provided.");
+    }
+    // Where the operator-granted read ceiling is read from. Only the daemon
+    // consults this file; the grant is never accepted from client handshakes.
+    this.userSettingsPath = userSettingsPath;
     this.slowRequestMs = positiveLimit(slowRequestMs, "slowRequestMs");
     this.allowShutdown = allowShutdown;
     this.maxFrameBytes = positiveLimit(
@@ -943,6 +951,12 @@ export class StoreDaemon {
         this.handshakenConnections += 1;
         state.project = handshake.project;
         state.readProjects = authorizedReadProjects(handshake.project, handshake.aliasProjects);
+        // The granted read ceiling is operator configuration read fresh at
+        // each handshake from the user-global settings file, so flipping the
+        // setting takes effect on the next connection without a daemon
+        // restart. It is deliberately not a handshake field: a client cannot
+        // grant itself a wider read boundary.
+        state.grantedReadScope = await readGrantedReadScope(this.userSettingsPath);
         await this.#writeFrame(socket, createHandshakeAccepted({
           serverVersion: this.serverVersion,
           storePath: this.storePath,
@@ -986,6 +1000,7 @@ export class StoreDaemon {
       response = await this.#executeRequest(request, {
         project: state.project,
         readProjects: state.readProjects ?? [state.project],
+        grantedReadScope: state.grantedReadScope ?? READ_SCOPE_PROJECT,
         requestBytes: line.byteLength + 1,
         requestFingerprint: createHash("sha256").update(line).digest("hex"),
         socket,

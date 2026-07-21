@@ -520,6 +520,7 @@ test("/window settings persists and applies turn and token caps from its TUI", a
   assert.match(initial, /Context Window Settings/);
   assert.match(initial, /Turn cap\s+20/);
   assert.match(initial, /Context cap\s+adaptive/);
+  assert.match(initial, /Read scope ceiling\s+project/);
 
   panel.handleInput("\r");
   const settingsPath = join(directory, ".pi", "agent", "settings.json");
@@ -532,6 +533,21 @@ test("/window settings persists and applies turn and token caps from its TUI", a
   assert.equal(persisted.rotationTokens, 64_000);
   assert.match(notifications.at(-1).message, /effective 30 turns \/ 64k tokens/);
   assert.match(String(statuses.at(-1)), /30 turns/);
+
+  // The read scope ceiling persists to the same user-global settings file and
+  // never touches project-local configuration.
+  panel.handleInput("\x1b[B");
+  panel.handleInput("\r");
+  persisted = JSON.parse(readFileSync(settingsPath, "utf8"))["context-window"];
+  assert.equal(persisted.maxReadScope, "all");
+  assert.match(
+    notifications.at(-1).message,
+    /read scope ceiling: all .* saved globally .* new daemon connections/iu,
+  );
+  panel.handleInput("\r");
+  persisted = JSON.parse(readFileSync(settingsPath, "utf8"))["context-window"];
+  assert.equal(persisted.maxReadScope, undefined);
+  assert.match(notifications.at(-1).message, /read scope ceiling: project/iu);
 
   handlers.get("session_shutdown")({}, ctx);
 });

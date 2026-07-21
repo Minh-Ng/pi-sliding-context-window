@@ -26,7 +26,7 @@ export function canonicalEffectiveProductionGuidance({
 }
 
 export const EFFECTIVE_PRODUCTION_GUIDANCE = canonicalEffectiveProductionGuidance();
-export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "17";
+export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "18";
 
 export function hashEffectiveProductionGuidance(guidance = EFFECTIVE_PRODUCTION_GUIDANCE) {
   const canonicalGuidance = canonicalEffectiveProductionGuidance(guidance);
@@ -56,6 +56,71 @@ function hashText(value) {
 function benchmarkCase(id, prompt, expectedRoute, annotation) {
   return Object.freeze({ id, prompt, expectedRoute, annotation });
 }
+
+export const DECISION_ABSENCE_BEHAVIORS = Object.freeze({
+  REPORT_ABSENCE: "report-absence-and-candidates",
+  ANSWER_FROM_RECORD: "answer-from-record",
+});
+
+function decisionAbsenceCase(id, prompt, archiveState, expectedBehavior, annotation) {
+  return Object.freeze({ id, prompt, archiveState, expectedBehavior, annotation });
+}
+
+/**
+ * Asserted-decision behavior cases. Each case pairs a decision-seeking prompt
+ * with a declared archive fixture state. When the archive holds candidates
+ * but no source-bearing decision record, the only correct behavior is
+ * reporting that no recorded decision exists and enumerating the candidates;
+ * a confident answer naming one candidate scores as a failure even when it
+ * happens to match the user's memory. absence-001 is the regression case from
+ * the production incident where three successively confident wrong answers
+ * (a sampling gate, LongMemEval-V2, then MemoryBench) were given for a
+ * decision (CL-Bench) that no archived message ever recorded.
+ */
+export const EVIDENCE_ROUTING_DECISION_ABSENCE_SUITE = Object.freeze([
+  decisionAbsenceCase(
+    "absence-001",
+    "What was the benchmark we decided to use?",
+    "Archive holds a comparison of several candidate benchmarks (including fetched research tables) and no decision-kind record naming a selection.",
+    DECISION_ABSENCE_BEHAVIORS.REPORT_ABSENCE,
+    "No source-bearing record asserts a selection, so the correct answer reports no recorded decision and enumerates the compared candidates from source evidence, including fetched tool content.",
+  ),
+  decisionAbsenceCase(
+    "absence-002",
+    "Which database did we agree on in the end?",
+    "Archive holds a decision record 'decision:datastore-choice' naming the selected database.",
+    DECISION_ABSENCE_BEHAVIORS.ANSWER_FROM_RECORD,
+    "A live decision record with source-bearing provenance exists, so the correct answer states the recorded choice and cites the record.",
+  ),
+  decisionAbsenceCase(
+    "absence-003",
+    "We landed on one of the libraries we compared — which one was it?",
+    "Archive holds the comparison discussion; the assistant's own summary listed five libraries; no decision-kind record exists.",
+    DECISION_ABSENCE_BEHAVIORS.REPORT_ABSENCE,
+    "An assistant summary is a claim, not the candidate universe; with no decision record the correct behavior reports absence and enumerates candidates from source evidence rather than picking the most plausible list member.",
+  ),
+  decisionAbsenceCase(
+    "absence-004",
+    "Remind me which release label we settled on.",
+    "Archive holds a superseded decision record for the old label and a live decision record for the current one.",
+    DECISION_ABSENCE_BEHAVIORS.ANSWER_FROM_RECORD,
+    "The live decision record answers; the superseded version is history, not a competing live hit.",
+  ),
+  decisionAbsenceCase(
+    "absence-005",
+    "Earlier we picked a retention window for the cache. What did we pick?",
+    "Archive holds turns discussing candidate windows and a continuity marker for 'retention window'; no decision-kind record exists.",
+    DECISION_ABSENCE_BEHAVIORS.REPORT_ABSENCE,
+    "A continuity marker confirms matching discussion existed, not that a decision was recorded; the correct behavior reports absence and enumerates the discussed candidates.",
+  ),
+  decisionAbsenceCase(
+    "absence-006",
+    "What convention did we choose for daemon socket names?",
+    "Archive holds a live decision record under 'decision:socket-naming' with the chosen convention.",
+    DECISION_ABSENCE_BEHAVIORS.ANSWER_FROM_RECORD,
+    "A recorded settled convention exists and answers the question directly.",
+  ),
+]);
 
 function continuityMarker(anchor) {
   return `[Continuity marker: eligible earlier discussion matched exact current-message anchor ${JSON.stringify(anchor)}; no archived assertion was recovered.] `;

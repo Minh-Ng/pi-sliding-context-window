@@ -13,7 +13,7 @@ export const EVIDENCE_ROUTING_POLICY = Object.freeze({
 });
 
 export const SEARCH_SCOPE_DESCRIPTION =
-  "Search boundary: session includes the current session and verified parent-session lineage within the current project; project includes every archived session for the current project; all includes all evidence authorized to this connection and does not bypass project authorization. Packaged RocksDB connections authorize only the current project.";
+  "Search boundary: session includes the current session and verified parent-session lineage within the current project; project includes every archived session for the current project; all includes all evidence authorized to this connection and does not bypass project authorization. By default connections authorize only the current project, so all collapses to project scope; it reads every project on this machine only when the operator granted context-window.maxReadScope=all in user-global settings.";
 
 export const SEARCH_EFFORT_DESCRIPTION =
   "Retrieval effort for this call only: normal (default) keeps today's gates; wide widens semantic broadening, RM3 expansion, and the candidate pool. Use wide only after a normal search missed or when uncertainty is genuinely high, since it costs latency and tokens.";
@@ -99,7 +99,24 @@ export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   // this rule names the working-artifact case explicitly and points at the
   // chain view context_recall now surfaces for it.
   "When archiving successive versions of one working artifact (a plan, design note, or config snapshot) rather than a single settled fact, keep every version under one stable subjectKey and supersede the prior version each time it changes, so the current version stays the one live search hit while every earlier version remains individually recallable for audit; use kind manual for an artifact that must outlive normal retention. context_recall on any version in that chain reports its position (version k of n) and its immediate predecessor/successor document, so read that instead of guessing adjacent version ids.",
+  // Asserted-but-unrecorded decisions: when retrieval cannot produce a
+  // source-bearing record of a decision the user says was made, absence is
+  // the answer — never the most plausible candidate.
+  "When the user asserts that a past decision or commitment was made and no context_window_search result or context_recall record with source-bearing provenance actually asserts it, report that no recorded decision exists and enumerate the candidates found in source evidence (including fetched tool content, never an assistant summary treated as the candidate universe); do not promote the most plausible candidate to a confident answer. Preserve that uncertainty until the user confirms the settlement, then archive the confirmed decision with context_window_archive under a stable subjectKey — or a confirmed absence under 'absence:<subject>'.",
 ]);
+
+// Query phrasing that seeks a prior decision or settlement. Used to gate the
+// structured absence signal below, so an agent sees "0 decision-kind records
+// matched" as data instead of having to infer absence from noisy turn hits.
+const DECISION_SEEKING_PATTERN =
+  /\b(?:decid\w*|decision\w*|chose|choos\w*|chosen|agree\w*|settl\w*|pick(?:ed)?|select\w*|landed\s+on)\b/iu;
+
+export function decisionSeekingQuery(query) {
+  return typeof query === "string" && DECISION_SEEKING_PATTERN.test(query);
+}
+
+export const DECISION_ABSENCE_HINT =
+  "Decision-seeking query: 0 decision-kind records matched. If the user asserts a decision was made, report that no recorded decision exists and enumerate candidates from source evidence instead of promoting the most plausible one; once the user confirms the settlement, archive it under a stable subjectKey.";
 
 export const ARCHIVED_EVIDENCE_LABEL =
   "Archived historical evidence — may be stale about current mutable state; verify live state separately.";

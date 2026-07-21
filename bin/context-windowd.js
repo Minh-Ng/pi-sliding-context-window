@@ -49,6 +49,7 @@ const VALUE_OPTIONS = new Set([
   "--reranker-revision",
   "--reranker-cache",
   "--reranker-candidates",
+  "--user-settings",
 ]);
 const FLAG_OPTIONS = new Set(["--allow-shutdown", "--semantic", "--reranker", "--help"]);
 
@@ -82,6 +83,7 @@ function usage() {
     "  --reranker-revision REVISION       Pinned reranker model revision",
     "  --reranker-cache PATH              Library-managed local reranker model cache",
     "  --reranker-candidates N            Fused candidates reranked per query",
+    "  --user-settings PATH               User-global settings file for the granted read ceiling",
     "  --help                             Show this help",
   ].join("\n");
 }
@@ -282,6 +284,12 @@ try {
     socketPath,
     serverVersion: DAEMON_RUNTIME_VERSION,
     allowShutdown: parsed.flags.has("--allow-shutdown"),
+    // The granted read ceiling (context-window.maxReadScope) is read by the
+    // daemon from the user-global settings file only; project-local settings
+    // cannot widen authorization. Overridable for tests.
+    ...(parsed.values.has("--user-settings")
+      ? { userSettingsPath: resolve(parsed.values.get("--user-settings")) }
+      : {}),
     operationHandlers,
     beforeStoreClose: closeRuntime,
     requestObserver: watchdog,

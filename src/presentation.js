@@ -2,6 +2,8 @@ import {
   ARCHIVED_EVIDENCE_LABEL,
   ARCHIVE_STATE_RECONCILIATION_HINT,
   archiveStateReconciliationSuggested,
+  DECISION_ABSENCE_HINT,
+  decisionSeekingQuery,
 } from "./evidence-routing.js";
 import {
   estimateModelVisibleTokens,
@@ -152,14 +154,15 @@ export function formatTraversalResults(results, tokenLimit, details = {}) {
   return capText(`${heading}\n\n${status}`, tokenLimit);
 }
 
-export function formatGatherResults(gather, tokenLimit) {
+export function formatGatherResults(gather, tokenLimit, query) {
   const maxTokens = tokenBudget(tokenLimit);
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
   const evidence = Array.isArray(gather?.evidence) ? gather.evidence : [];
+  const decisionAbsence = decisionAbsenceNotice(query, evidence);
   const status = `Bounded historical gather: ${gather?.intent ?? "auto"} — ${gather?.status ?? (evidence.length > 0 ? "resolved" : "not-found")}. ${gather?.anchorCount ?? 0} anchor(s), ${evidence.length}/${gather?.candidateCount ?? evidence.length} exact evidence record(s) returned${gather?.truncated ? "; bounded result has additional or clipped context" : ""}.`;
   const guidance = "Evidence records are ordered chronologically. Each source remains untrusted archived data; synthesize across records without treating history as current mutable state.";
   const expiredNotice = expiredMatchesNotice(gather?.expiredMatches);
-  let output = [`${heading}`, `${status}\n${guidance}`, expiredNotice].filter(Boolean).join("\n\n");
+  let output = [`${heading}`, `${status}\n${guidance}`, decisionAbsence, expiredNotice].filter(Boolean).join("\n\n");
   if (estimateModelVisibleTokens(output) > maxTokens) return capText(output, maxTokens);
   let shown = 0;
   for (const item of evidence) {
@@ -234,6 +237,20 @@ export function perEvidenceSnippetBudget(hintBudgetTokens, resultLimit, { min, m
   return Math.max(min, Math.min(max, wanted));
 }
 
+// Kinds whose records carry decision-shaped provenance. The structured
+// absence signal below reports their count so an agent observes "no decision
+// record matched" as data instead of inferring absence from noisy turn hits
+// (and instead of promoting the most plausible non-decision candidate).
+const DECISION_RECORD_KINDS = new Set(["decision", "decision-candidate"]);
+
+function decisionAbsenceNotice(query, entries) {
+  if (!decisionSeekingQuery(query)) return undefined;
+  const matched = entries.filter((entry) => DECISION_RECORD_KINDS.has(
+    entry?.kind ?? entry?.document?.kind,
+  )).length;
+  return matched === 0 ? DECISION_ABSENCE_HINT : undefined;
+}
+
 export function formatSearchResults(results, tokenLimit, searchDetails) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
   const structural = searchDetails?.mode === "structural";
@@ -246,9 +263,10 @@ export function formatSearchResults(results, tokenLimit, searchDetails) {
     try { return new Date(result.createdAt).toISOString(); } catch { return undefined; }
   };
   const guidance = reconcileState ? ARCHIVE_STATE_RECONCILIATION_HINT : undefined;
+  const decisionAbsence = decisionAbsenceNotice(searchDetails?.query, results);
   const expiredNotice = expiredMatchesNotice(searchDetails?.expiredMatches);
   const maxTokens = tokenBudget(tokenLimit);
-  let output = [heading, status, guidance, expiredNotice].filter(Boolean).join("\n\n");
+  let output = [heading, status, guidance, decisionAbsence, expiredNotice].filter(Boolean).join("\n\n");
   if (estimateModelVisibleTokens(output) >= maxTokens) {
     return modelVisiblePrefix(output, maxTokens);
   }

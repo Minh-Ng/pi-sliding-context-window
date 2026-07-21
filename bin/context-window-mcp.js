@@ -304,7 +304,7 @@ function callTool(name, args = {}) {
         maxEvidence: 12,
         maxTokens: Math.max(39, totalBudget - 640),
       });
-      return textResult(formatGatherResults(gather, totalBudget), gather.status === "not-found");
+      return textResult(formatGatherResults(gather, totalBudget, args.query), gather.status === "not-found");
     }
     case "context_window_search": {
       const query = String(args.query ?? "").trim();

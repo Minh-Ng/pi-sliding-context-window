@@ -1085,6 +1085,13 @@ export class DaemonArchive {
         ...(item.sessionContextTerms === undefined || item.sessionContextTerms.length === 0
           ? {}
           : { sessionContextTerms: [...item.sessionContextTerms] }),
+        // Possibly-conflicting-evidence cross-references (ultracode task
+        // #37; see detectPossibleConflicts in src/retrieval/gather.js),
+        // forwarded the same optional/present-only-when-non-empty way as the
+        // provenance fields above.
+        ...(item.possiblyConflicting === undefined || item.possiblyConflicting.length === 0
+          ? {}
+          : { possiblyConflicting: [...item.possiblyConflicting] }),
       };
     });
     return {

@@ -647,6 +647,17 @@ const gatheredEvidence = object({
   // onto anchor evidence only -- the same restriction as
   // score/retrievalMode/reranked/workingSetAnchors above.
   sessionContextTerms: array(identifier, { maxItems: 8 }),
+  // Deterministic, bounded pairwise conflict flagging within this one gather
+  // packet (ultracode task #37; see detectPossibleConflicts in
+  // src/retrieval/gather.js): the locator(s) of other evidence in the same
+  // packet that share this evidence's subject (same live subjectKey, or a
+  // strong typed-anchor citation in common) and carry opposing decision-cue
+  // language, with no explicit supersession already connecting the pair.
+  // "Possibly" is the operative word -- the agent judges; false positives
+  // (two records restating the same decision) are the accepted risk. Never
+  // present on store.search/store.traverse results or the automatic
+  // preflight path -- gather-only.
+  possiblyConflicting: array(identifier, { maxItems: 8 }),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({

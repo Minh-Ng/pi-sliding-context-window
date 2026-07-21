@@ -1362,3 +1362,96 @@ test("cross-project gather strips reranked provenance from pooled multi-alias ev
       "position ever reflects a cross-encoder decision informed by the other alias -- the flag must not survive the pool",
   );
 });
+
+test("cross-project gather detects a possibly-conflicting pair split across aliases, and never leaves a dangling ref to evidence trimmed out of the pool (ultracode task #37)", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-gather-alias-conflict-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+
+  const canonical = "/workspace/gather-alias-conflict-canonical";
+  const alias = "/workspace/gather-alias-conflict-alias";
+
+  async function admit(project, id, text, createdAt) {
+    const sourceKey = `user:${id}`;
+    await admitDocument(store, {
+      idempotencyKey: `gather-alias-conflict:${id}`,
+      document: {
+        documentId: id,
+        version: 1,
+        sourceKey,
+        sessionId: `session-${id}`,
+        project,
+        kind: "turn",
+        createdAt,
+        text,
+        metadata: { turnId: `turn-${id}` },
+        sourceMessageKeys: [sourceKey],
+      },
+      structuralMessages: [],
+      retentionClass: "conversation-source",
+    }, {
+      chunking: { maxChunkBytes: 256, minLineSplitBytes: 0 },
+      windows: { windowTokens: 32, overlapTokens: 2 },
+    });
+  }
+
+  // The affirming and reversal halves of the pair live in different project
+  // aliases -- each alias's own single-project gatherArchive call only ever
+  // sees its own half, so neither leg's own flagPossibleConflicts pass can
+  // flag anything on its own; only pooling both aliases together exposes
+  // the shared subject signal.
+  await admit(canonical, "decide-cache", "We decided to use src/cache/redis-client.js for the cache layer.", 100);
+  await admit(alias, "reverse-cache", "We rejected src/cache/redis-client.js instead of memcached for the cache layer.", 200);
+
+  const worker = new IndexWorker(store, {
+    workerId: "gather-alias-conflict-worker",
+    maxDrainMs: 30_000,
+    handlers: [createExactIndexHandler(), createBm25IndexHandler()],
+  });
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const runtime = await createDaemonOperations(store);
+  t.after(() => runtime.close());
+
+  const request = {
+    query: "cache layer redis client",
+    intent: "state",
+    scope: "project",
+    sessionIds: [],
+    limit: 4,
+    before: 0,
+    after: 0,
+    neighborhoodAnchors: 4,
+    maxEvidence: 8,
+    maxTokens: 4_000,
+    excludeVisibleSourceKeys: [],
+  };
+
+  const canonicalOnly = await runtime.gather(request, { project: canonical, readProjects: [canonical] });
+  assert.ok(
+    canonicalOnly.evidence.every((item) => item.possiblyConflicting === undefined),
+    "fixture precondition: the canonical-only leg never sees the alias's reversal, so it flags nothing on its own",
+  );
+
+  const merged = await runtime.gather(request, { project: canonical, readProjects: [canonical, alias] });
+  const byDocumentId = new Map(merged.evidence.map((item) => [item.document.documentId, item]));
+  const decide = byDocumentId.get("decide-cache");
+  const reverse = byDocumentId.get("reverse-cache");
+  assert.ok(decide, "expected the canonical-alias document to be gathered as evidence");
+  assert.ok(reverse, "expected the other-alias document to be gathered as evidence");
+  assert.deepEqual(decide.possiblyConflicting, [reverse.locator]);
+  assert.deepEqual(reverse.possiblyConflicting, [decide.locator]);
+
+  // Every possiblyConflicting ref in the returned packet must resolve to
+  // another item actually present in that same packet -- the property that
+  // survives budget trimming only because gatherAcrossProjects re-runs
+  // flagPossibleConflicts over the final pooled-and-trimmed set instead of
+  // trusting each leg's own pre-pool flags.
+  const locators = new Set(merged.evidence.map((item) => item.locator));
+  for (const item of merged.evidence) {
+    for (const ref of item.possiblyConflicting ?? []) {
+      assert.ok(locators.has(ref), `dangling possiblyConflicting ref ${ref} does not resolve to any evidence in the returned packet`);
+    }
+  }
+});

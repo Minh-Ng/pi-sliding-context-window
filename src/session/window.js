@@ -659,7 +659,10 @@ export const DECISION_CANDIDATE_MAX_CHARS = 300;
 // verbatim-quoting: a heuristic cannot hallucinate a decision that was never
 // made, only quote a sentence that looks like one. Recall is allowed to be
 // moderate because raw turns remain archived and searchable regardless.
-const DECISION_CUE_PATTERN = new RegExp(
+// Exported so other deterministic evidence machinery (e.g. gather.js's
+// possibly-conflicting-evidence flagging, ultracode task #37) can reuse this
+// exact lexicon instead of re-deriving its own.
+export const DECISION_CUE_PATTERN = new RegExp(
   "\\b(?:"
   + [
     "decided?", "agreed?", "settl(?:ed?|ing) on", "let'?s go with",

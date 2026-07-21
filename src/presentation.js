@@ -153,6 +153,14 @@ export function formatGatherResults(gather, tokenLimit) {
       // before/after neighbors have no relevance ranking to report.
       ...(band === undefined ? {} : { score: item.score, relevanceBand: band }),
       ...(sourceTimestamp === undefined ? {} : { sourceTimestamp }),
+      // Possibly-conflicting-evidence cross-references (ultracode task #37;
+      // see detectPossibleConflicts in src/retrieval/gather.js). Deliberately
+      // worded "possibly" -- the agent judges; two records restating the
+      // same decision, or coincidentally sharing an anchor, are the accepted
+      // false-positive risk.
+      ...(item.possiblyConflicting?.length > 0
+        ? { possiblyConflicting: item.possiblyConflicting.map((ref) => `possibly conflicting with ${ref}`) }
+        : {}),
     });
     const recalled = formatRecalledDocument(document, maxTokens, item.id ?? item.locator);
     const candidate = `${output}\n\n${metadata}\n${recalled}`;

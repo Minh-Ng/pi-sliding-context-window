@@ -6,12 +6,53 @@ import {
   readNearDuplicateSignature,
   selectNearDuplicateRepresentatives,
 } from "../rocksdb/index/simhash.js";
+import { extractExactAnchors } from "../rocksdb/index/exact.js";
+import { manifestKeys } from "../rocksdb/manifests.js";
+import { DECISION_CUE_PATTERN } from "../session/window.js";
 import { recallArchive } from "./recall.js";
 import { searchArchive } from "./search.js";
 import { traverseArchive } from "./traverse.js";
 
 const MIN_RECALL_TOKENS = 39;
 const DEFAULT_SCAN_LIMIT = 2_048;
+
+// Reversal-flavored half of the decision extractor's own cue lexicon
+// (session/window.js's DECISION_CUE_PATTERN, reused verbatim above as the
+// "this sentence is decision-shaped at all" test): reject/rule-out/won't/
+// instead-of/rather-than/out-of-scope/defer, plus revert. A text matching
+// DECISION_CUE_PATTERN but not this subset reads as the affirming half of a
+// possibly-conflicting pair ("we decided to use X"); matching both reads as
+// the reversal half ("instead of X, we're rejecting it"). Two evidence items
+// are "opposing" only when exactly one side is reversal-flavored -- two
+// affirmations or two rejections of the same subject are not evidence of a
+// conflict on their own.
+const REVERSAL_CUE_PATTERN = new RegExp(
+  "\\b(?:"
+  + [
+    "instead of", "rather than", "reject(?:ed|ing)?", "rul(?:ed?|ing) out",
+    "won'?t (?:use|do|support|need)", "will not", "out of scope",
+    "deferr?(?:ed|ing)?", "revert(?:ed|ing)?",
+  ].join("|")
+  + ")\\b",
+  "i",
+);
+
+// "Strong" exact-anchor types (rocksdb/index/exact.js's TYPE_SPECIFICITY)
+// for subject-signal overlap: every classified type except the generic
+// "value" catch-all (bare version numbers, hex constants, k=v pairs), which
+// is too common across unrelated evidence to imply the same subject.
+const STRONG_CONFLICT_ANCHOR_TYPES = new Set([
+  "error", "path", "commit", "quoted-value", "symbol", "dotted-name", "url",
+]);
+// Local, per-evidence-item text scan -- not a store scan -- so this stays
+// cheap regardless of how large the archive is; capped defensively anyway
+// since a pathological excerpt could otherwise produce a large anchor set.
+const MAX_CONFLICT_ANCHORS_PER_EVIDENCE = 64;
+// Contract cap on gatheredEvidence.possiblyConflicting (store-contract-schema
+// .js). A packet holds up to 24 evidence items, so one item can in principle
+// share a subject signal with up to 23 others; must truncate here rather
+// than let the schema validator reject the whole packet.
+const MAX_POSSIBLY_CONFLICTING_REFS = 8;
 
 function candidateIdentity(candidate) {
   return `${candidate.documentId}\0${candidate.version}`;
@@ -113,6 +154,159 @@ async function dedupOrderedCandidates(store, orderedCandidates, project, options
     priorCount: (entry) => entry.candidate.nearDuplicates ?? 0,
   });
   return representatives.map(({ item, nearDuplicates }) => ({ ...item, nearDuplicates }));
+}
+
+/** Bounded, local (no store access) set of this evidence item's own strong
+ * exact-anchor citations, keyed case-insensitively by type+value. */
+function strongAnchorKeys(text) {
+  const anchors = extractExactAnchors(String(text ?? ""), {
+    maxAnchors: MAX_CONFLICT_ANCHORS_PER_EVIDENCE,
+  });
+  const keys = new Set();
+  for (const anchor of anchors) {
+    if (!STRONG_CONFLICT_ANCHOR_TYPES.has(anchor.type)) continue;
+    keys.add(`${anchor.type}::${anchor.folded}`);
+  }
+  return keys;
+}
+
+function sharesStrongAnchor(left, right) {
+  if (left.size === 0 || right.size === 0) return false;
+  for (const key of left) {
+    if (right.has(key)) return true;
+  }
+  return false;
+}
+
+/** Both sides read as decision-shaped, and exactly one side is
+ * reversal-flavored: the "opposing decision cues" half of the contract. */
+function opposingDecisionCues(leftText, rightText) {
+  if (!DECISION_CUE_PATTERN.test(leftText) || !DECISION_CUE_PATTERN.test(rightText)) {
+    return false;
+  }
+  return REVERSAL_CUE_PATTERN.test(leftText) !== REVERSAL_CUE_PATTERN.test(rightText);
+}
+
+/** True when one item's own recorded explicit supersession already targets
+ * the other -- the tension is already formalized, not merely possible. In
+ * gatherArchive's own flow this is always false by construction (a document
+ * that is actually superseded fails recall and never reaches `evidence`);
+ * this is a defense-in-depth guard against ever mislabeling a formally
+ * reconciled pair, kept independently testable and cheap (no extra store
+ * round trip -- `supersedes` rides along with the subjectKey manifest read
+ * gatherArchive already does for every evidence item). */
+function supersessionLinks(left, right) {
+  const leftTargetsRight = left.supersedes
+    && left.supersedes.documentId === right.documentId
+    && left.supersedes.version === right.version;
+  const rightTargetsLeft = right.supersedes
+    && right.supersedes.documentId === left.documentId
+    && right.supersedes.version === left.version;
+  return Boolean(leftTargetsRight || rightTargetsLeft);
+}
+
+/**
+ * Deterministic, bounded pairwise conflict flagging within one gather packet
+ * (ultracode task #37). Two evidence descriptors that share a subject signal
+ * (same live subjectKey, or a strong typed-anchor citation in common),
+ * carry opposing decision-cue language, and are not already connected by an
+ * explicit supersession get a mutual "possibly conflicting" cross-reference.
+ * This is honest uncertainty, not a verdict -- the agent judges: two records
+ * restating the same decision, or coincidentally sharing an anchor, are the
+ * accepted false-positive risk, so every label reads "possibly," never
+ * "conflicting." Pairwise over `descriptors` (bounded by the caller to one
+ * gather packet's evidence, itself capped by maxEvidence), never a store
+ * scan. Exported directly for targeted unit coverage of the flagging logic
+ * itself (e.g. the supersession-link exclusion), independent of whether
+ * gatherArchive's own recall filtering can ever construct that input.
+ * Each item's ref list is truncated at MAX_POSSIBLY_CONFLICTING_REFS (the
+ * schema's possiblyConflicting maxItems) -- with up to 24 evidence items per
+ * packet, one item can otherwise collect more conflict refs than the
+ * contract allows, which would make the whole packet fail validation rather
+ * than degrade gracefully.
+ */
+export function detectPossibleConflicts(descriptors) {
+  const conflicts = new Map();
+  const addRef = (ref, otherRef) => {
+    const existing = conflicts.get(ref);
+    if (existing === undefined) {
+      conflicts.set(ref, [otherRef]);
+    } else if (
+      !existing.includes(otherRef)
+      && existing.length < MAX_POSSIBLY_CONFLICTING_REFS
+    ) {
+      existing.push(otherRef);
+    }
+  };
+  for (let i = 0; i < descriptors.length; i += 1) {
+    for (let j = i + 1; j < descriptors.length; j += 1) {
+      const left = descriptors[i];
+      const right = descriptors[j];
+      const sameSubject = (left.subjectKey !== undefined && left.subjectKey === right.subjectKey)
+        || sharesStrongAnchor(left.anchorKeys, right.anchorKeys);
+      if (!sameSubject) continue;
+      if (!opposingDecisionCues(left.text, right.text)) continue;
+      if (supersessionLinks(left, right)) continue;
+      addRef(left.ref, right.ref);
+      addRef(right.ref, left.ref);
+    }
+  }
+  return conflicts;
+}
+
+/**
+ * Enrich already-resolved gather evidence with possibly-conflicting
+ * cross-references, mutating each item in place. One bounded manifest
+ * point-read per evidence item (subjectKey + any recorded explicit
+ * supersedes target, evidence.length <= the request's maxEvidence cap);
+ * anchor extraction and cue matching are local text scans. No-op below two
+ * evidence items -- callers that trim a two-or-more item evidence array down
+ * to fewer than two beforehand get their stale flags cleared automatically
+ * (see below), but the trivial no-op path here can't reach an item to clear.
+ * Idempotent and re-runnable on already-flagged evidence: any prior
+ * possiblyConflicting value on an item is overwritten (or removed, if this
+ * pass finds no conflict for it), so a caller that pools evidence across
+ * multiple prior gatherArchive calls (each of which already ran this once
+ * against its own smaller set) and then trims can safely call this again
+ * over the final pooled set to get cross-set detection and drop any
+ * dangling ref that no longer resolves to a surviving item.
+ */
+export async function flagPossibleConflicts(store, evidence) {
+  if (evidence.length < 2) {
+    for (const item of evidence) delete item.possiblyConflicting;
+    return;
+  }
+  const manifests = await store.snapshot(async (view) => {
+    const map = new Map();
+    for (const item of evidence) {
+      const manifest = await view.get(
+        manifestKeys.document(item.document.documentId, item.document.version),
+      );
+      map.set(item, manifest);
+    }
+    return map;
+  });
+  const descriptors = evidence.map((item) => {
+    const manifest = manifests.get(item);
+    return {
+      ref: item.locator,
+      documentId: item.document.documentId,
+      version: item.document.version,
+      subjectKey: manifest?.subjectKey,
+      supersedes: manifest?.supersedes,
+      text: item.document.text,
+      anchorKeys: strongAnchorKeys(item.document.text),
+    };
+  });
+  const conflicts = detectPossibleConflicts(descriptors);
+  for (const item of evidence) {
+    const refs = conflicts.get(item.locator);
+    if (refs !== undefined && refs.length > 0) {
+      item.possiblyConflicting = refs;
+    } else {
+      delete item.possiblyConflicting;
+    }
+  }
 }
 
 /**
@@ -272,6 +466,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     });
   }
   evidence.sort(chronological);
+  await flagPossibleConflicts(store, evidence);
 
   const candidateOverflow = deduped.length > selected.length;
   const searchMayHaveMore = search.results.length === request.limit;

@@ -34,7 +34,7 @@ import {
   unpinDocument,
 } from "../rocksdb/retention.js";
 import { cleanupExpiredLeases } from "../retrieval/leases.js";
-import { chronological, gatherArchive } from "../retrieval/gather.js";
+import { chronological, flagPossibleConflicts, gatherArchive } from "../retrieval/gather.js";
 import { clearScopedHints, removeFrozenHint } from "../retrieval/hints.js";
 import { recallArchive } from "../retrieval/recall.js";
 import { normalizeRenderFormat } from "../retrieval/render.js";
@@ -903,6 +903,15 @@ export class DaemonOperations {
       evidence.push(item);
       returnedTokens += itemTokens;
     }
+    // Each leg's own gatherArchive call already flagged possiblyConflicting
+    // refs against that leg's own (pre-trim, single-project) evidence set.
+    // Pooling and then trimming to the shared budget can drop one side of a
+    // flagged pair, and never compares anchors across aliases at all -- so
+    // re-run detection here over the final cross-project, post-trim set.
+    // This is idempotent (flagPossibleConflicts overwrites or clears every
+    // item's flag) and cheap: one more manifest snapshot read per surviving
+    // item, bounded by the same evidenceCap as everything else here.
+    await flagPossibleConflicts(this.store, evidence);
     // Single-project gather returns evidence in chronological order (gather.js)
     // and the model-facing guidance asserts that ordering; re-sort after budget
     // selection so the alias-widened merge matches it instead of leaking the

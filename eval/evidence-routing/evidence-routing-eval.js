@@ -26,7 +26,7 @@ export function canonicalEffectiveProductionGuidance({
 }
 
 export const EFFECTIVE_PRODUCTION_GUIDANCE = canonicalEffectiveProductionGuidance();
-export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "14";
+export const EFFECTIVE_PRODUCTION_GUIDANCE_VERSION = "15";
 
 export function hashEffectiveProductionGuidance(guidance = EFFECTIVE_PRODUCTION_GUIDANCE) {
   const canonicalGuidance = canonicalEffectiveProductionGuidance(guidance);

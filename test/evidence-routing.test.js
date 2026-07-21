@@ -118,6 +118,12 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // search rather than the default speculative-search avoidance.
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /destructive or hard-to-reverse action.*subjectKey or exact anchors.*empty result clears the action.*match must be reconciled before proceeding/i.test(guideline)));
   assert.match(SUPERSEDE_TOOL_DESCRIPTION, /hard to reverse.*search for the subject's prior decisions or constraints first/i);
+  // Negative-evidence archiving: a meaningful, acted-on absence finding
+  // ("checked X, found nothing") is worth archiving under a stable
+  // absence:<subject> key so the next session doesn't repeat the check or
+  // assume presence; a routine empty grep is not archived.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /meaningful check for a subject comes up empty.*absence is acted on.*absence:<subject>.*what was checked, how, and when/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /context_window_supersede.*subject is later found to exist.*absence stops being treated as current/i.test(guideline)));
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -132,13 +138,15 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // identifier must be bumped past it.
   // The gather-before-irreversible-action rule appended to
   // EVIDENCE_ROUTING_GUIDELINES again changes the model-visible guidance
-  // text, so the fingerprint version bumps past "13" to "14". Any
-  // held-out/reference eval artifact captured against an older version
-  // (see the persisted-artifact test below, still pinned at "4") already
-  // fails validateEvidenceRoutingEvalRecord's version check by design —
-  // once guidance moves, its recorded routing accuracy is regression-only
+  // text, so the fingerprint version bumped past "13" to "14". The
+  // negative-evidence archiving rule (confirmed-absence findings) appended
+  // above bumps it again to "15". Any held-out/reference eval artifact
+  // captured against an older version (see the persisted-artifact test
+  // below, still pinned at "4") already fails
+  // validateEvidenceRoutingEvalRecord's version check by design — once
+  // guidance moves, its recorded routing accuracy is regression-only
   // evidence for that snapshot, not a live held-out measurement.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "14");
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "15");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

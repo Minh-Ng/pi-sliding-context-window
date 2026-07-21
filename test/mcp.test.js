@@ -211,6 +211,10 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
       assert.equal(tool.inputSchema.additionalProperties, false);
       assert.equal(tool.inputSchema.properties.workingSet.maxItems, 16);
       assert.equal(tool.inputSchema.properties.workingSet.items.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
+      // sessionContext (ultracode task #32) is the same optional
+      // ranking-boost input shape, for an MCP caller's own digest.
+      assert.equal(tool.inputSchema.properties.sessionContext.maxItems, 16);
+      assert.equal(tool.inputSchema.properties.sessionContext.items.maxLength, MAX_STORE_IDENTIFIER_LENGTH);
       // searchEffort is the caller's own per-call uncertainty signal, mirrored
       // on both explicit tools; "normal" is the default, so an agent that
       // never mentions it gets today's behavior.

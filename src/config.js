@@ -40,6 +40,15 @@ export const DEFAULT_CONFIG = Object.freeze({
   searchResults: 3,
   searchResultTokens: 1_500,
   automaticRetrieval: true,
+  // Explicit search/gather ranking signal only (ultracode task #32), never
+  // consulted by automatic preflight: the Pi adapter's own deterministic
+  // conversation-prefix digest (src/session/session-context.js) is computed
+  // and forwarded into every store.search/store.gather call this config
+  // makes unless set false, in which case the digest is never computed and
+  // the request never carries a `sessionContext` field -- byte-identical to
+  // every pre-task-#32 request. MCP callers are unaffected by this flag: they
+  // pass their own sessionContext per call (or omit it) regardless.
+  sessionContextRanking: true,
   hintBudgetTokens: 160,
   activeHintBudgetTokens: 640,
   // Compatibility alias. loadConfig resolves both names to one value.
@@ -476,6 +485,12 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     automaticRetrieval: booleanValue(
       env.CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL ?? merged.automaticRetrieval,
       DEFAULT_CONFIG.automaticRetrieval,
+    ),
+    // See DEFAULT_CONFIG.sessionContextRanking above for why this defaults on
+    // and is scoped to the Pi adapter's own automatic digest only.
+    sessionContextRanking: booleanValue(
+      env.CONTEXT_WINDOW_SESSION_CONTEXT_RANKING ?? merged.sessionContextRanking,
+      DEFAULT_CONFIG.sessionContextRanking,
     ),
     hintBudgetTokens: numeric(
       "hintBudgetTokens",

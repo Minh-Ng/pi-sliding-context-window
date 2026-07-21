@@ -853,6 +853,9 @@ export class DaemonArchive {
       ...(Array.isArray(options.workingSet)
         ? { workingSet: [...new Set(options.workingSet.map(String).filter(Boolean))].slice(0, 16) }
         : {}),
+      ...(Array.isArray(options.sessionContext)
+        ? { sessionContext: [...new Set(options.sessionContext.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
       relation: options.relation ?? null,
       semanticPolicy: options.semanticPolicy ?? "auto",
       expansionPolicy: options.expansionPolicy ?? "auto",
@@ -940,6 +943,11 @@ export class DaemonArchive {
         ...(candidate.workingSetAnchors === undefined || candidate.workingSetAnchors.length === 0
           ? {}
           : { workingSetAnchors: [...candidate.workingSetAnchors] }),
+        // Same expandedTerms/workingSetAnchors provenance pattern above, for
+        // the request's sessionContext ranking boost (ultracode task #32).
+        ...(candidate.sessionContextTerms === undefined || candidate.sessionContextTerms.length === 0
+          ? {}
+          : { sessionContextTerms: [...candidate.sessionContextTerms] }),
         historical: candidate.historical,
         superseded: candidate.superseded,
         source: structuredClone(candidate.source),
@@ -997,6 +1005,9 @@ export class DaemonArchive {
       ...(Array.isArray(options.workingSet)
         ? { workingSet: [...new Set(options.workingSet.map(String).filter(Boolean))].slice(0, 16) }
         : {}),
+      ...(Array.isArray(options.sessionContext)
+        ? { sessionContext: [...new Set(options.sessionContext.map(String).filter(Boolean))].slice(0, 16) }
+        : {}),
       intent,
       scope: options.scope ?? "session",
       ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
@@ -1031,6 +1042,9 @@ export class DaemonArchive {
         ...(item.workingSetAnchors === undefined || item.workingSetAnchors.length === 0
           ? {}
           : { workingSetAnchors: [...item.workingSetAnchors] }),
+        ...(item.sessionContextTerms === undefined || item.sessionContextTerms.length === 0
+          ? {}
+          : { sessionContextTerms: [...item.sessionContextTerms] }),
       };
     });
     return {

@@ -299,6 +299,35 @@ test("gather forwards workingSet through to its internal search call and surface
   assert.equal(Object.hasOwn(after, "workingSetAnchors"), false);
 });
 
+// Same wiring regression as the workingSet test above, for sessionContext
+// (ultracode task #32).
+test("gather forwards sessionContext through to its internal search call and surfaces boosted-anchor provenance", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("anchor", "Reusable migration procedure PALLET_INVENTORY_TRACKER anchor.", 100);
+  await admit("step-1", "First continuation detail.", 110);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "Reusable migration procedure anchor",
+    sessionContext: ["PALLET_INVENTORY_TRACKER"],
+    intent: "workflow",
+    limit: 1,
+    before: 0,
+    after: 1,
+    neighborhoodAnchors: 1,
+    maxEvidence: 2,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.deepEqual(gather.evidence.map(({ relation }) => relation), ["anchor", "after"]);
+  const [anchor, after] = gather.evidence;
+  assert.ok(anchor.sessionContextTerms.length > 0);
+  assert.equal(Object.hasOwn(after, "sessionContextTerms"), false);
+});
+
 test("gather surfaces a tombstoned document with no live replacement as an expired-match count, never its content", async (t) => {
   const { store, worker, admit } = await fixture(t);
   await admit("expired-doc", "GATHER_EXPIRED_ANCHOR sensitive prior detail.", 100);

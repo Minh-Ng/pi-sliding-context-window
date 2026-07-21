@@ -24,6 +24,7 @@ import {
   TOC_TOKEN_BUDGET,
   turnTopic,
 } from "./window.js";
+import { deriveSessionContextTerms } from "./session-context.js";
 import {
   measureToolResultTokens,
   resolveToolResultBudget,
@@ -627,7 +628,21 @@ export class EpochWindowSession {
     return this.searchDetailed(query, options).results;
   }
 
+  /**
+   * Explicit search/gather ranking signal only (ultracode task #32): the Pi
+   * adapter's own deterministic digest of this epoch's active message
+   * prefix (see deriveSessionContextTerms), computed with no store round
+   * trip. `sessionContextRanking: false` opts out -- the digest is never
+   * computed and callers below never see a non-empty array to forward, so a
+   * request's bytes stay identical to every pre-task-#32 request.
+   */
+  sessionContextDigest() {
+    if (this.config.sessionContextRanking === false) return [];
+    return deriveSessionContextTerms(this.activeMessages ?? []);
+  }
+
   searchDetailed(query, options = {}) {
+    const sessionContext = options.sessionContext ?? this.sessionContextDigest();
     const searchOptions = {
       sessionId: this.sessionId,
       sessionIds: [...this.sessionIds],
@@ -637,6 +652,7 @@ export class EpochWindowSession {
       relation: options.relation,
       expansionTerms: options.expansionTerms,
       workingSet: options.workingSet,
+      ...(sessionContext.length > 0 ? { sessionContext } : {}),
       ...(Number.isSafeInteger(options.hintBudgetTokens) ? { hintBudgetTokens: options.hintBudgetTokens } : {}),
     };
     if (this.archive.searchDetailed) {
@@ -653,6 +669,7 @@ export class EpochWindowSession {
   }
 
   gatherDetailed(query, options = {}) {
+    const sessionContext = options.sessionContext ?? this.sessionContextDigest();
     const gatherOptions = {
       sessionId: this.sessionId,
       sessionIds: [...this.sessionIds],
@@ -662,6 +679,7 @@ export class EpochWindowSession {
       limit: options.limit ?? this.config.searchResults,
       expansionTerms: options.expansionTerms,
       workingSet: options.workingSet,
+      ...(sessionContext.length > 0 ? { sessionContext } : {}),
       before: options.before,
       after: options.after,
       neighborhoodAnchors: options.neighborhoodAnchors,

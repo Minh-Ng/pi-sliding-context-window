@@ -130,6 +130,15 @@ const tools = [
           items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
           maxItems: 16,
         },
+        // Ranking-boost input only, like workingSet above (ultracode task
+        // #32): terms from the caller's own session/conversation context.
+        // The Pi adapter computes and forwards this automatically; an MCP
+        // caller may pass its own digest here or omit it.
+        sessionContext: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
         scope: {
           type: "string",
           enum: ["session", "project", "all"],
@@ -161,6 +170,13 @@ const tools = [
           maxItems: 16,
         },
         workingSet: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
+          maxItems: 16,
+        },
+        // Same ranking-boost input as context_window_gather's sessionContext
+        // above (ultracode task #32).
+        sessionContext: {
           type: "array",
           items: { type: "string", minLength: 1, maxLength: MAX_STORE_IDENTIFIER_LENGTH },
           maxItems: 16,
@@ -282,6 +298,7 @@ function callTool(name, args = {}) {
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
         workingSet: args.workingSet,
+        sessionContext: args.sessionContext,
         searchEffort: args.searchEffort,
         maxEvidence: 12,
         maxTokens: Math.max(39, totalBudget - 640),
@@ -301,6 +318,7 @@ function callTool(name, args = {}) {
         limit: args.limit ?? config.searchResults,
         expansionTerms: args.expansionTerms,
         workingSet: args.workingSet,
+        sessionContext: args.sessionContext,
         searchEffort: args.searchEffort,
         // The render step below already commits to config.searchResultTokens
         // as the total output budget; hand that same headroom to render-time

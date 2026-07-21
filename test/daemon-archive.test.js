@@ -1116,6 +1116,84 @@ test("searchDetailed forwards the workingSet ranking boost's anchor provenance i
   }
 });
 
+// Same field-forwarding regression as the workingSet test above, for
+// sessionContext (ultracode task #32).
+test("searchDetailed forwards the sessionContext ranking boost's term provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-session-context-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/session-context-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    let forwardedSessionContext;
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.search") return realRequest(operation, payload, options);
+      forwardedSessionContext = payload.sessionContext;
+      return {
+        mode: "lexical",
+        status: "resolved",
+        indexGeneration: 0,
+        expiredMatches: { count: 0, retentionClasses: [] },
+        results: [
+          {
+            documentId: "boosted-doc",
+            version: 1,
+            kind: "note",
+            score: 0.9,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            sessionContextTerms: ["pallet"],
+            snippet: "boosted candidate",
+            locator: "cw1.boosted-doc",
+            source: { sessionId: "session-a" },
+          },
+          {
+            documentId: "untouched-doc",
+            version: 1,
+            kind: "note",
+            score: 0.5,
+            margin: 0.1,
+            matchType: "lexical",
+            historical: false,
+            superseded: false,
+            snippet: "untouched candidate",
+            locator: "cw1.untouched-doc",
+            source: { sessionId: "session-a" },
+          },
+        ],
+      };
+    };
+    const detailed = archive.searchDetailed("anything", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/session-context-wiring",
+      scope: "session",
+      sessionContext: ["PALLET_ROUTE_PLANNER"],
+    });
+    assert.deepEqual(forwardedSessionContext, ["PALLET_ROUTE_PLANNER"]);
+    assert.deepEqual(detailed.results[0].sessionContextTerms, ["pallet"]);
+    assert.equal(
+      Object.hasOwn(detailed.results[1], "sessionContextTerms"),
+      false,
+      "sessionContextTerms is present only on the specific result the boost actually matched",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("searchDetailed and gatherDetailed forward searchEffort only when the caller actually asks for wide", async () => {
   const paths = fixture("context-window-daemon-search-effort-wiring-");
   let archive;
@@ -1418,6 +1496,93 @@ test("gatherDetailed forwards the workingSet ranking boost's anchor provenance i
       Object.hasOwn(gathered.evidence[1], "workingSetAnchors"),
       false,
       "workingSetAnchors is present only on evidence the boost actually matched, matching searchDetailed's forwarding",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+// Same field-forwarding regression as the workingSet gather test above, for
+// sessionContext (ultracode task #32).
+test("gatherDetailed forwards the sessionContext ranking boost's term provenance instead of dropping it", async () => {
+  const paths = fixture("context-window-daemon-gather-session-context-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/gather-session-context-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    const document = {
+      documentId: "boosted-doc",
+      version: 1,
+      sessionId: "session-a",
+      project: "/project/gather-session-context-wiring",
+      kind: "note",
+      createdAt: Date.now(),
+      renderedText: "rendered anchor text",
+      text: "raw anchor text",
+      stalenessLabel: "current",
+      chunks: [{ chunkId: "c1", ordinal: 0, startByte: 0, endByte: 4, text: "text" }],
+      continuationLocators: [],
+      sourceMessages: { status: "available", keys: [], totalKeys: 0, truncated: false },
+    };
+    let forwardedSessionContext;
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.gather") return realRequest(operation, payload, options);
+      forwardedSessionContext = payload.sessionContext;
+      return {
+        status: "resolved",
+        mode: "lexical",
+        intent: payload.intent ?? "auto",
+        anchorCount: 1,
+        candidateCount: 1,
+        returnedTokens: 0,
+        truncated: false,
+        hasMore: false,
+        evidence: [
+          {
+            relation: "anchor",
+            anchorRank: 1,
+            distance: 0,
+            locator: "cw1.boosted-doc",
+            document,
+            score: 0.9,
+            retrievalMode: "lexical",
+            sessionContextTerms: ["pallet"],
+          },
+          {
+            relation: "before",
+            anchorRank: 1,
+            distance: 1,
+            locator: "cw1.untouched-doc",
+            document: { ...document, documentId: "untouched-doc" },
+          },
+        ],
+        expiredMatches: { count: 0, retentionClasses: [] },
+      };
+    };
+    const gathered = archive.gatherDetailed("SESSION_CONTEXT_WIRING_ANCHOR", {
+      sessionId: "session-a",
+      sessionIds: ["session-a"],
+      project: "/project/gather-session-context-wiring",
+      scope: "session",
+      sessionContext: ["PALLET_ROUTE_PLANNER"],
+    });
+    assert.deepEqual(forwardedSessionContext, ["PALLET_ROUTE_PLANNER"]);
+    assert.deepEqual(gathered.evidence[0].sessionContextTerms, ["pallet"]);
+    assert.equal(
+      Object.hasOwn(gathered.evidence[1], "sessionContextTerms"),
+      false,
+      "sessionContextTerms is present only on evidence the boost actually matched, matching searchDetailed's forwarding",
     );
   } finally {
     try { archive?.close(); } catch {}

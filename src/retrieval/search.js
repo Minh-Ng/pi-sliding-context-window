@@ -989,6 +989,128 @@ async function rankByImportance(store, collected, project) {
   });
 }
 
+// Explicit search/gather ranking signal only (ultracode task #32), never
+// consulted by automatic preflight: a caller- or Pi-adapter-supplied digest
+// of session/conversation context terms (request.sessionContext), used
+// exactly like WORKING_SET_BOOST_MULTIPLIER above -- same capped-multiplier
+// discipline as the importance prior and the workingSet boost. Calibrated
+// more conservatively than WORKING_SET_BOOST_MULTIPLIER (1.12, exact.js)
+// because an explicitly-named working set is a deliberate, high-confidence
+// action-anchored signal, while a conversation-prefix digest is inferred and
+// topically noisier. Capping at 1.08 means a lower-ranked candidate must
+// already be within ~7% of the one above it for this signal alone to
+// promote it past it, so a genuinely stronger relevance gap always
+// survives.
+export const SESSION_CONTEXT_BOOST_MULTIPLIER = 1.08;
+// Matches the searchResult/gatheredEvidence schema's sessionContextTerms
+// maxItems bound (store-contract-schema.js).
+const MAX_SESSION_CONTEXT_TERMS_PER_RESULT = 8;
+// Bounded term-normalization budget for the request's own sessionContext
+// array (already capped to 16 entries by the store-contract schema): each
+// entry can tokenize into more than one BM25 term (camelCase/snake_case
+// subtoken splitting, tokenizer.js), so this stays independently bounded
+// rather than growing unboundedly with entry count. tokenizeBm25Query
+// requires maxTerms in [1, 100].
+const MAX_SESSION_CONTEXT_MATCH_TERMS = 32;
+
+function normalizeSessionContextTerms(sessionContext) {
+  if (!Array.isArray(sessionContext) || sessionContext.length === 0) return Object.freeze([]);
+  return tokenizeBm25Query(sessionContext.join(" "), { maxTerms: MAX_SESSION_CONTEXT_MATCH_TERMS });
+}
+
+/**
+ * Batched match pass for applySessionContextBoost below: for each candidate
+ * in the pre-fusion pool, read its own already-indexed term vocabulary
+ * (readDocumentTermVocabulary -- the same sharded per-document metadata RM3
+ * expansion reads from; no retokenization of source text) and intersect it
+ * with the request's normalized sessionContext terms. Mirrors
+ * applyImportancePriors' shape (a shadow pool + one re-fusion pass), not
+ * applyWorkingSetBoost's: this one *does* persist its shadow-adjusted pool
+ * back onto `rawCandidates`, exactly like applyImportancePriors, so that
+ * applyWorkingSetBoost's own re-fusion (which runs after this and reads
+ * collected.rawCandidates) genuinely composes with this bounded boost
+ * instead of silently discarding it -- the same compounding hazard
+ * applyImportancePriors' own docblock documents. If nothing in the pool
+ * matches, `rawCandidates` in the return value is left undefined so the
+ * caller can skip persisting a no-op shadow copy.
+ */
+async function matchSessionContextTerms(view, collected, project, contextTermSet) {
+  const matchedByIdentity = new Map();
+  let matchedAny = false;
+  const rawPool = collected.rawCandidates ?? collected.candidates;
+  for (const candidate of rawPool) {
+    const identity = candidateIdentity(candidate);
+    if (matchedByIdentity.has(identity)) continue;
+    const vocabulary = await readDocumentTermVocabulary(view, {
+      project,
+      documentId: candidate.documentId,
+      version: candidate.version,
+    });
+    const matched = Object.freeze(vocabulary.filter((term) => contextTermSet.has(term)));
+    matchedByIdentity.set(identity, matched);
+    if (matched.length > 0) matchedAny = true;
+  }
+  if (!matchedAny) return { ranked: collected.candidates, rawCandidates: undefined };
+  const boostedPool = rawPool.map((candidate) => {
+    const identity = candidateIdentity(candidate);
+    const matched = matchedByIdentity.get(identity);
+    return matched.length > 0
+      ? { ...candidate, normalizedScore: candidate.normalizedScore * SESSION_CONTEXT_BOOST_MULTIPLIER }
+      : candidate;
+  });
+  const refused = fuseCandidates(boostedPool, boostedPool.length);
+  const rankingScoreByIdentity = new Map(
+    refused.map((candidate) => [candidateIdentity(candidate), candidate.fusionScore]),
+  );
+  const ranked = collected.candidates.map((candidate) => {
+    const identity = candidateIdentity(candidate);
+    const rankingScore = rankingScoreByIdentity.get(identity);
+    const matched = matchedByIdentity.get(identity);
+    return {
+      ...candidate,
+      ...(rankingScore === undefined ? {} : { rankingScore }),
+      ...(matched && matched.length > 0
+        ? { sessionContextTerms: matched.slice(0, MAX_SESSION_CONTEXT_TERMS_PER_RESULT) }
+        : {}),
+    };
+  });
+  return { ranked: ranked.sort(compareRankedCandidates), rawCandidates: boostedPool };
+}
+
+/**
+ * Boost candidates whose own indexed term vocabulary intersects the
+ * request's sessionContext digest (ultracode task #32): a deterministic,
+ * caller- or Pi-adapter-supplied summary of recent conversation topic terms.
+ * Query-independent secondary ranking signal, same as the importance prior
+ * and the workingSet boost below: never a filter and never a source of new
+ * candidates -- it can only reorder documents the primary query already
+ * fetched into `collected.rawCandidates`/`collected.candidates`, so a
+ * document matching only sessionContext terms and not the query itself never
+ * enters results. Runs after the importance prior and before the workingSet
+ * boost (see matchSessionContextTerms above for why persisting its own
+ * shadow-adjusted rawCandidates forward, rather than leaving them
+ * untouched like applyWorkingSetBoost, is what lets the two compose). Absent
+ * on automatic preflight: preflight's own request schema carries no
+ * `sessionContext` field, so this resolves to a no terms/no-op branch
+ * with no store access, and frozen hints stay byte-identical. Exported for
+ * direct testing against a hand-built candidate pool, the same way
+ * fuseCandidates and applyWorkingSetBoost are.
+ */
+export async function applySessionContextBoost(store, collected, request) {
+  const contextTerms = normalizeSessionContextTerms(request.sessionContext);
+  if (contextTerms.length === 0) return collected;
+  const contextTermSet = new Set(contextTerms);
+  const { ranked, rawCandidates } = await store.snapshot((view) => (
+    matchSessionContextTerms(view, collected, request.project, contextTermSet)
+  ));
+  if (rawCandidates === undefined) return collected;
+  return Object.freeze({
+    ...collected,
+    candidates: Object.freeze(preserveCandidateMargins(ranked)),
+    rawCandidates: Object.freeze(rawCandidates),
+  });
+}
+
 /**
  * Boost candidates whose exact-anchor postings intersect the request's
  * workingSet (files/symbols/identifiers the agent is actively acting on).
@@ -1218,6 +1340,11 @@ async function locateCandidates(store, collected, request, options, secret) {
       // ranking boost above: present only when this specific result's own
       // exact-anchor postings actually intersected the request's workingSet.
       workingSetAnchors: candidate.workingSetAnchors ?? [],
+      // Same provenance pattern, for applySessionContextBoost's ranking
+      // boost (ultracode task #32): present only when this specific
+      // result's own indexed term vocabulary actually intersected the
+      // request's sessionContext digest.
+      sessionContextTerms: candidate.sessionContextTerms ?? [],
       locator,
       source: {
         sessionId: candidate.source.sessionId,
@@ -1255,12 +1382,20 @@ export async function searchArchive(store, request, options = {}) {
   const ranked = resolvedOptions.applyImportancePrior === true
     ? await rankByImportance(store, decayed, normalized.project)
     : decayed;
+  // Session-context ranking boost, explicit search/gather only (ultracode
+  // task #32): sessionContext is an optional field on the store.search/
+  // store.gather request schema that automatic preflight's store.preflight
+  // request never carries, so this is a no-op (single tokenization check, no
+  // store access) whenever it is absent -- frozen hints stay byte-identical.
+  // Runs before the workingSet boost so the two compose (see
+  // matchSessionContextTerms' docblock).
+  const contextRanked = await applySessionContextBoost(store, ranked, normalized);
   // Action-anchored ranking boost, explicit search/gather only: workingSet is
   // an optional field on the store.search/store.gather request schema that
   // automatic preflight's store.preflight request never carries, so this is a
   // no-op (single classification check, no store access) whenever it is
   // absent -- frozen hints stay byte-identical.
-  const workingSetRanked = await applyWorkingSetBoost(store, ranked, normalized);
+  const workingSetRanked = await applyWorkingSetBoost(store, contextRanked, normalized);
   // Cross-encoder rerank of the lexical/semantic tier, explicit search/gather
   // only (resolvedOptions.reranker, set by the daemon's store.search/gather
   // operations -- see rerankTierOne above). Automatic preflight never sets

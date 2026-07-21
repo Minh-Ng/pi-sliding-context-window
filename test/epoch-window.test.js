@@ -719,3 +719,105 @@ test("adaptive rotation derives limits from each model's Pi input budget", () =>
     /no usable model input budget/u,
   );
 });
+
+// sessionContext (ultracode task #32): the Pi adapter's own automatic digest
+// of the active epoch prefix, forwarded into searchDetailed/gatherDetailed's
+// own options object. These record the exact options object handed to the
+// archive client, the same way the sessionIds-lineage tests above record
+// searchOptions off a spied archive.search.
+function contextRichMessages() {
+  // WIDGET_CALIBRATION_ENGINE recurs across every turn (local document
+  // frequency 3/3, so deriveSessionContextTerms' local-IDF proxy still
+  // ranks it, just not above a term concentrated in one group); it is enough
+  // to prove a non-empty digest without depending on the exact ranking.
+  return [
+    user("Investigate the WIDGET_CALIBRATION_ENGINE regression.", 1),
+    assistant("Looking into WIDGET_CALIBRATION_ENGINE now.", 2),
+    user("Any update on WIDGET_CALIBRATION_ENGINE?", 3),
+    assistant("Still narrowing down WIDGET_CALIBRATION_ENGINE.", 4),
+  ];
+}
+
+test("searchDetailed forwards an automatically-computed sessionContext digest from the active epoch prefix", () => {
+  const archive = memoryArchive();
+  let searchOptions;
+  archive.searchDetailed = (_query, options) => {
+    searchOptions = options;
+    return { mode: "lexical", status: "not-found", results: [] };
+  };
+  const session = new EpochWindowSession({ archive, config, sessionId: "session-1", project: "/project" });
+  session.process(contextRichMessages(), { contextWindow: 200_000 });
+
+  session.searchDetailed("some query");
+  assert.ok(Array.isArray(searchOptions.sessionContext));
+  assert.ok(searchOptions.sessionContext.length > 0);
+  assert.ok(searchOptions.sessionContext.some((term) => term.includes("calibr")));
+});
+
+test("gatherDetailed forwards the same automatically-computed sessionContext digest as searchDetailed", () => {
+  const archive = memoryArchive();
+  let gatherOptions;
+  archive.gatherDetailed = (_query, options) => {
+    gatherOptions = options;
+    return { status: "not-found", mode: "lexical", intent: "auto", anchorCount: 0, candidateCount: 0, returnedTokens: 0, truncated: false, hasMore: false, evidence: [] };
+  };
+  const session = new EpochWindowSession({ archive, config, sessionId: "session-1", project: "/project" });
+  session.process(contextRichMessages(), { contextWindow: 200_000 });
+
+  session.gatherDetailed("some query");
+  assert.ok(Array.isArray(gatherOptions.sessionContext));
+  assert.ok(gatherOptions.sessionContext.length > 0);
+});
+
+test("an explicit sessionContext option overrides the automatic digest", () => {
+  const archive = memoryArchive();
+  let searchOptions;
+  archive.searchDetailed = (_query, options) => {
+    searchOptions = options;
+    return { mode: "lexical", status: "not-found", results: [] };
+  };
+  const session = new EpochWindowSession({ archive, config, sessionId: "session-1", project: "/project" });
+  session.process(contextRichMessages(), { contextWindow: 200_000 });
+
+  session.searchDetailed("some query", { sessionContext: ["explicit-term"] });
+  assert.deepEqual(searchOptions.sessionContext, ["explicit-term"]);
+});
+
+test("sessionContextRanking: false opts out -- the digest is never computed and the field is never sent", () => {
+  const archive = memoryArchive();
+  let searchOptions;
+  let gatherOptions;
+  archive.searchDetailed = (_query, options) => {
+    searchOptions = options;
+    return { mode: "lexical", status: "not-found", results: [] };
+  };
+  archive.gatherDetailed = (_query, options) => {
+    gatherOptions = options;
+    return { status: "not-found", mode: "lexical", intent: "auto", anchorCount: 0, candidateCount: 0, returnedTokens: 0, truncated: false, hasMore: false, evidence: [] };
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, sessionContextRanking: false },
+    sessionId: "session-1",
+    project: "/project",
+  });
+  session.process(contextRichMessages(), { contextWindow: 200_000 });
+
+  session.searchDetailed("some query");
+  assert.equal("sessionContext" in searchOptions, false);
+  session.gatherDetailed("some query");
+  assert.equal("sessionContext" in gatherOptions, false);
+});
+
+test("sessionContextDigest is empty before the first process() call, with no crash", () => {
+  const archive = memoryArchive();
+  let searchOptions;
+  archive.searchDetailed = (_query, options) => {
+    searchOptions = options;
+    return { mode: "lexical", status: "not-found", results: [] };
+  };
+  const session = new EpochWindowSession({ archive, config, sessionId: "session-1", project: "/project" });
+
+  session.searchDetailed("some query");
+  assert.equal("sessionContext" in searchOptions, false);
+});

@@ -406,6 +406,16 @@ const searchRequest = object({
   // SEARCH_EFFORT_POLICY. It moves existing thresholds; it adds no new
   // retrieval machinery. Absent entirely on the automatic preflight path.
   searchEffort: enumeration(["normal", "wide"]),
+  // Optional (not in the required list): a deterministic digest of session
+  // context terms (ultracode task #32) -- the Pi adapter's own top-K
+  // high-IDF terms extracted from the recent conversation prefix
+  // (src/session/session-context.js), or an MCP caller's own equivalent.
+  // Ranking-boost input only (see applySessionContextBoost in
+  // src/retrieval/search.js) -- never a filter, never widens what a request
+  // can retrieve: a document matching only these terms and not the query
+  // itself never enters results. Absent entirely on the automatic preflight
+  // path.
+  sessionContext: array(identifier, { maxItems: 16 }),
 }, ["query", "relation", "scope", "limit", "excludeVisibleSourceKeys", "hintBudgetTokens"]);
 
 const searchResult = object({
@@ -456,6 +466,17 @@ const searchResult = object({
   // independently intersect one document, so this is truncated to 8 wherever
   // it is produced (MAX_WORKING_SET_ANCHORS_PER_RESULT, exact.js).
   workingSetAnchors: array(identifier, { maxItems: 8 }),
+  // Same expandedTerms/workingSetAnchors provenance pattern above, for the
+  // request's sessionContext ranking boost (ultracode task #32; see
+  // applySessionContextBoost in src/retrieval/search.js): the sessionContext
+  // term(s) this specific document's own indexed vocabulary actually
+  // matched, present only when this result was actually boosted -- empty
+  // whenever sessionContext is omitted or matched a different document.
+  // Bounded independently of the request's sessionContext maxItems (16) the
+  // same way workingSetAnchors is bounded independently of workingSet's:
+  // MAX_SESSION_CONTEXT_TERMS_PER_RESULT (search.js) truncates to this bound
+  // wherever it is produced.
+  sessionContextTerms: array(identifier, { maxItems: 8 }),
   locator: identifier,
   source: SOURCE_REFERENCE_SCHEMA,
 }, [
@@ -601,6 +622,11 @@ const gatheredEvidence = object({
   // (see that field's comment), carried onto anchor evidence only -- the same
   // restriction as score/retrievalMode/reranked above.
   workingSetAnchors: array(identifier, { maxItems: 8 }),
+  // Same sessionContext ranking-boost provenance as store.search's
+  // searchResult (ultracode task #32; see that field's comment), carried
+  // onto anchor evidence only -- the same restriction as
+  // score/retrievalMode/reranked/workingSetAnchors above.
+  sessionContextTerms: array(identifier, { maxItems: 8 }),
 }, ["relation", "anchorRank", "distance", "locator", "document"]);
 
 const gatherResponse = object({
@@ -823,6 +849,11 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       // (optional, not required): forwarded into gather's internal search
       // call so its anchor search gets the same widened gates.
       searchEffort: enumeration(["normal", "wide"]),
+      // Same sessionContext ranking-boost input as store.search's
+      // sessionContext above (ultracode task #32; optional, not required):
+      // forwarded into gather's internal search call so its anchor evidence
+      // gets the same boost.
+      sessionContext: array(identifier, { maxItems: 16 }),
     }, [
       "query",
       "intent",

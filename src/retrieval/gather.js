@@ -129,6 +129,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     query: request.query,
     ...(request.expansionTerms === undefined ? {} : { expansionTerms: request.expansionTerms }),
     ...(request.workingSet === undefined ? {} : { workingSet: request.workingSet }),
+    ...(request.sessionContext === undefined ? {} : { sessionContext: request.sessionContext }),
     relation: null,
     semanticPolicy: "always",
     scope: request.scope,
@@ -262,6 +263,9 @@ export async function gatherArchive(store, rawRequest, options = {}) {
           ...(item.candidate.reranked === true ? { reranked: true } : {}),
           ...(item.candidate.workingSetAnchors?.length > 0
             ? { workingSetAnchors: [...item.candidate.workingSetAnchors] }
+            : {}),
+          ...(item.candidate.sessionContextTerms?.length > 0
+            ? { sessionContextTerms: [...item.candidate.sessionContextTerms] }
             : {}),
         }
         : {}),

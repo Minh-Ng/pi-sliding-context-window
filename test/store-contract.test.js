@@ -871,6 +871,48 @@ test("workingSet is an optional ranking-boost field on store.search/store.gather
   assert.deepEqual(boostedAnchorEvidence.evidence[0].workingSetAnchors, ["REAP_DRAIN"]);
 });
 
+// Same optional-field contract shape as workingSet above, for sessionContext
+// (ultracode task #32).
+test("sessionContext is an optional ranking-boost field on store.search/store.gather requests and results", () => {
+  const searchWithSessionContext = assertStoreRequest("store.search", {
+    ...requests["store.search"],
+    sessionContext: ["pallet", "rout", "planner"],
+  });
+  assert.deepEqual(searchWithSessionContext.sessionContext, ["pallet", "rout", "planner"]);
+  // Absent entirely remains valid: sessionContext is optional, not required.
+  assertStoreRequest("store.search", requests["store.search"]);
+
+  const gatherWithSessionContext = assertStoreRequest("store.gather", {
+    ...requests["store.gather"],
+    sessionContext: ["pallet"],
+  });
+  assert.deepEqual(gatherWithSessionContext.sessionContext, ["pallet"]);
+
+  for (const operation of ["store.search", "store.gather"]) {
+    expectContractError(
+      () => assertStoreRequest(operation, {
+        ...requests[operation],
+        sessionContext: Array.from({ length: 17 }, (_, index) => `term-${index}`),
+      }),
+      { code: "INVALID_REQUEST", path: "$.payload.sessionContext" },
+    );
+  }
+
+  const boostedResult = assertStoreResult("store.search", {
+    ...results["store.search"],
+    results: [{ ...results["store.search"].results[0], sessionContextTerms: ["pallet"] }],
+  });
+  assert.deepEqual(boostedResult.results[0].sessionContextTerms, ["pallet"]);
+  // Absent entirely remains valid: most results are never boosted.
+  assertStoreResult("store.search", results["store.search"]);
+
+  const boostedAnchorEvidence = assertStoreResult("store.gather", {
+    ...results["store.gather"],
+    evidence: [{ ...results["store.gather"].evidence[0], sessionContextTerms: ["pallet"] }],
+  });
+  assert.deepEqual(boostedAnchorEvidence.evidence[0].sessionContextTerms, ["pallet"]);
+});
+
 test("searchEffort is an optional caller-uncertainty field on store.search/store.gather requests, defaulting to normal", () => {
   for (const operation of ["store.search", "store.gather"]) {
     // Absent entirely remains valid: searchEffort is optional, not required,

@@ -20,12 +20,14 @@ import { readLease } from "../src/retrieval/leases.js";
 import { recallArchive } from "../src/retrieval/recall.js";
 import { preflightArchive } from "../src/retrieval/preflight.js";
 import {
+  applySessionContextBoost,
   applyWorkingSetBoost,
   findStoredWindowForByteRange,
   fuseCandidates,
   normalizeModeScore,
   resolveCandidateLimit,
   searchArchive,
+  SESSION_CONTEXT_BOOST_MULTIPLIER,
 } from "../src/retrieval/search.js";
 import { normalizeBm25Term } from "../src/rocksdb/index/tokenizer.js";
 import { LocalReranker } from "../src/semantic/reranker.js";
@@ -265,6 +267,7 @@ function searchRequest(query, overrides = {}) {
     hintBudgetTokens: overrides.hintBudgetTokens ?? 160,
     expansionPolicy: overrides.expansionPolicy,
     workingSet: overrides.workingSet,
+    sessionContext: overrides.sessionContext,
     searchEffort: overrides.searchEffort,
   };
 }
@@ -548,6 +551,266 @@ test("end-to-end explicit search caps workingSetAnchors provenance at the schema
   // provenance array is genuinely truncated (not merely under a small
   // natural count) to the schema's maxItems: 8 bound.
   assert.equal(boosted.workingSetAnchors.length, 8);
+});
+
+// applySessionContextBoost (ultracode task #32) is exercised the same way as
+// applyWorkingSetBoost above: the expected outcome is derived by
+// independently re-running the same real fuseCandidates the implementation
+// itself must use over a hand-boosted shadow pool, not a hand-picked
+// rankingScore literal.
+test("session-context boost promotes a near-tied candidate via real RRF re-fusion in normalizedScore space", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-promote");
+  await admit(store, "target", "Discusses PALLET_ROUTE_PLANNER coordination at length.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+
+  const rawCandidates = [
+    tierOneCandidate("rank1", "lexical", 0.95, { version: 1 }),
+    tierOneCandidate("rank2", "lexical", 0.85, { version: 1 }),
+    tierOneCandidate("rank3", "lexical", 0.55, { version: 1 }),
+    // Pre-boost normalizedScore close enough below rank3's that the bounded
+    // 1.08x multiplier alone (0.53 * 1.08 = 0.5724) closes the gap.
+    tierOneCandidate("target", "lexical", 0.53, { version: 1 }),
+    tierOneCandidate("rank5", "lexical", 0.30, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    sessionContext: ["PALLET_ROUTE_PLANNER"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  const boosted = await applySessionContextBoost(store, collected, request);
+  assert.deepEqual(
+    boosted.candidates.map(({ documentId }) => documentId),
+    ["rank1", "rank2", "target", "rank3", "rank5"],
+  );
+  const boostedTarget = boosted.candidates.find(({ documentId }) => documentId === "target");
+  // The document's own indexed vocabulary intersects the compound term
+  // "pallet_route_planner" and its camelCase/snake_case subterms
+  // "pallet"/"rout"/"planner" (tokenizer.js splits and indexes both) --
+  // vocabulary matching, not exact-anchor postings. readDocumentTermVocabulary
+  // returns the vocabulary sorted, hence the alphabetical order here.
+  assert.deepEqual(
+    boostedTarget.sessionContextTerms,
+    ["pallet", "pallet_route_planner", "planner", "rout"],
+  );
+
+  const boostedRawCandidates = rawCandidates.map((candidate) => (
+    candidate.documentId === "target"
+      ? { ...candidate, normalizedScore: candidate.normalizedScore * SESSION_CONTEXT_BOOST_MULTIPLIER }
+      : candidate
+  ));
+  const expected = fuseCandidates(boostedRawCandidates, boostedRawCandidates.length);
+  for (const documentId of ["rank1", "rank2", "rank3", "target", "rank5"]) {
+    const actual = boosted.candidates.find((candidate) => candidate.documentId === documentId);
+    const reference = expected.find((candidate) => candidate.documentId === documentId);
+    assert.equal(actual.rankingScore, reference.fusionScore);
+  }
+  const original = fuseCandidates(rawCandidates, rawCandidates.length);
+  for (const documentId of ["rank1", "rank2", "rank5"]) {
+    const before = original.find((candidate) => candidate.documentId === documentId);
+    const after = boosted.candidates.find((candidate) => candidate.documentId === documentId);
+    assert.equal(after.rankingScore, before.fusionScore);
+    assert.equal(after.sessionContextTerms, undefined);
+  }
+});
+
+test("session-context boost never overrules a strong relevance gap compressed by cross-mode RRF corroboration", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-counter-case");
+  await admit(store, "weak", "Mentions WEAK_ANCHOR_SYMBOL only in passing.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+
+  const rawCandidates = [
+    tierOneCandidate("winner", "lexical", 0.99, { version: 1 }),
+    tierOneCandidate("winner", "semantic", 0.99, { version: 1 }),
+    tierOneCandidate("strong", "lexical", 0.90, { version: 1 }),
+    tierOneCandidate("weak", "lexical", 0.68, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    sessionContext: ["WEAK_ANCHOR_SYMBOL"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  const boosted = await applySessionContextBoost(store, collected, request);
+  assert.deepEqual(
+    boosted.candidates.map(({ documentId }) => documentId),
+    ["winner", "strong", "weak"],
+  );
+  const boostedWeak = boosted.candidates.find(({ documentId }) => documentId === "weak");
+  assert.ok(boostedWeak.sessionContextTerms.length > 0);
+  const original = fuseCandidates(rawCandidates, rawCandidates.length);
+  const winner = boosted.candidates.find(({ documentId }) => documentId === "winner");
+  const strong = boosted.candidates.find(({ documentId }) => documentId === "strong");
+  assert.equal(winner.rankingScore, original.find(({ documentId }) => documentId === "winner").fusionScore);
+  assert.equal(strong.rankingScore, original.find(({ documentId }) => documentId === "strong").fusionScore);
+  assert.equal(winner.sessionContextTerms, undefined);
+  assert.equal(strong.sessionContextTerms, undefined);
+  assert.ok(boostedWeak.rankingScore > original.find(({ documentId }) => documentId === "weak").fusionScore);
+  assert.ok(boostedWeak.rankingScore < strong.rankingScore);
+});
+
+test("session-context boost is a no-op when the field is absent, empty, or matches no candidate document's vocabulary", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-noop");
+  await admit(store, "target", "Discusses PALLET_ROUTE_PLANNER coordination at length.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+  const collected = {
+    generation,
+    candidates: [tierOneCandidate("target", "lexical", 0.19, { version: 1, rankingScore: 0.68 })],
+  };
+  const baseRequest = {
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+
+  assert.equal(await applySessionContextBoost(store, collected, baseRequest), collected);
+  assert.equal(
+    await applySessionContextBoost(store, collected, { ...baseRequest, sessionContext: [] }),
+    collected,
+  );
+  assert.equal(
+    await applySessionContextBoost(store, collected, { ...baseRequest, sessionContext: ["NO_SUCH_TERM_ANYWHERE"] }),
+    collected,
+  );
+});
+
+test("end-to-end explicit search accepts sessionContext and surfaces boosted-result provenance without admitting a query-irrelevant document", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-e2e");
+  await admit(store, "on-topic", "General gateway routing overview mentions batching briefly.", { createdAt: 100 });
+  await admit(
+    store,
+    "on-topic-context",
+    "General gateway routing overview mentions batching briefly. PALLET_INVENTORY_TRACKER lives here.",
+    { createdAt: 200 },
+  );
+  // Matches the sessionContext digest but not the search query at all: this
+  // must never enter results, however strongly it matches sessionContext --
+  // sessionContext is a rerank-only signal over the query's own candidates,
+  // never a second retrieval path. Deliberately shares no BM25 term (not even
+  // a camelCase/snake_case subterm) with the query "gateway routing batching
+  // overview", so any appearance in results could only come from the
+  // sessionContext digest itself creating a second retrieval path, not from
+  // incidental lexical overlap.
+  await admit(
+    store,
+    "context-only-irrelevant",
+    "PALLET_INVENTORY_TRACKER logistics scheduling has nothing to do with fruit desserts.",
+    { createdAt: 300 },
+  );
+  await worker.drain();
+  const response = await searchArchive(store, withoutUndefined(searchRequest("gateway routing batching overview", {
+    limit: 5,
+    sessionContext: ["PALLET_INVENTORY_TRACKER"],
+  })), { now: 1_000, applyImportancePrior: true, recencyDecay: true });
+  assert.equal(response.status, "resolved");
+  assert.ok(!response.results.some(({ documentId }) => documentId === "context-only-irrelevant"));
+  const boosted = response.results.find(({ documentId }) => documentId === "on-topic-context");
+  assert.ok(boosted, "the context-carrying document must still be a returned result");
+  assert.ok(boosted.sessionContextTerms.length > 0);
+  for (const result of response.results) {
+    if (result.documentId !== "on-topic-context") {
+      assert.deepEqual(result.sessionContextTerms, []);
+    }
+  }
+});
+
+test("session-context boost is deterministic for a fixed candidate pool and sessionContext digest", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-determinism");
+  await admit(store, "target", "Discusses PALLET_ROUTE_PLANNER coordination at length.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+  const rawCandidates = [
+    tierOneCandidate("target", "lexical", 0.5, { version: 1 }),
+    tierOneCandidate("other", "lexical", 0.4, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    sessionContext: ["PALLET_ROUTE_PLANNER"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+  const first = await applySessionContextBoost(store, collected, request);
+  const second = await applySessionContextBoost(store, collected, request);
+  assert.deepEqual(first.candidates, second.candidates);
+});
+
+// The two boosts (workingSet, task #31; sessionContext, task #32) must
+// genuinely compose: matchSessionContextTerms persists its own
+// shadow-adjusted rawCandidates forward (unlike applyWorkingSetBoost, which
+// deliberately does not), so applyWorkingSetBoost's own re-fusion -- running
+// after this in the real searchArchive pipeline -- sees the sessionContext
+// multiplier already baked in rather than silently discarding it.
+test("session-context boost composes with a later workingSet boost instead of the second discarding the first's effect", async (t) => {
+  const { store, worker } = await fixture(t, "search-session-context-compose");
+  await admit(store, "both", "Discusses PALLET_ROUTE_PLANNER and GATEWAY_ANCHOR together.");
+  await admit(store, "context-only", "Discusses PALLET_ROUTE_PLANNER alone.");
+  await worker.drain();
+  const generation = await publishedGenerationOf(store);
+  const rawCandidates = [
+    tierOneCandidate("both", "lexical", 0.5, { version: 1 }),
+    tierOneCandidate("context-only", "lexical", 0.5, { version: 1 }),
+  ];
+  const collected = {
+    generation,
+    rawCandidates,
+    candidates: fuseCandidates(rawCandidates, rawCandidates.length),
+  };
+  const request = {
+    sessionContext: ["PALLET_ROUTE_PLANNER"],
+    workingSet: ["GATEWAY_ANCHOR"],
+    project: "/workspace/search",
+    effectiveScope: "session",
+    sessionIds: ["session-main"],
+    excludeVisibleSourceKeys: [],
+  };
+  const contextRanked = await applySessionContextBoost(store, collected, request);
+  const bothRanked = await applyWorkingSetBoost(store, contextRanked, request);
+  const both = bothRanked.candidates.find(({ documentId }) => documentId === "both");
+
+  // Ground truth for genuine composition: both multipliers baked into "both"'s
+  // shadow normalizedScore before the one real re-fusion pass. Order alone
+  // (both > context-only) cannot distinguish this from a buggy
+  // implementation that silently discards the sessionContext boost before
+  // workingSet's own re-fusion, since "context-only" never gets a workingSet
+  // multiplier either way -- only the exact fused number can, so this checks
+  // that number against both the correct and the discarding reference.
+  const composedReference = fuseCandidates(rawCandidates.map((candidate) => ({
+    ...candidate,
+    normalizedScore: candidate.normalizedScore * SESSION_CONTEXT_BOOST_MULTIPLIER
+      * (candidate.documentId === "both" ? WORKING_SET_BOOST_MULTIPLIER : 1),
+  })), rawCandidates.length);
+  const discardedReference = fuseCandidates(rawCandidates.map((candidate) => ({
+    ...candidate,
+    normalizedScore: candidate.normalizedScore * (candidate.documentId === "both" ? WORKING_SET_BOOST_MULTIPLIER : 1),
+  })), rawCandidates.length);
+  const composedScore = composedReference.find(({ documentId }) => documentId === "both").fusionScore;
+  const discardedScore = discardedReference.find(({ documentId }) => documentId === "both").fusionScore;
+  assert.notEqual(composedScore, discardedScore, "the two references must differ for this check to be meaningful");
+  assert.equal(both.rankingScore, composedScore);
 });
 
 test("render-time excerpt widening expands an exact match symmetrically within its evidence budget", async (t) => {

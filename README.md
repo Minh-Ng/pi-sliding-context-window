@@ -124,6 +124,8 @@ Installing only warms the cache; it does not switch the daemon to the new model.
 
 The small and quality tiers above are unvalidated in this environment: their dimensions and pooling are sourced from each model's published card, not measured by running the model here (no network access to download weights during that change). Confirm the installer's reported `dimensions` for a candidate before relying on it, and expect the quality tier's retrieval quality to fall short of its published benchmarks until per-model instruction/query prompting (recommended by the Qwen3/Jina model cards, not implemented here) is added.
 
+The non-default tiers are an experimental pick by decision, not a pending default change: the shipped default stays `all-MiniLM-L6-v2` because a larger resident model costs every install RAM and a tier switch triggers a full background re-embed, while the semantic gate thresholds are calibrated against the default model's score distribution. Treat an upgraded tier as an experiment to validate on your own archive (`eval:retrieval`, and the relevance-feedback stats once populated) rather than an endorsed configuration.
+
 Semantic retrieval is opt-out. On a machine where its additional memory, CPU, or disk use is undesirable, disable it explicitly:
 
 ```json

@@ -283,6 +283,47 @@ test("recall failure omits the dependents notice when the target is expired or n
   assert.equal(withoutDependents.includes("later document"), false);
 });
 
+test("recall failure names the chain position and predecessor/successor for a superseded target without exposing content", () => {
+  const failure = formatRecallFailure({
+    status: "superseded",
+    documentId: "target-doc",
+    version: 1,
+    reason: "Explicitly replaced by a later decision.",
+    chain: {
+      position: 1,
+      totalVersions: 2,
+      successor: { documentId: "replacement-doc", version: 1, createdAt: 200 },
+    },
+  }, 500);
+  assert.match(failure, /Version 1 of 2 in its supersession chain\./);
+  assert.match(failure, /Successor: replacement-doc \(1970-01-01T00:00:00\.200Z\)\./);
+  assert.equal(failure.includes("Predecessor"), false);
+
+  const withPredecessor = formatRecallFailure({
+    status: "superseded",
+    documentId: "target-doc",
+    version: 2,
+    reason: "Explicitly replaced.",
+    chain: {
+      position: 2,
+      totalVersions: 2,
+      predecessor: { documentId: "root-doc", version: 1, createdAt: 100 },
+    },
+  }, 500);
+  assert.match(withPredecessor, /Predecessor: root-doc \(1970-01-01T00:00:00\.100Z\)\./);
+  assert.equal(withPredecessor.includes("Successor"), false);
+});
+
+test("recall failure omits the chain notice when the target is not part of a chain", () => {
+  const withoutChain = formatRecallFailure({
+    status: "superseded",
+    documentId: "target-doc",
+    version: 1,
+    reason: "Explicitly replaced.",
+  }, 500);
+  assert.equal(withoutChain.includes("supersession chain"), false);
+});
+
 test("gather omits the expired-match notice when nothing expired", () => {
   const gather = {
     status: "not-found",

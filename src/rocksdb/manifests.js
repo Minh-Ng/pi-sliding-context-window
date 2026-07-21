@@ -21,6 +21,14 @@ export const MANIFEST_FORMAT_VERSION = 1;
 export const MANIFEST_KEYSPACE = "manifest";
 export const DOCUMENT_HISTORY_FORMAT_VERSION = 1;
 export const AUXILIARY_MANIFEST_REFERENCE_VERSION = 1;
+// Depth bound for walking a stored explicit-supersession chain (the
+// document.supersedes pointer chain admissionExplicitSupersession follows
+// backward below to reject a cycle before commit). Exported so a read-time
+// walk of the same chain -- e.g. the recall-time chain-position view in
+// src/rocksdb/supersession-chain.js -- reuses this exact write-time cycle
+// bound rather than inventing an independent one; a genuinely-written chain
+// can never exceed it.
+export const MAX_EXPLICIT_SUPERSESSION_CHAIN_DEPTH = 4_096;
 
 export class ManifestIntegrityError extends Error {
   constructor(message, details = {}) {
@@ -1096,7 +1104,7 @@ async function admissionExplicitSupersession(store, request) {
   const visited = new Set();
   let cursor = targetManifest;
   for (let depth = 0; cursor?.supersedes !== undefined; depth += 1) {
-    if (depth >= 4_096) {
+    if (depth >= MAX_EXPLICIT_SUPERSESSION_CHAIN_DEPTH) {
       throw semanticAdmissionError("CONFLICT", "Explicit supersession chain exceeds the validation bound.");
     }
     const predecessor = exactTarget(cursor.supersedes, "Stored explicit supersession");

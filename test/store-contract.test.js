@@ -1182,3 +1182,68 @@ test("unresolved recall never resolves an expired locator to a new version", () 
     { code: "INVALID_RESPONSE", path: "$.result" },
   );
 });
+
+const minimalResolvedRecall = Object.freeze({
+  status: "resolved",
+  documentId: "chain-doc",
+  version: 2,
+  kind: "manual",
+  sessionId: "chain-session",
+  project: "/chain-project",
+  createdAt: 200,
+  historical: true,
+  stalenessLabel: "Archived historical evidence; verify current state.",
+  sourceMessages: { status: "documented-absence", reason: "not retained" },
+  chunks: [{ chunkId: "chain-chunk", ordinal: 0, startByte: 0, endByte: 4, text: "text" }],
+  text: "text",
+  continuationLocators: [],
+  maxTokens: 1_000,
+  renderedText: "text",
+  returnedTokens: 39,
+});
+
+test("resolved and unresolved recall accept an optional chain-position summary (ultracode task #38)", () => {
+  assert.equal(assertStoreResult("store.recall", minimalResolvedRecall), minimalResolvedRecall);
+
+  const withChain = {
+    ...minimalResolvedRecall,
+    chain: {
+      position: 2,
+      totalVersions: 3,
+      predecessor: { documentId: "chain-doc-v1", version: 1, createdAt: 100 },
+      successor: { documentId: "chain-doc-v3", version: 1, createdAt: 300 },
+    },
+  };
+  assert.equal(assertStoreResult("store.recall", withChain), withChain);
+
+  const unresolvedWithChain = {
+    status: "superseded",
+    documentId: "chain-doc",
+    version: 1,
+    reason: "Explicitly replaced.",
+    chain: { position: 1, totalVersions: 2, successor: { documentId: "chain-doc-v2", version: 1, createdAt: 200 } },
+  };
+  assert.equal(assertStoreResult("store.recall", unresolvedWithChain), unresolvedWithChain);
+
+  expectContractError(
+    () => assertStoreResult("store.recall", {
+      ...minimalResolvedRecall,
+      chain: { totalVersions: 3, predecessor: { documentId: "chain-doc-v1", version: 1, createdAt: 100 } },
+    }),
+    { code: "INVALID_RESPONSE", path: "$.result" },
+  );
+  expectContractError(
+    () => assertStoreResult("store.recall", {
+      ...minimalResolvedRecall,
+      chain: { position: 2, totalVersions: 3, predecessor: { documentId: "chain-doc-v1" } },
+    }),
+    { code: "INVALID_RESPONSE", path: "$.result" },
+  );
+  expectContractError(
+    () => assertStoreResult("store.recall", {
+      ...minimalResolvedRecall,
+      chain: { position: 2, totalVersions: 3, unexpected: true },
+    }),
+    { code: "INVALID_RESPONSE", path: "$.result" },
+  );
+});

@@ -94,6 +94,11 @@ export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "If context_window_search reports matching documents expired by retention, treat that as evidence the topic was discussed and later aged out of eligibility—not as proof it was never discussed. The count and retention class are the only disclosed detail; do not guess or assert the expired content itself.",
   "Before a destructive or hard-to-reverse action (deleting or overwriting non-trivial state, redaction, superseding a live decision, migrations, force operations), run one targeted context_window_search for a decision or constraint about the action's subject, keyed on its subjectKey or exact anchors; an empty result clears the action, a match must be reconciled before proceeding.",
   "When a meaningful check for a subject comes up empty and that absence is acted on (a decision made, a duplicate not created, an investigation closed) rather than a routine empty grep, archive the confirmed-absence finding under a stable subjectKey such as 'absence:<subject>', stating what was checked, how, and when; call context_window_supersede on that record once the subject is later found to exist so the absence stops being treated as current.",
+  // Artifact versioning: subjectKey + supersedes already forms a version
+  // chain for any archived document, not only settled single-value facts;
+  // this rule names the working-artifact case explicitly and points at the
+  // chain view context_recall now surfaces for it.
+  "When archiving successive versions of one working artifact (a plan, design note, or config snapshot) rather than a single settled fact, keep every version under one stable subjectKey and supersede the prior version each time it changes, so the current version stays the one live search hit while every earlier version remains individually recallable for audit; use kind manual for an artifact that must outlive normal retention. context_recall on any version in that chain reports its position (version k of n) and its immediate predecessor/successor document, so read that instead of guessing adjacent version ids.",
 ]);
 
 export const ARCHIVED_EVIDENCE_LABEL =

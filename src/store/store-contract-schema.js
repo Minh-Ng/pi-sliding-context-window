@@ -515,6 +515,24 @@ const dependentDocumentsSummary = object({
   documentIds: array(identifier, { maxItems: MAX_DEPENDENT_DOCUMENT_IDS }),
 });
 
+// Artifact-versioning chain view (ultracode task #38): a compact summary of
+// one document's position within its explicit subjectKey + supersedes
+// chain -- see supersessionChainView in src/rocksdb/supersession-chain.js.
+// `predecessor`/`successor` each name only the immediate neighbor in that
+// direction, not the full chain. Optional wherever it appears below so
+// older daemons/clients that predate this field validate unchanged.
+const supersessionChainNeighbor = object({
+  documentId: identifier,
+  version: positiveInteger,
+  createdAt: timestamp,
+});
+const supersessionChainSummary = object({
+  position: positiveInteger,
+  totalVersions: positiveInteger,
+  predecessor: supersessionChainNeighbor,
+  successor: supersessionChainNeighbor,
+}, ["position", "totalVersions"]);
+
 const searchResponse = object({
   mode: enumeration(RETRIEVAL_MODES),
   status: enumeration(["resolved", "not-found", "ambiguous", "legacy-fallback"]),
@@ -609,7 +627,27 @@ const resolvedRecall = object({
   maxTokens: positiveInteger,
   renderedText: text,
   returnedTokens: nonNegativeInteger,
-});
+  // Present only when this document is part of an explicit subjectKey +
+  // supersedes chain, either direction (ultracode task #38).
+  chain: supersessionChainSummary,
+}, [
+  "status",
+  "documentId",
+  "version",
+  "kind",
+  "sessionId",
+  "project",
+  "createdAt",
+  "historical",
+  "stalenessLabel",
+  "sourceMessages",
+  "chunks",
+  "text",
+  "continuationLocators",
+  "maxTokens",
+  "renderedText",
+  "returnedTokens",
+]);
 
 const unresolvedRecall = object({
   status: enumeration(RECALL_STATUSES.filter((status) => status !== "resolved")),
@@ -620,6 +658,10 @@ const unresolvedRecall = object({
   // Present only when status is "superseded" and the bounded lookup found at
   // least one later document referencing it (ultracode task #36).
   dependents: dependentDocumentsSummary,
+  // Present only when status is "superseded" and this document is part of an
+  // explicit subjectKey + supersedes chain, either direction (ultracode
+  // task #38).
+  chain: supersessionChainSummary,
 }, ["status", "reason"]);
 
 const gatheredEvidence = object({
@@ -747,6 +789,10 @@ const documentReadResponse = anyOf(
     // Present only when status is "superseded" and the bounded lookup found
     // at least one later document referencing it (ultracode task #36).
     dependents: dependentDocumentsSummary,
+    // Present only when status is "superseded" and this document is part of
+    // an explicit subjectKey + supersedes chain, either direction
+    // (ultracode task #38).
+    chain: supersessionChainSummary,
   }, ["status", "documentId"]),
 );
 

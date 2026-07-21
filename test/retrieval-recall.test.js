@@ -666,3 +666,83 @@ test("an explicit correction makes a pre-correction locator typed and non-substi
   assert.equal(Object.hasOwn(result, "continuationLocators"), false);
   assert.equal(JSON.stringify(result).includes("NEW_CORRECTION_BYTES_NEVER_RECALLED"), false);
 });
+
+test("recalling the superseded root of an explicit chain reports its chain position and successor", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "recall-chain-root"));
+  t.after(() => store.close());
+  const subjectKey = "artifact:chain-plan";
+  const target = candidate("chain-plan-v1", "Draft plan TARGET evidence.", {
+    createdAt: 100,
+    subjectKey,
+  });
+  const replacement = candidate("chain-plan-v2", "Revised plan evidence.", {
+    createdAt: 200,
+    subjectKey,
+    supersedes: { documentId: target.documentId, version: target.version },
+  });
+  await admit(store, target);
+  const { locator } = await locatorFor(store, target, "TARGET");
+  await admit(store, replacement);
+
+  const result = await recallArchive(
+    store,
+    { locator, neighbors: 1, maxTokens: 100 },
+    auth(target),
+  );
+  assert.equal(result.status, "superseded");
+  assert.deepEqual(result.chain, {
+    position: 1,
+    totalVersions: 2,
+    successor: { documentId: "chain-plan-v2", version: 1, createdAt: 200 },
+  });
+});
+
+test("recalling the live head of an explicit chain reports its position and predecessor, embedded in rendered evidence", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "recall-chain-head"));
+  t.after(() => store.close());
+  const subjectKey = "artifact:chain-plan-head";
+  const target = candidate("chain-head-v1", "Draft plan evidence.", {
+    createdAt: 100,
+    subjectKey,
+  });
+  const replacement = candidate("chain-head-v2", "Revised TARGET plan evidence.", {
+    createdAt: 200,
+    subjectKey,
+    supersedes: { documentId: target.documentId, version: target.version },
+  });
+  await admit(store, target);
+  await admit(store, replacement);
+  const { locator } = await locatorFor(store, replacement, "TARGET");
+
+  const result = await recallArchive(
+    store,
+    { locator, neighbors: 1, maxTokens: 1_000 },
+    auth(replacement),
+  );
+  assert.equal(result.status, "resolved");
+  assert.deepEqual(result.chain, {
+    position: 2,
+    totalVersions: 2,
+    predecessor: { documentId: "chain-head-v1", version: 1, createdAt: 100 },
+  });
+
+  const [, encodedEnvelope] = result.renderedText.split("\n");
+  const envelope = JSON.parse(encodedEnvelope);
+  assert.deepEqual(JSON.parse(envelope.metadataJson).chain, result.chain);
+});
+
+test("a document outside any explicit chain never carries a chain field on recall", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "recall-no-chain"));
+  t.after(() => store.close());
+  const document = candidate("lone-note", "Nothing supersedes or is superseded by this TARGET.");
+  await admit(store, document);
+  const { locator } = await locatorFor(store, document, "TARGET");
+
+  const result = await recallArchive(store, { locator, neighbors: 1, maxTokens: 1_000 }, auth(document));
+  assert.equal(result.status, "resolved");
+  assert.equal(Object.hasOwn(result, "chain"), false);
+
+  const [, encodedEnvelope] = result.renderedText.split("\n");
+  const envelope = JSON.parse(encodedEnvelope);
+  assert.equal(Object.hasOwn(JSON.parse(envelope.metadataJson), "chain"), false);
+});

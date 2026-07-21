@@ -60,6 +60,11 @@ function renderedRecord(recall, body, sourceMessages) {
     sourceMessages,
     stalenessLabel: recall.stalenessLabel,
     version: recall.version,
+    // Artifact-versioning chain view (ultracode task #38): only present when
+    // this recalled document is part of an explicit subjectKey + supersedes
+    // chain; see supersessionChainView in src/rocksdb/supersession-chain.js.
+    // JSON.stringify drops an undefined value, so this is absent otherwise.
+    chain: recall.chain,
   });
   const bodyJson = oneLineJson(body);
   const envelope = {
@@ -116,6 +121,9 @@ function fencedRecord(recall, body, sourceMessages) {
     src: sourceMessages?.status === "available" ? sourceMessages.keys : undefined,
     bodyBytes: Buffer.byteLength(body, "utf8"),
     truncated: truncated ? true : undefined,
+    // Artifact-versioning chain view (ultracode task #38); see the same
+    // field in renderedRecord above.
+    chain: recall.chain,
   };
   return fencedEnvelope(FENCED_MARKER, metadata, fence, body);
 }

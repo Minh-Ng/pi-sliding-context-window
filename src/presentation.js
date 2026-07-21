@@ -48,6 +48,31 @@ function dependentsNotice(dependents) {
   return `${dependents.count} later ${noun} ${verb} this document${ids ? ` (${ids})` : ""}.`;
 }
 
+function chainNeighborDate(createdAt) {
+  try {
+    return new Date(createdAt).toISOString();
+  } catch {
+    return "unknown date";
+  }
+}
+
+/** Artifact-versioning chain view (ultracode task #38): name this document's
+ * position within its explicit subjectKey + supersedes chain and, when
+ * known, its immediate predecessor/successor -- never the content of either,
+ * and never an instruction to act on them. See supersessionChainView in
+ * src/rocksdb/supersession-chain.js. */
+function chainNotice(chain) {
+  if (!chain) return undefined;
+  const parts = [`Version ${chain.position} of ${chain.totalVersions} in its supersession chain.`];
+  if (chain.predecessor) {
+    parts.push(`Predecessor: ${chain.predecessor.documentId} (${chainNeighborDate(chain.predecessor.createdAt)}).`);
+  }
+  if (chain.successor) {
+    parts.push(`Successor: ${chain.successor.documentId} (${chainNeighborDate(chain.successor.createdAt)}).`);
+  }
+  return parts.join(" ");
+}
+
 /**
  * A stopping-criterion contract, not a decoration: the consuming agent reads
  * this label to decide whether to keep recalling rather than parsing the raw
@@ -369,8 +394,10 @@ function additionalProvenance(provenance) {
  * DaemonArchive#recall in src/archive/daemon-archive.js). Render that
  * gracefully instead of leaving it an uncaught, unstructured RPC error:
  * name the status and, for a superseded target, any later documents that
- * already show signs of referencing it (ultracode task #36) so the agent
- * can decide whether to look further rather than just re-searching blind.
+ * already show signs of referencing it (ultracode task #36) and its
+ * position in an explicit subjectKey + supersedes chain, if any (ultracode
+ * task #38), so the agent can decide whether to look further rather than
+ * just re-searching blind.
  */
 export function formatRecallFailure(error, tokenLimit) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
@@ -378,8 +405,10 @@ export function formatRecallFailure(error, tokenLimit) {
     ? ` ${error.documentId}${error.version ? `@${error.version}` : ""}`
     : "";
   const lines = [`${heading}\n\nArchived document${locator} is ${error.status}: ${error.reason ?? "unavailable"}.`];
-  const notice = dependentsNotice(error.dependents);
-  if (notice) lines.push(notice);
+  const dependents = dependentsNotice(error.dependents);
+  if (dependents) lines.push(dependents);
+  const chain = chainNotice(error.chain);
+  if (chain) lines.push(chain);
   return capText(lines.join("\n"), tokenLimit);
 }
 

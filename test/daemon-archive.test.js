@@ -1778,6 +1778,12 @@ test("supersede and recall surface a document that cites the superseded subject,
     const status = archive.recallStatus("decision-queue-config");
     assert.equal(status.status, "superseded");
     assert.deepEqual(status.dependents, { count: 1, documentIds: ["note-citing-decision"] });
+    // supersede() always admits its replacement with an explicit `supersedes`
+    // pointer (subjectKey or not), so this is also a two-version chain
+    // (ultracode task #38).
+    assert.equal(status.chain.position, 1);
+    assert.equal(status.chain.totalVersions, 2);
+    assert.equal(status.chain.successor.documentId, replacement.documentId);
 
     // A locator is never handed a status of its own; recallStatus is a no-op
     // for one, and get()/recall() throw instead (covered by the ArchiveRecallError
@@ -1956,6 +1962,79 @@ test("recall forwards the store's dependents summary through ArchiveRecallError 
       archive.recallStatus("target-doc").dependents,
       { count: 1, documentIds: ["citing-doc"] },
     );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("recall forwards the store's chain-position summary through ArchiveRecallError and the resolved document instead of dropping it", async () => {
+  const paths = fixture("context-window-chain-recall-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/chain-recall-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    const realRequest = archive.request.bind(archive);
+    const chain = {
+      position: 1,
+      totalVersions: 2,
+      successor: { documentId: "chain-doc-v2", version: 1, createdAt: 200 },
+    };
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.recall") return realRequest(operation, payload, options);
+      return {
+        status: "superseded",
+        documentId: "chain-doc-v1",
+        version: 1,
+        reason: "Explicitly replaced by a later version.",
+        chain,
+      };
+    };
+    assert.throws(
+      () => archive.recall("cw1.not-a-real-locator"),
+      (error) => error instanceof ArchiveRecallError
+        && error.status === "superseded"
+        && error.documentId === "chain-doc-v1"
+        && JSON.stringify(error.chain) === JSON.stringify(chain),
+    );
+
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.recall") return realRequest(operation, payload, options);
+      return {
+        status: "resolved",
+        documentId: "chain-doc-v2",
+        version: 1,
+        kind: "manual",
+        sessionId: "chain-session",
+        project: "/project/chain-recall-wiring",
+        createdAt: 200,
+        historical: true,
+        stalenessLabel: "Archived historical evidence; verify current state.",
+        sourceMessages: { status: "documented-absence", reason: "not retained" },
+        chunks: [{ chunkId: "chain-chunk", ordinal: 0, startByte: 0, endByte: 4, text: "text" }],
+        text: "text",
+        continuationLocators: [],
+        maxTokens: 1_000,
+        renderedText: "text",
+        returnedTokens: 39,
+        chain: { position: 2, totalVersions: 2, predecessor: { documentId: "chain-doc-v1", version: 1, createdAt: 100 } },
+      };
+    };
+    const resolved = archive.recall("cw1.not-a-real-locator");
+    assert.deepEqual(resolved.chain, {
+      position: 2,
+      totalVersions: 2,
+      predecessor: { documentId: "chain-doc-v1", version: 1, createdAt: 100 },
+    });
   } finally {
     try { archive?.close(); } catch {}
     await stopProcess(daemonProcessId);

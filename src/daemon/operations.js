@@ -11,6 +11,7 @@ import {
 } from "../rocksdb/manifests.js";
 import { encodeKey, KEYSPACE } from "../rocksdb/keys.js";
 import { findDependentDocuments } from "../rocksdb/dependents.js";
+import { supersessionChainView } from "../rocksdb/supersession-chain.js";
 import { createExactIndexHandler } from "../rocksdb/index/exact.js";
 import { createBm25IndexHandler } from "../rocksdb/index/bm25.js";
 import { createStructuralIndexHandler } from "../rocksdb/index/structural.js";
@@ -629,6 +630,7 @@ export class DaemonOperations {
         // manifest that fails the target-identity check) must not turn an
         // otherwise-graceful "superseded" response into an RPC error.
         if (failure.status === "superseded" && snapshotManifest !== undefined) {
+          let extra = {};
           try {
             const dependents = await findDependentDocuments(view, {
               documentId: snapshotManifest.documentId,
@@ -639,10 +641,21 @@ export class DaemonOperations {
               subjectKey: snapshotManifest.subjectKey,
               sourceMessageKeys: snapshotManifest.sourceMessageKeys,
             }, { replacementDocumentId: marker?.replacementDocumentId });
-            if (dependents.count > 0) return { ...failure, dependents };
+            if (dependents.count > 0) extra = { ...extra, dependents };
           } catch (error) {
             this.recordBackgroundError(error);
           }
+          try {
+            // Artifact-versioning chain view (ultracode task #38): same
+            // best-effort surfacing as the dependents lookup above, for a
+            // direct-by-id read of a document that is part of an explicit
+            // subjectKey + supersedes chain.
+            const chain = await supersessionChainView(view, snapshotManifest);
+            if (chain !== undefined) extra = { ...extra, chain };
+          } catch (error) {
+            this.recordBackgroundError(error);
+          }
+          if (Object.keys(extra).length > 0) return { ...failure, ...extra };
         }
         return failure;
       }

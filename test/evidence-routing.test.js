@@ -124,6 +124,12 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // assume presence; a routine empty grep is not archived.
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /meaningful check for a subject comes up empty.*absence is acted on.*absence:<subject>.*what was checked, how, and when/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /context_window_supersede.*subject is later found to exist.*absence stops being treated as current/i.test(guideline)));
+  // Artifact versioning (ultracode task #38): successive versions of one
+  // working artifact share a stable subjectKey and supersede one another,
+  // and context_recall reports the resulting chain position.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /successive versions of one working artifact.*stable subjectKey.*supersede the prior version/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /kind manual for an artifact that must outlive normal retention/i.test(guideline)));
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /context_recall on any version in that chain reports its position \(version k of n\) and its immediate predecessor\/successor/i.test(guideline)));
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -140,13 +146,15 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // EVIDENCE_ROUTING_GUIDELINES again changes the model-visible guidance
   // text, so the fingerprint version bumped past "13" to "14". The
   // negative-evidence archiving rule (confirmed-absence findings) appended
-  // above bumps it again to "15". Any held-out/reference eval artifact
+  // above bumps it again to "15". The artifact-versioning rule (successive
+  // versions of one working artifact under a stable subjectKey; ultracode
+  // task #38) bumps it again to "16". Any held-out/reference eval artifact
   // captured against an older version (see the persisted-artifact test
   // below, still pinned at "4") already fails
   // validateEvidenceRoutingEvalRecord's version check by design — once
   // guidance moves, its recorded routing accuracy is regression-only
   // evidence for that snapshot, not a live held-out measurement.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "15");
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "16");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

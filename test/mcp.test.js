@@ -509,6 +509,15 @@ test("MCP surfaces citing documents on supersede and on recall of the superseded
     assert.equal(recalled.result.isError, true);
     assert.match(recalled.result.content[0].text, /is superseded/u);
     assert.match(recalled.result.content[0].text, /1 later document references this document/u);
+    // The subjectKey the archive call carried forward means supersede() also
+    // formed an explicit two-version chain (ultracode task #38): recalling
+    // the superseded root now also reports its chain position and the
+    // replacement's id, not just the dependents count above.
+    assert.match(recalled.result.content[0].text, /Version 1 of 2 in its supersession chain\./u);
+    assert.match(
+      recalled.result.content[0].text,
+      new RegExp(`Successor: ${superseded.result.content[0].text.match(/with (\S+)\./u)[1]}`, "u"),
+    );
 
     child.stdin.end();
     const [exitCode] = await once(child, "exit");

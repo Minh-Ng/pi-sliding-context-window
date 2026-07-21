@@ -8,6 +8,7 @@ import {
   retiredDocumentStatus,
 } from "../rocksdb/manifests.js";
 import { findDependentDocuments } from "../rocksdb/dependents.js";
+import { supersessionChainView } from "../rocksdb/supersession-chain.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { tokenizeWithByteOffsets } from "../rocksdb/windows.js";
 import {
@@ -27,7 +28,7 @@ const MAX_FULL_TURN_RECALL_BYTES = 64 * 1_024;
 // unusually small windows cannot turn one recall into an unbounded scan.
 const MAX_SPAN_GROWTH_WINDOWS = 256;
 
-function unresolved(status, reason, claims, dependents) {
+function unresolved(status, reason, claims, dependents, chain) {
   const result = { status, reason };
   if (claims) {
     result.documentId = claims.documentId;
@@ -37,6 +38,10 @@ function unresolved(status, reason, claims, dependents) {
   // attached by the "superseded" call site below, and only when the bounded
   // lookup actually found something.
   if (dependents !== undefined) result.dependents = dependents;
+  // Artifact-versioning chain view (ultracode task #38): only ever attached
+  // by the "superseded" call site below, and only when this document is
+  // itself part of an explicit subjectKey + supersedes chain.
+  if (chain !== undefined) result.chain = chain;
   return assertStoreResult("store.recall", result);
 }
 
@@ -358,6 +363,7 @@ async function recallSnapshot(view, request, options, secret, claims) {
   if (supersession) {
     const status = supersession.status === "superseded" ? "superseded" : "expired";
     let dependents;
+    let chain;
     if (status === "superseded") {
       // The target's own canonical record is still readable here even though
       // it is no longer live; recall of a superseded document is exactly the
@@ -388,6 +394,16 @@ async function recallSnapshot(view, request, options, secret, claims) {
         } catch (error) {
           options.recordBackgroundError?.(error);
         }
+        try {
+          // Artifact-versioning chain view (ultracode task #38): the same
+          // moment a caller learns a recalled version is stale is also
+          // exactly when its position in an explicit subjectKey +
+          // supersedes chain is most useful, so report it here too.
+          // Best-effort for the same reason as the dependents lookup above.
+          chain = await supersessionChainView(view, manifest);
+        } catch (error) {
+          options.recordBackgroundError?.(error);
+        }
       }
     }
     return unresolved(
@@ -395,6 +411,7 @@ async function recallSnapshot(view, request, options, secret, claims) {
       supersession.reason ?? `The archived version is ${supersession.status}.`,
       claims,
       dependents,
+      chain,
     );
   }
   const history = await view.get(manifestKeys.documentHistory(claims.documentId));
@@ -423,6 +440,18 @@ async function recallSnapshot(view, request, options, secret, claims) {
   }
   if (manifest.project !== claims.project || manifest.sessionId !== claims.sessionId) {
     return unresolved("locator-invalid", "The locator source identity does not match the canonical manifest.", claims);
+  }
+  let chain;
+  try {
+    // Artifact-versioning chain view (ultracode task #38): report this
+    // document's position when it is part of an explicit subjectKey +
+    // supersedes chain (either direction), so recalling any single version
+    // still finds every other one without guessing IDs. Best-effort, like
+    // the superseded branch above: a fault here must not turn an
+    // otherwise-valid resolved recall into an RPC error.
+    chain = await supersessionChainView(view, manifest);
+  } catch (error) {
+    options.recordBackgroundError?.(error);
   }
   const target = await readWindow(
     view,
@@ -513,6 +542,7 @@ async function recallSnapshot(view, request, options, secret, claims) {
     text: recalledText,
     continuationLocators,
     maxTokens: request.maxTokens,
+    ...(chain === undefined ? {} : { chain }),
   };
   const renderedText = renderRecalledEvidence(response, request.maxTokens, {
     focusStartByte: Math.max(0, claims.matchRange.startByte - startByte),

@@ -433,6 +433,10 @@ function recalledDocument(response, locator) {
     metadata: {},
     metadataParse: { status: "valid" },
     provenance: recallProvenance(response),
+    // Artifact-versioning chain view (ultracode task #38): forwarded
+    // unchanged from the store result; see supersessionChainView in
+    // src/rocksdb/supersession-chain.js.
+    ...(response.chain === undefined ? {} : { chain: response.chain }),
   };
 }
 
@@ -448,6 +452,10 @@ export class ArchiveRecallError extends Error {
     // when status is "superseded" and the daemon's bounded lookup found at
     // least one later document already referencing this one.
     this.dependents = response.dependents;
+    // Artifact-versioning chain view (ultracode task #38): only present
+    // when status is "superseded" and this document is part of an explicit
+    // subjectKey + supersedes chain.
+    this.chain = response.chain;
   }
 }
 

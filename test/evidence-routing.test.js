@@ -12,6 +12,7 @@ import {
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  SUPERSEDE_TOOL_DESCRIPTION,
   archiveGatherSuggested,
   archiveStateReconciliationSuggested,
 } from "../src/evidence-routing.js";
@@ -112,6 +113,11 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // Third destination: cross-project user facts go to host memory, not the
   // project-partitioned archive and not the repository.
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /user-scoped fact that holds across projects.*host's own memory mechanism.*not this project-partitioned archive and not the repository/i.test(guideline)));
+  // Risk-weighted retrieval: before an irreversible action, the bar for
+  // consulting archived evidence drops to one targeted, precisely-keyed
+  // search rather than the default speculative-search avoidance.
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /destructive or hard-to-reverse action.*subjectKey or exact anchors.*empty result clears the action.*match must be reconciled before proceeding/i.test(guideline)));
+  assert.match(SUPERSEDE_TOOL_DESCRIPTION, /hard to reverse.*search for the subject's prior decisions or constraints first/i);
 
   assert.deepEqual(EFFECTIVE_PRODUCTION_GUIDANCE, {
     searchToolDescription: SEARCH_TOOL_DESCRIPTION,
@@ -124,7 +130,15 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // The searchEffort=wide guidance line added to SEARCH_TOOL_DESCRIPTION and
   // GATHER_TOOL_DESCRIPTION invalidates the prior fingerprint, so the version
   // identifier must be bumped past it.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "13");
+  // The gather-before-irreversible-action rule appended to
+  // EVIDENCE_ROUTING_GUIDELINES again changes the model-visible guidance
+  // text, so the fingerprint version bumps past "13" to "14". Any
+  // held-out/reference eval artifact captured against an older version
+  // (see the persisted-artifact test below, still pinned at "4") already
+  // fails validateEvidenceRoutingEvalRecord's version check by design —
+  // once guidance moves, its recorded routing accuracy is regression-only
+  // evidence for that snapshot, not a live held-out measurement.
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "14");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

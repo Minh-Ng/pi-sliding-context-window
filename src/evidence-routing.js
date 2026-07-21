@@ -72,7 +72,7 @@ export const TRAVERSE_TOOL_DESCRIPTION =
   "Inspect a bounded chronological page before or after an archived anchor returned by context_window_search or a prior traversal. Use for temporal questions when the needed event is defined relative to a known anchor and its vocabulary is unknown. Start with up to 128 records when the distance is unknown, then traverse from the oldest/newest result handle to continue paging; do not guess answer-specific terms.";
 
 export const SUPERSEDE_TOOL_DESCRIPTION =
-  "Mark a prior archived decision or document as superseded by a correction. Use when the user reverses an earlier decision so search and automatic retrieval stop treating the old version as live. Prefer writing durable constraints into the repository (AGENTS.md, ADR, config) rather than pinning archive records.";
+  "Mark a prior archived decision or document as superseded by a correction. Use when the user reverses an earlier decision so search and automatic retrieval stop treating the old version as live. Prefer writing durable constraints into the repository (AGENTS.md, ADR, config) rather than pinning archive records. This removes the old version from search and is itself hard to reverse; search for the subject's prior decisions or constraints first if that has not already happened this turn.";
 
 export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "Before answering, classify the evidence needed: already in visible context (answer directly), current mutable project state (use live tools), or an out-of-window referent such as prior intent, rationale, decisions, rejected approaches, continuity, or scope disputes (use context_window_search); combine archive and live only when both are required.",
@@ -92,6 +92,7 @@ export const EVIDENCE_ROUTING_GUIDELINES = Object.freeze([
   "When a decision or constraint must outlive the archive retention window (cross-session process, security, standing project rule), write it into the repository (AGENTS.md, CLAUDE.md, ADR, or config). The archive is provenance, not the system of record; do not pin archive documents for longevity.",
   "Route a user-scoped fact that holds across projects (a standing preference, personal workflow, or cross-repository convention) to the host's own memory mechanism (Claude Code memory, Pi settings), not this project-partitioned archive and not the repository (AGENTS.md, CLAUDE.md), since neither carries it to the next project.",
   "If context_window_search reports matching documents expired by retention, treat that as evidence the topic was discussed and later aged out of eligibility—not as proof it was never discussed. The count and retention class are the only disclosed detail; do not guess or assert the expired content itself.",
+  "Before a destructive or hard-to-reverse action (deleting or overwriting non-trivial state, redaction, superseding a live decision, migrations, force operations), run one targeted context_window_search for a decision or constraint about the action's subject, keyed on its subjectKey or exact anchors; an empty result clears the action, a match must be reconciled before proceeding.",
 ]);
 
 export const ARCHIVED_EVIDENCE_LABEL =

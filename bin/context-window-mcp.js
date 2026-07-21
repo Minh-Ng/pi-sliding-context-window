@@ -267,7 +267,7 @@ const tools = [
   },
   {
     name: "context_window_redact",
-    description: "Tombstone archived documents for the current session or project after an explicit confirm token.",
+    description: "Tombstone archived documents for the current session or project after an explicit confirm token. Redaction is irreversible; search for decisions or constraints on the affected subject before confirming.",
     inputSchema: {
       type: "object",
       properties: {

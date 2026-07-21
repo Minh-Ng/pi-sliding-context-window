@@ -15,6 +15,7 @@ import {
   SEARCH_EFFORT_DESCRIPTION,
   SEARCH_SCOPE_DESCRIPTION,
   SEARCH_TOOL_DESCRIPTION,
+  SUPERSEDE_TOOL_DESCRIPTION,
 } from "../src/evidence-routing.js";
 import { StoreClient } from "../src/store/store-client.js";
 import {
@@ -194,7 +195,14 @@ test("MCP exposes routing guidance and labels recall output as archived evidence
     const search = listed.result.tools.find(({ name }) => name === "context_window_search");
     const recall = listed.result.tools.find(({ name }) => name === "context_recall");
     const archiveTool = listed.result.tools.find(({ name }) => name === "context_window_archive");
+    const supersede = listed.result.tools.find(({ name }) => name === "context_window_supersede");
+    const redact = listed.result.tools.find(({ name }) => name === "context_window_redact");
     assert.equal(listed.result.tools.some(({ name }) => name === "context_window_recall"), false);
+    // Gather-before-irreversible-action (ultracode task #34): the two
+    // in-band moments of irreversibility carry a search-first clause.
+    assert.equal(supersede.description, SUPERSEDE_TOOL_DESCRIPTION);
+    assert.match(supersede.description, /hard to reverse.*search for the subject's prior decisions or constraints first/i);
+    assert.match(redact.description, /Redaction is irreversible.*search for decisions or constraints on the affected subject before confirming/i);
     assert.equal(gather.description, GATHER_TOOL_DESCRIPTION);
     assert.equal(gather.inputSchema.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
     assert.equal(search.description, SEARCH_TOOL_DESCRIPTION);

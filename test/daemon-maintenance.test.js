@@ -50,6 +50,10 @@ test("archive retention policy assigns explicit expiries and keeps manual eviden
     retentionClass: "derived-evidence",
     expiresAt: 1_000 + (30 * DAY_MS),
   });
+  assert.deepEqual(retentionForAdmission(policy, { kind: "fact-candidate", now: 1_000 }), {
+    retentionClass: "derived-evidence",
+    expiresAt: 1_000 + (30 * DAY_MS),
+  });
   assert.deepEqual(retentionForAdmission(policy, { kind: "manual", now: 1_000 }), {
     retentionClass: "durable-evidence",
   });

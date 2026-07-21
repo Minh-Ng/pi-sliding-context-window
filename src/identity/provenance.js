@@ -27,7 +27,8 @@ function unavailableSourceMessages(document, metadata) {
     };
   }
 
-  if (document.kind === "turn" || document.kind === "preamble" || document.kind === "decision-candidate") {
+  if (document.kind === "turn" || document.kind === "preamble" || document.kind === "decision-candidate"
+    || document.kind === "fact-candidate") {
     return {
       status: "legacy-unavailable",
       reason: "Ordered source message keys were not recorded for this legacy archived turn.",
@@ -73,7 +74,8 @@ export function archiveDocumentProvenance(document) {
 
   const keys = metadata.sourceMessageKeys;
   const sourceCount = metadata.sourceMessageCount;
-  const archivedTurnKind = document.kind === "turn" || document.kind === "preamble" || document.kind === "decision-candidate";
+  const archivedTurnKind = document.kind === "turn" || document.kind === "preamble"
+    || document.kind === "decision-candidate" || document.kind === "fact-candidate";
   const completeSourceMetadata = archivedTurnKind
     && Array.isArray(keys)
     && keys.every((key) => typeof key === "string" && key.length > 0)
@@ -120,6 +122,23 @@ export function archiveDocumentProvenance(document) {
       verbatim: true,
       ...(typeof metadata.sourceTurnId === "string" && metadata.sourceTurnId
         ? { sourceTurnId: metadata.sourceTurnId }
+        : {}),
+    };
+  }
+
+  if (document.kind === "fact-candidate") {
+    provenance.factCandidate = {
+      // Verbatim quote of a fact-shaped sentence (a typed value/path/url
+      // anchor bound by a cue like "is"/"uses"/"lives in"); heuristic
+      // extraction, not a verified fact record.
+      verbatim: true,
+      ...(typeof metadata.sourceTurnId === "string" && metadata.sourceTurnId
+        ? { sourceTurnId: metadata.sourceTurnId }
+        : {}),
+      ...(metadata.factAnchor && typeof metadata.factAnchor === "object" && !Array.isArray(metadata.factAnchor)
+        && typeof metadata.factAnchor.type === "string"
+        && typeof metadata.factAnchor.value === "string"
+        ? { anchor: { type: metadata.factAnchor.type, value: metadata.factAnchor.value } }
         : {}),
     };
   }

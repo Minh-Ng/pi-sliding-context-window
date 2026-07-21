@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { resolveModelConfig } from "../config.js";
+import { extractExactAnchors } from "../rocksdb/index/exact.js";
 
 // Matches Pi's provider-neutral image proxy. Actual image tokenization varies
 // by provider and dimensions; provider-reported usage remains authoritative.
@@ -693,6 +694,101 @@ export function extractDecisionCandidates(text, {
     if (seen.has(sentence)) continue;
     seen.add(sentence);
     candidates.push(sentence);
+    if (candidates.length >= maxCandidates) break;
+  }
+  return candidates;
+}
+
+// Lexical cues for a fact-shaped sentence: an explicit binding between a
+// stated value and its meaning ("retention is 90 days", "the socket lives
+// in /tmp/app.sock", "use node v20.11.0"). "is" and "uses" alone are far too
+// common to gate extraction by themselves, so this cue set is only ever
+// tested together with the typed-anchor requirement in
+// extractFactCandidates below -- a common word plus an untyped span of text
+// is not enough on its own.
+export const FACT_CUE_PATTERN = new RegExp(
+  "\\b(?:"
+  + [
+    "is", "uses?", "set to", "defaults? to", "lives? in", "named",
+  ].join("|")
+  + ")\\b",
+  "i",
+);
+
+// Anchor types from exact.js's classifier (classifyExactValue/
+// extractExactAnchors) that name a fact-shaped value rather than a code
+// referent. "value" covers dotted versions and k=v pairs (its
+// VERSION_OR_VALUE branch) as well as hyphenated tokens; "path" and "url"
+// cover the location-shaped values the task also calls out (a config file,
+// a socket, an endpoint). Identifier-shaped anchors that exact.js also
+// types -- symbol, dotted-name, commit, error, quoted-value -- are
+// deliberately excluded: they tend to name code referents already covered
+// by decision-candidate extraction's cue set or by ordinary lexical search,
+// not a stated configuration fact.
+export const FACT_ANCHOR_TYPES = new Set(["value", "path", "url"]);
+
+// Independent of DECISION_CANDIDATE_MAX_PER_TURN, not a shared budget.
+// Decisions and facts are mined by disjoint cue sets over the same turn
+// text; sharing one counter would let a decision-heavy turn crowd out fact
+// extraction (or vice versa) even though each extractor's own regex/anchor
+// scan is already separately bounded and cheap. Two independent per-turn
+// ceilings of 5 keep the combined worst case at 10 archive.put calls per
+// rotated turn -- still bounded, additive work.
+export const FACT_CANDIDATE_MAX_PER_TURN = 5;
+export const FACT_CANDIDATE_MAX_CHARS = DECISION_CANDIDATE_MAX_CHARS;
+
+/**
+ * Extract verbatim fact-shaped sentences from serialized turn text. A
+ * sentence qualifies only when it contains BOTH a typed exact anchor
+ * (FACT_ANCHOR_TYPES, via the same extractExactAnchors classifier exact.js's
+ * index/search path uses) AND a binding cue (FACT_CUE_PATTERN) -- an anchor
+ * with no binding cue, or a cue with no typed anchor, is not extracted (see
+ * the negative-case test). Returns exact spans (trimmed only) paired with
+ * the qualifying anchor exactly as the classifier reported it -- never
+ * re-trimmed or otherwise touched -- so the metadata anchor always matches
+ * byte-for-byte what the archived document's own exact-index posting will
+ * contain (path/url anchors sitting at a sentence's end can include that
+ * sentence's own terminal "."/"!"/"?", the same way they would for any other
+ * archived document ending in one; that is exact.js's existing, shared
+ * classification behavior, not something specific to fact candidates). Like
+ * extractDecisionCandidates, this is additive: the raw turn stays archived
+ * regardless, so a missed extraction only degrades to the status quo. No
+ * subjectKey is assigned here -- these are candidates for the agent to
+ * promote, not an automatically deduplicated record.
+ */
+export function extractFactCandidates(text, {
+  maxCandidates = FACT_CANDIDATE_MAX_PER_TURN,
+  maxChars = FACT_CANDIDATE_MAX_CHARS,
+} = {}) {
+  const source = String(text ?? "");
+  const candidates = [];
+  const seen = new Set();
+  for (const raw of source.split(/(?<=[.!?])\s+|\n+/)) {
+    const sentence = raw.trim();
+    if (sentence.length < 15 || sentence.length > maxChars) continue;
+    if (seen.has(sentence)) continue;
+    // A question can't itself assert a bound fact, but "is" (a deliberately
+    // included cue) also opens an interrogative ("Is the checkpoint
+    // restart-safe?"); observed as a false positive against the eval
+    // fixtures (ultracode task #39 notes), so interrogatives are excluded
+    // outright rather than trying to enumerate every cue that can start one.
+    if (sentence.endsWith("?")) continue;
+    if (!FACT_CUE_PATTERN.test(sentence)) continue;
+    let anchors;
+    try {
+      anchors = extractExactAnchors(sentence, { maxAnchors: 8 });
+    } catch {
+      // Malformed input (e.g. an unpaired surrogate from naive slicing) is
+      // conservatively skipped rather than failing the whole rotation.
+      continue;
+    }
+    const anchor = anchors.find((candidate) => FACT_ANCHOR_TYPES.has(candidate.type));
+    if (!anchor) continue;
+    seen.add(sentence);
+    candidates.push({
+      text: sentence,
+      anchor: { type: anchor.type, value: anchor.value },
+    });
     if (candidates.length >= maxCandidates) break;
   }
   return candidates;

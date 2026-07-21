@@ -85,6 +85,74 @@ test("rotation archives verbatim decision candidates with turn provenance", () =
   });
 });
 
+test("rotation archives verbatim fact candidates with anchor metadata and turn provenance", () => {
+  const archive = memoryArchive();
+  archive.resolveSubject = () => {
+    throw new Error("rotation must not infer supersession from an exact anchor");
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-1",
+    project: "/project",
+    onRotation: () => {},
+  });
+  const factText = "The build uses node v20.11.0 for this project.";
+  const messages = [
+    user("What node version do we use?", 1), assistant(factText, 2),
+    user("two", 3), assistant("answer two", 4),
+    user("three", 5), assistant("answer three", 6),
+  ];
+
+  session.process(messages, { contextWindow: 200_000 });
+
+  const documents = [...archive.documents.values()];
+  const candidates = documents.filter((document) => document.kind === "fact-candidate");
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+  // Verbatim: the archived sentence is an exact span of the serialized turn.
+  assert.equal(candidate.text, `[assistant] ${factText}`);
+  assert.equal(candidate.subjectKey, undefined, "no automatic subjectKey is assigned");
+  const turnDocument = documents.find((document) => document.kind === "turn"
+    && document.metadata.sourceMessageKeys[0] === messageKey(messages[0]));
+  assert.equal(candidate.metadata.sourceTurnId, turnDocument.id);
+  assert.deepEqual(candidate.metadata.sourceMessageKeys, messages.slice(0, 2).map(messageKey));
+  assert.deepEqual(candidate.metadata.factAnchor, { type: "value", value: "v20.11.0" });
+
+  const provenance = archiveDocumentProvenance(candidate);
+  assert.equal(provenance.sourceMessages.status, "available");
+  assert.deepEqual(provenance.factCandidate, {
+    verbatim: true,
+    sourceTurnId: turnDocument.id,
+    anchor: { type: "value", value: "v20.11.0" },
+  });
+});
+
+test("rotation caps fact candidates per turn independently of decision candidates", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-cap",
+    project: "/project",
+    onRotation: () => {},
+  });
+  const manyFacts = Array.from({ length: 9 }, (_, i) =>
+    `The port for service-${i} is set to service-${i}-8080.`).join(" ");
+  const manyDecisions = Array.from({ length: 9 }, (_, i) => `We decided option ${i} works.`).join(" ");
+  const messages = [
+    user("summarize", 1), assistant(`${manyFacts} ${manyDecisions}`, 2),
+    user("two", 3), assistant("answer two", 4),
+    user("three", 5), assistant("answer three", 6),
+  ];
+
+  session.process(messages, { contextWindow: 200_000 });
+
+  const documents = [...archive.documents.values()];
+  assert.equal(documents.filter((document) => document.kind === "fact-candidate").length, 5);
+  assert.equal(documents.filter((document) => document.kind === "decision-candidate").length, 5);
+});
+
 test("automatic preflight caches every frozen decision and survives later retrieval failure", () => {
   const archive = memoryArchive();
   const requests = [];

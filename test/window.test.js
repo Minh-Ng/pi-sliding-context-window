@@ -11,6 +11,7 @@ import {
   externalizeLargeToolArguments,
   externalizeLargeToolResults,
   extractDecisionCandidates,
+  extractFactCandidates,
   extractSalientTerms,
   findRetainedStart,
   groupCompleteTurns,
@@ -680,4 +681,71 @@ test("extractDecisionCandidates quotes decision-shaped sentences verbatim", () =
   assert.deepEqual(extractDecisionCandidates(`We decided that ${"x".repeat(400)}.`), [], "over-length sentences are skipped");
   const many = Array.from({ length: 9 }, (_, i) => `We decided option ${i} works.`).join(" ");
   assert.equal(extractDecisionCandidates(many).length, 5, "caps candidates per turn");
+});
+
+test("extractFactCandidates quotes fact-shaped sentences verbatim with a structured anchor", () => {
+  const text = [
+    "[user] What node version and socket path do we use?",
+    "[assistant] The build uses node v20.11.0 for this project.",
+    "The socket lives in /tmp/app.sock. Purely descriptive sentence here.",
+    "The config value is timeout=30.",
+    "The default queue is named jobs-primary.",
+  ].join("\n");
+  const candidates = extractFactCandidates(text);
+  assert.deepEqual(candidates, [
+    { text: "[assistant] The build uses node v20.11.0 for this project.", anchor: { type: "value", value: "v20.11.0" } },
+    // The path anchor sits at the end of its sentence, so its value carries
+    // that sentence's own trailing "." -- exact.js's classifier includes "."
+    // in a path's character class, and this is deliberately reported as-is
+    // (never re-trimmed) so it matches this document's own exact-index
+    // posting byte-for-byte; see extractFactCandidates' doc comment.
+    { text: "The socket lives in /tmp/app.sock.", anchor: { type: "path", value: "/tmp/app.sock." } },
+    { text: "The config value is timeout=30.", anchor: { type: "value", value: "timeout=30" } },
+    { text: "The default queue is named jobs-primary.", anchor: { type: "value", value: "jobs-primary" } },
+  ]);
+  // Every candidate's text is a verbatim span of the source turn.
+  for (const candidate of candidates) {
+    assert.ok(text.includes(candidate.text), `not verbatim: ${candidate.text}`);
+  }
+});
+
+test("extractFactCandidates requires both a typed anchor and a binding cue", () => {
+  // Anchor present (a path), but no binding cue anywhere in the sentence.
+  assert.deepEqual(
+    extractFactCandidates("The file /tmp/app.sock changed permissions recently."),
+    [],
+    "an anchor without a binding cue is not extracted",
+  );
+  // Binding cue present ("is"), but no typed value/path/url anchor.
+  assert.deepEqual(
+    extractFactCandidates("This retention setting is important to review."),
+    [],
+    "a binding cue without a typed anchor is not extracted",
+  );
+  assert.deepEqual(extractFactCandidates("Nothing conclusive was discussed today."), []);
+  assert.deepEqual(
+    extractFactCandidates(`The config value is ${"x".repeat(400)}=1.`),
+    [],
+    "over-length sentences are skipped",
+  );
+  // "is" also opens an interrogative; a question is never itself a bound
+  // fact even when it names a typed anchor (observed as a false positive
+  // against the eval retrieval fixtures -- see task notes).
+  assert.deepEqual(
+    extractFactCandidates("Is the migration checkpoint restart-safe?"),
+    [],
+    "an interrogative sentence is not extracted even with an anchor and a cue",
+  );
+});
+
+test("extractFactCandidates caps candidates per turn independently of decisions", () => {
+  const manyFacts = Array.from({ length: 9 }, (_, i) => `The port for service-${i} is set to service-${i}-8080.`).join(" ");
+  assert.equal(extractFactCandidates(manyFacts).length, 5, "caps fact candidates per turn");
+
+  const mixed = [
+    ...Array.from({ length: 9 }, (_, i) => `We decided option ${i} works.`),
+    ...Array.from({ length: 9 }, (_, i) => `The port for service-${i} is set to service-${i}-8080.`),
+  ].join(" ");
+  assert.equal(extractDecisionCandidates(mixed).length, 5, "decision cap is unaffected by fact-shaped sentences");
+  assert.equal(extractFactCandidates(mixed).length, 5, "fact cap is unaffected by decision-shaped sentences");
 });

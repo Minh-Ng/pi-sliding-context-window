@@ -10,6 +10,7 @@ import {
   deduplicateToolResults,
   estimateTokens,
   extractDecisionCandidates,
+  extractFactCandidates,
   extractSalientTerms,
   externalizeLargeToolArguments,
   externalizeLargeToolResults,
@@ -1333,6 +1334,31 @@ export class EpochWindowSession {
                 sourceFirstKey: sourceMessageKeys[0],
                 sourceLastKey: sourceMessageKeys.at(-1),
                 sourceMessageCount: sourceMessageKeys.length,
+              },
+            }, { deferPrune: true });
+          }
+          // Verbatim fact-shaped sentences (a typed value/path/url anchor
+          // bound by a cue like "is"/"uses"/"lives in") become their own
+          // searchable, additive records alongside decision candidates
+          // (ultracode task #39). Same discipline: the raw turn stays
+          // archived either way, so a missed extraction degrades to the
+          // status quo, and no subjectKey is assigned -- these are
+          // candidates for the agent to promote, not an auto-deduplicated
+          // record.
+          for (const fact of extractFactCandidates(text)) {
+            this.archive.put({
+              sessionId: this.sessionId,
+              project: this.project,
+              kind: "fact-candidate",
+              text: fact.text,
+              createdAt: Number(first?.timestamp) || Date.now(),
+              metadata: {
+                sourceTurnId: id,
+                sourceMessageKeys,
+                sourceFirstKey: sourceMessageKeys[0],
+                sourceLastKey: sourceMessageKeys.at(-1),
+                sourceMessageCount: sourceMessageKeys.length,
+                factAnchor: fact.anchor,
               },
             }, { deferPrune: true });
           }

@@ -12,6 +12,7 @@ export const DEFAULT_RETENTION_CLASS_BY_KIND = Object.freeze({
   "tool-result": "ephemeral-payload",
   "tool-argument": "ephemeral-payload",
   "decision-candidate": "derived-evidence",
+  "fact-candidate": "derived-evidence",
   manual: "durable-evidence",
 });
 

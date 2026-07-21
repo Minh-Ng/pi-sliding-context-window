@@ -11,7 +11,9 @@ import {
   formatGatherResults,
   formatPromotePacket,
   formatRecalledDocument,
+  formatRecallFailure,
   formatSearchResults,
+  formatSupersedeResult,
   formatStatusDetails,
   formatStatusLine,
   formatTraversalResults,
@@ -222,6 +224,63 @@ test("gather names an expired-match count and retention class without exposing c
   };
   const output = formatGatherResults(gather, 500);
   assert.match(output, /2 matching documents expired \(conversation-source retention 90d\)\./);
+});
+
+test("supersede names a dependents count and recallable IDs without exposing content, singular and plural", () => {
+  const result = {
+    documentId: "replacement-doc",
+    superseded: { documentId: "target-doc", version: 1 },
+    dependents: { count: 1, documentIds: ["citing-doc"] },
+  };
+  const singular = formatSupersedeResult(result);
+  assert.match(singular, /^Superseded target-doc@1 with replacement-doc\.$/m);
+  assert.match(singular, /1 later document references this document \(citing-doc\)\.$/);
+
+  const plural = formatSupersedeResult({
+    ...result,
+    dependents: { count: 2, documentIds: ["citing-doc-a", "citing-doc-b"] },
+  });
+  assert.match(plural, /2 later documents reference this document \(citing-doc-a, citing-doc-b\)\.$/);
+});
+
+test("supersede omits the dependents notice when nothing was found", () => {
+  const base = {
+    documentId: "replacement-doc",
+    superseded: { documentId: "target-doc", version: 1 },
+  };
+  const withoutField = formatSupersedeResult(base);
+  const withZeroCount = formatSupersedeResult({ ...base, dependents: { count: 0, documentIds: [] } });
+  assert.equal(withoutField, "Superseded target-doc@1 with replacement-doc.");
+  assert.equal(withoutField, withZeroCount);
+});
+
+test("recall failure names the status, reason, and any dependents for a superseded target without exposing content", () => {
+  const failure = formatRecallFailure({
+    status: "superseded",
+    documentId: "target-doc",
+    version: 1,
+    reason: "Explicitly replaced by a later decision.",
+    dependents: { count: 1, documentIds: ["citing-doc"] },
+  }, 500);
+  assert.match(failure, /Archived document target-doc@1 is superseded: Explicitly replaced by a later decision\./);
+  assert.match(failure, /1 later document references this document \(citing-doc\)\./);
+});
+
+test("recall failure omits the dependents notice when the target is expired or nothing was found", () => {
+  const expired = formatRecallFailure({
+    status: "expired",
+    documentId: "target-doc",
+    reason: "Retention removed this version.",
+  }, 500);
+  assert.equal(expired.includes("later document"), false);
+
+  const withoutDependents = formatRecallFailure({
+    status: "superseded",
+    documentId: "target-doc",
+    version: 1,
+    reason: "Explicitly replaced.",
+  }, 500);
+  assert.equal(withoutDependents.includes("later document"), false);
 });
 
 test("gather omits the expired-match notice when nothing expired", () => {

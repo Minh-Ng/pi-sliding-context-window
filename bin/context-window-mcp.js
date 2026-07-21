@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Archive } from "../src/archive/archive.js";
 import { claimSqliteBackendAuthority } from "../src/archive/backend-authority.js";
-import { DaemonArchive } from "../src/archive/daemon-archive.js";
+import { ArchiveRecallError, DaemonArchive } from "../src/archive/daemon-archive.js";
 import { loadConfig } from "../src/config.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import { LineFramer } from "../src/daemon/framing.js";
@@ -19,6 +19,7 @@ import {
   formatGatherResults,
   formatPromotePacket,
   formatRecalledDocument,
+  formatRecallFailure,
   formatRedactResult,
   formatSearchResults,
   formatSupersedeResult,
@@ -332,11 +333,30 @@ function callTool(name, args = {}) {
       }));
     }
     case "context_recall": {
-      const document = archive.get(String(args.id ?? ""));
-      return textResult(
-        formatRecalledDocument(document, config.searchResultTokens * 2, args.id),
-        !document,
-      );
+      try {
+        const requestedId = String(args.id ?? "");
+        const document = archive.get(requestedId);
+        if (document) {
+          return textResult(formatRecalledDocument(document, config.searchResultTokens * 2, args.id));
+        }
+        // get() collapses a superseded/expired plain documentId to undefined
+        // (it must stay "resolved document, or undefined" for its other
+        // callers); ask separately so a superseded recall still surfaces its
+        // status and any later-document dependents (ultracode task #36)
+        // instead of a bare "not found".
+        if (typeof archive.recallStatus === "function") {
+          const failure = archive.recallStatus(requestedId);
+          if (failure?.status === "superseded" || failure?.status === "expired") {
+            return textResult(formatRecallFailure(failure, config.searchResultTokens * 2), true);
+          }
+        }
+        return textResult(formatRecalledDocument(document, config.searchResultTokens * 2, args.id), true);
+      } catch (error) {
+        if (error instanceof ArchiveRecallError) {
+          return textResult(formatRecallFailure(error, config.searchResultTokens * 2), true);
+        }
+        throw error;
+      }
     }
     case "context_window_archive": {
       if ((args.subjectKey !== undefined || args.supersedes !== undefined)

@@ -455,6 +455,79 @@ test("MCP archive tool admits a subjectKey and requires supersedes to replace it
   }
 });
 
+test("MCP surfaces citing documents on supersede and on recall of the superseded document", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-dependents-"));
+  const storePath = join(directory, "archive.rocks");
+  const socketPath = defaultSocketPath(storePath);
+  const project = join(directory, "project");
+  const child = startRocksServer({ directory, storePath, socketPath, project });
+  const rpc = rpcClient(child);
+  let daemonProcessId;
+
+  try {
+    const first = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "decision",
+        text: "The team settled on the original release process.",
+        subjectKey: "decision:release-process",
+      },
+    });
+    const firstId = first.result.content[0].text.match(/^Archived as (\S+)\.$/u)?.[1];
+    assert.ok(firstId, "first archive call must report a document id");
+
+    const citing = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: {
+        kind: "turn",
+        text: `Per ${firstId}, the rollout begins Friday.`,
+      },
+    });
+    assert.equal(citing.result.isError, false);
+
+    const unrelated = await rpc.request("tools/call", {
+      name: "context_window_archive",
+      arguments: { kind: "turn", text: "The office plants were watered today." },
+    });
+    assert.equal(unrelated.result.isError, false);
+
+    const superseded = await rpc.request("tools/call", {
+      name: "context_window_supersede",
+      arguments: { documentId: firstId, note: "The team moved to the new release process." },
+    });
+    assert.equal(superseded.error, undefined);
+    assert.equal(superseded.result.isError, false);
+    assert.match(superseded.result.content[0].text, /1 later document references this document/u);
+    assert.match(superseded.result.content[0].text, new RegExp(citing.result.content[0].text.match(/Archived as (\S+)/u)[1]));
+    assert.doesNotMatch(superseded.result.content[0].text, new RegExp(unrelated.result.content[0].text.match(/Archived as (\S+)/u)[1]));
+
+    const recalled = await rpc.request("tools/call", {
+      name: "context_recall",
+      arguments: { id: firstId },
+    });
+    assert.equal(recalled.error, undefined);
+    assert.equal(recalled.result.isError, true);
+    assert.match(recalled.result.content[0].text, /is superseded/u);
+    assert.match(recalled.result.content[0].text, /1 later document references this document/u);
+
+    child.stdin.end();
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 0);
+  } finally {
+    rpc.close();
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    if (!daemonProcessId) {
+      try { daemonProcessId = (await daemonStatus(socketPath, project)).processId; } catch {}
+    }
+    await stopProcess(daemonProcessId);
+    rmSync(socketPath, { force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP recall renders archive, source-message, and tool-result provenance", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-window-mcp-provenance-"));
   const databasePath = join(directory, "archive.db");

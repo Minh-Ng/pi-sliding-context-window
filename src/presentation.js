@@ -34,6 +34,20 @@ function expiredMatchesNotice(expiredMatches) {
   return `${expiredMatches.count} matching ${plural} expired${classes ? ` (${classes})` : ""}.`;
 }
 
+/** Surface-only invalidation cascade (ultracode task #36): name the count and
+ * recallable IDs of later documents that already showed signs of referencing
+ * a document once it is superseded (or recalled after being superseded) —
+ * never their content, and never an instruction to act on them. The agent
+ * judges whether any of them need reconciling. */
+function dependentsNotice(dependents) {
+  if (!dependents || dependents.count <= 0) return undefined;
+  const singular = dependents.count === 1;
+  const noun = singular ? "document" : "documents";
+  const verb = singular ? "references" : "reference";
+  const ids = dependents.documentIds.join(", ");
+  return `${dependents.count} later ${noun} ${verb} this document${ids ? ` (${ids})` : ""}.`;
+}
+
 /**
  * A stopping-criterion contract, not a decoration: the consuming agent reads
  * this label to decide whether to keep recalling rather than parsing the raw
@@ -341,6 +355,26 @@ function additionalProvenance(provenance) {
   return lines.length === 1 ? "" : lines.join("\n");
 }
 
+/**
+ * Recall of a locator whose target has since been superseded or expired
+ * fails with a structured ArchiveRecallError rather than a document (see
+ * DaemonArchive#recall in src/archive/daemon-archive.js). Render that
+ * gracefully instead of leaving it an uncaught, unstructured RPC error:
+ * name the status and, for a superseded target, any later documents that
+ * already show signs of referencing it (ultracode task #36) so the agent
+ * can decide whether to look further rather than just re-searching blind.
+ */
+export function formatRecallFailure(error, tokenLimit) {
+  const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
+  const locator = error.documentId
+    ? ` ${error.documentId}${error.version ? `@${error.version}` : ""}`
+    : "";
+  const lines = [`${heading}\n\nArchived document${locator} is ${error.status}: ${error.reason ?? "unavailable"}.`];
+  const notice = dependentsNotice(error.dependents);
+  if (notice) lines.push(notice);
+  return capText(lines.join("\n"), tokenLimit);
+}
+
 export function formatRecalledDocument(document, tokenLimit, requestedId) {
   const heading = `[${ARCHIVED_EVIDENCE_LABEL}]`;
   if (!document) {
@@ -486,7 +520,10 @@ export function formatRedactResult(result) {
 
 export function formatSupersedeResult(result) {
   if (!result) return "Archive supersession failed.";
-  return `Superseded ${result.superseded.documentId}@${result.superseded.version} with ${result.documentId}.`;
+  const lines = [`Superseded ${result.superseded.documentId}@${result.superseded.version} with ${result.documentId}.`];
+  const notice = dependentsNotice(result.dependents);
+  if (notice) lines.push(notice);
+  return lines.join("\n");
 }
 
 export function formatArchiveStorage(storage) {

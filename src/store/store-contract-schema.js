@@ -88,6 +88,11 @@ export const MAX_DIRECT_DOCUMENT_SOURCE_BYTES = 1 * 1_024 * 1_024;
 export const MAX_DIRECT_DOCUMENT_RESPONSE_BYTES = 8 * 1_024 * 1_024;
 export const MAX_DIRECT_CHUNK_TABLE_ENTRIES = 256;
 export const MAX_DIRECT_SOURCE_MESSAGE_KEYS = 16;
+// Dependent-document cascade surfacing (ultracode task #36): recallable IDs
+// returned alongside a superseded document's dependents count. See
+// MAX_DEPENDENT_DOCUMENT_IDS in src/rocksdb/dependents.js, which this mirrors
+// so the wire contract and the bounded lookup that fills it never drift.
+export const MAX_DEPENDENT_DOCUMENT_IDS = 10;
 // Recall repeats bounded content across chunk, plain-text, and rendered-text
 // response fields. Keep the complete encoded response below the 16 MiB wire
 // frame even under worst-case JSON escaping.
@@ -498,6 +503,18 @@ const expiredMatchesSummary = object({
   retentionClasses: array(enumeration(RETENTION_CLASSES), { maxItems: RETENTION_CLASSES.length }),
 });
 
+// Surface-only invalidation cascade (ultracode task #36): a bounded,
+// postings-only count of later-admitted documents that show signs of
+// referencing a document once it is superseded, plus a capped, recallable
+// subset of their IDs. Never includes their content and never implies any
+// action was taken on them -- see findDependentDocuments in
+// src/rocksdb/dependents.js. Optional wherever it appears below so older
+// daemons/clients that predate this field validate unchanged.
+const dependentDocumentsSummary = object({
+  count: nonNegativeInteger,
+  documentIds: array(identifier, { maxItems: MAX_DEPENDENT_DOCUMENT_IDS }),
+});
+
 const searchResponse = object({
   mode: enumeration(RETRIEVAL_MODES),
   status: enumeration(["resolved", "not-found", "ambiguous", "legacy-fallback"]),
@@ -600,6 +617,9 @@ const unresolvedRecall = object({
   version: positiveInteger,
   reason: string({ minLength: 1, maxLength: 8_192 }),
   replacementLocator: identifier,
+  // Present only when status is "superseded" and the bounded lookup found at
+  // least one later document referencing it (ultracode task #36).
+  dependents: dependentDocumentsSummary,
 }, ["status", "reason"]);
 
 const gatheredEvidence = object({
@@ -713,6 +733,9 @@ const documentReadResponse = anyOf(
     documentId: identifier,
     version: positiveInteger,
     reason: string({ minLength: 1, maxLength: 8_192 }),
+    // Present only when status is "superseded" and the bounded lookup found
+    // at least one later document referencing it (ultracode task #36).
+    dependents: dependentDocumentsSummary,
   }, ["status", "documentId"]),
 );
 
@@ -810,7 +833,12 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       version: positiveInteger,
       sourceKey: identifier,
       outboxSequence: positiveInteger,
-    }),
+      // Present only when this admission carried an explicit `supersedes`
+      // pointer and the bounded lookup found at least one later document
+      // already referencing the document it just superseded (ultracode task
+      // #36).
+      dependents: dependentDocumentsSummary,
+    }, ["status", "documentId", "version", "sourceKey", "outboxSequence"]),
   },
   "store.get": {
     request: object({

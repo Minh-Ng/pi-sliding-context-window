@@ -1719,6 +1719,251 @@ test("real daemon exposes supersession and completes multi-wave redaction", asyn
   }
 });
 
+test("supersede and recall surface a document that cites the superseded subject, never an unrelated one", async () => {
+  const paths = fixture("context-window-dependents-facade-");
+  const project = "/project/dependents-facade";
+  const sessionId = "session-dependents-facade";
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project,
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    archive.put({
+      id: "decision-queue-config",
+      sessionId,
+      project,
+      kind: "decision-candidate",
+      text: "Use the original queue configuration.",
+      createdAt: 100,
+    });
+    archive.put({
+      id: "note-citing-decision",
+      sessionId,
+      project,
+      kind: "turn",
+      text: "Per decision-queue-config, the migration proceeds Monday.",
+      createdAt: 200,
+    });
+    archive.put({
+      id: "note-unrelated",
+      sessionId,
+      project,
+      kind: "turn",
+      text: "Lunch plans moved to noon.",
+      createdAt: 300,
+    });
+
+    const replacement = archive.supersede({
+      documentId: "decision-queue-config",
+      note: "Use the replacement queue configuration.",
+    });
+    assert.equal(replacement.superseded.documentId, "decision-queue-config");
+    assert.deepEqual(replacement.dependents, {
+      count: 1,
+      documentIds: ["note-citing-decision"],
+    });
+
+    // get() must keep its own "resolved document, or undefined" contract
+    // for its other, unguarded callers (see recallStatus's own comment in
+    // src/archive/daemon-archive.js); recallStatus is the dedicated,
+    // non-throwing way to learn *why* -- and, for a superseded target, who
+    // already cites it.
+    assert.equal(archive.get("decision-queue-config"), undefined);
+    const status = archive.recallStatus("decision-queue-config");
+    assert.equal(status.status, "superseded");
+    assert.deepEqual(status.dependents, { count: 1, documentIds: ["note-citing-decision"] });
+
+    // A locator is never handed a status of its own; recallStatus is a no-op
+    // for one, and get()/recall() throw instead (covered by the ArchiveRecallError
+    // forwarding test below).
+    assert.equal(archive.recallStatus("cw1.not-a-real-locator"), undefined);
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("supersede without an explicit note or text never reports its own default replacement as a dependent", async () => {
+  // supersede()'s default replacement text ("Supersedes <targetId>@<version>.")
+  // embeds the target's own documentId, which the exact indexer mines as an
+  // anchor citation on the replacement itself. Every surfacing path --
+  // the supersede() result, recallStatus() (store.get), and recall() of the
+  // target's own pre-supersede locator (store.recall) -- must exclude that
+  // deliberate replacement from `dependents`, not just the true citing note.
+  const paths = fixture("context-window-dependents-noteless-");
+  const project = "/project/dependents-noteless";
+  const sessionId = "session-dependents-noteless";
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project,
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    archive.put({
+      id: "decision-noteless-target",
+      sessionId,
+      project,
+      kind: "decision-candidate",
+      text: "Use the original noteless configuration.",
+      createdAt: 100,
+    });
+    const targetLocator = archive.search("noteless configuration", { sessionId, project })[0]?.id;
+    assert.ok(targetLocator, "search must resolve a locator for the target before it is superseded");
+
+    archive.put({
+      id: "note-citing-noteless-target",
+      sessionId,
+      project,
+      kind: "turn",
+      text: "Per decision-noteless-target, the rollout starts Tuesday.",
+      createdAt: 200,
+    });
+
+    const replacement = archive.supersede({ documentId: "decision-noteless-target" });
+    assert.equal(replacement.superseded.documentId, "decision-noteless-target");
+    assert.deepEqual(
+      replacement.dependents,
+      { count: 1, documentIds: ["note-citing-noteless-target"] },
+      "supersede()'s own result must not report its default-text replacement as its own dependent",
+    );
+
+    const status = archive.recallStatus("decision-noteless-target");
+    assert.equal(status.status, "superseded");
+    assert.deepEqual(
+      status.dependents,
+      { count: 1, documentIds: ["note-citing-noteless-target"] },
+      "recallStatus (store.get) must agree with the supersede result",
+    );
+
+    assert.throws(
+      () => archive.recall(targetLocator),
+      (error) => error instanceof ArchiveRecallError
+        && error.status === "superseded"
+        && error.dependents?.count === 1
+        && error.dependents.documentIds[0] === "note-citing-noteless-target"
+        && !error.dependents.documentIds.includes(replacement.documentId),
+      "recall() (store.recall) of the target's old locator must also exclude the replacement itself",
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("supersede forwards the store's dependents summary instead of dropping it", async () => {
+  const paths = fixture("context-window-dependents-put-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/dependents-put-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    archive.put({
+      id: "target-doc",
+      sessionId: "session-a",
+      text: "Original decision text.",
+      createdAt: 100,
+    });
+
+    // The daemon's own store.put response can carry a dependents summary
+    // (proven end-to-end above); this test isolates the facade's own
+    // reshaping of that response. put() previously collapsed every result
+    // down to a bare documentId string and supersede() rebuilt its return
+    // value with a fixed key set -- either would silently drop the field.
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      const result = realRequest(operation, payload, options);
+      if (operation !== "store.put") return result;
+      return { ...result, dependents: { count: 1, documentIds: ["citing-doc"] } };
+    };
+
+    const result = archive.supersede({ documentId: "target-doc", note: "Replacement text." });
+    assert.deepEqual(result.dependents, { count: 1, documentIds: ["citing-doc"] });
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test("recall forwards the store's dependents summary through ArchiveRecallError instead of dropping it", async () => {
+  const paths = fixture("context-window-dependents-recall-wiring-");
+  let archive;
+  let daemonProcessId;
+  try {
+    archive = new DaemonArchive({
+      ...paths,
+      project: "/project/dependents-recall-wiring",
+      requestTimeoutMs: 30_000,
+      daemonStartTimeoutMs: 20_000,
+    });
+    daemonProcessId = archive.stats().processId;
+
+    const realRequest = archive.request.bind(archive);
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.recall") return realRequest(operation, payload, options);
+      return {
+        status: "superseded",
+        documentId: "target-doc",
+        version: 1,
+        reason: "Explicitly replaced by a later decision.",
+        dependents: { count: 1, documentIds: ["citing-doc"] },
+      };
+    };
+
+    assert.throws(
+      () => archive.recall("cw1.not-a-real-locator"),
+      (error) => error instanceof ArchiveRecallError
+        && error.status === "superseded"
+        && error.documentId === "target-doc"
+        && error.dependents?.count === 1
+        && error.dependents.documentIds[0] === "citing-doc",
+    );
+
+    // recallStatus's own store.get forwarding, same drop point.
+    archive.request = (operation, payload, options) => {
+      if (operation !== "store.get") return realRequest(operation, payload, options);
+      return {
+        status: "superseded",
+        documentId: "target-doc",
+        version: 1,
+        reason: "Explicitly replaced by a later decision.",
+        dependents: { count: 1, documentIds: ["citing-doc"] },
+      };
+    };
+    assert.deepEqual(
+      archive.recallStatus("target-doc").dependents,
+      { count: 1, documentIds: ["citing-doc"] },
+    );
+  } finally {
+    try { archive?.close(); } catch {}
+    await stopProcess(daemonProcessId);
+    rmSync(paths.socketPath, { force: true });
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
 test("a direct StoreClient first write permanently claims RocksDB before SQLite can open", async () => {
   const paths = fixture("context-window-direct-client-authority-");
   const sourcePath = join(paths.directory, "archive.db");

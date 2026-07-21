@@ -7,6 +7,7 @@ import {
   manifestKeys,
   retiredDocumentStatus,
 } from "../rocksdb/manifests.js";
+import { findDependentDocuments } from "../rocksdb/dependents.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
 import { tokenizeWithByteOffsets } from "../rocksdb/windows.js";
 import {
@@ -26,12 +27,16 @@ const MAX_FULL_TURN_RECALL_BYTES = 64 * 1_024;
 // unusually small windows cannot turn one recall into an unbounded scan.
 const MAX_SPAN_GROWTH_WINDOWS = 256;
 
-function unresolved(status, reason, claims) {
+function unresolved(status, reason, claims, dependents) {
   const result = { status, reason };
   if (claims) {
     result.documentId = claims.documentId;
     result.version = claims.documentVersion;
   }
+  // Surface-only invalidation cascade (ultracode task #36): only ever
+  // attached by the "superseded" call site below, and only when the bounded
+  // lookup actually found something.
+  if (dependents !== undefined) result.dependents = dependents;
   return assertStoreResult("store.recall", result);
 }
 
@@ -352,7 +357,45 @@ async function recallSnapshot(view, request, options, secret, claims) {
   const supersession = supersessionFor(view, claims);
   if (supersession) {
     const status = supersession.status === "superseded" ? "superseded" : "expired";
-    return unresolved(status, supersession.reason ?? `The archived version is ${supersession.status}.`, claims);
+    let dependents;
+    if (status === "superseded") {
+      // The target's own canonical record is still readable here even though
+      // it is no longer live; recall of a superseded document is exactly the
+      // moment a caller learns it was stale, so surface any later document
+      // that already shows signs of referencing it (ultracode task #36).
+      const manifest = await view.get(manifestKeys.document(claims.documentId, claims.documentVersion));
+      if (manifest !== undefined) {
+        try {
+          // `replacementDocumentId` excludes the deliberate replacement
+          // itself from the signals below -- without it, a note-less
+          // supersede's default replacement text ("Supersedes
+          // <targetId>@<version>.") embeds the target's own documentId,
+          // which the exact indexer mines as an anchor citation on the
+          // replacement, misreporting it as its own dependent. Best-effort,
+          // like the put()/get() paths' own lookups: a fault here (e.g. a
+          // legacy manifest failing the target-identity check) must not
+          // turn an otherwise-graceful "superseded" recall into an RPC error.
+          const found = await findDependentDocuments(view, {
+            documentId: manifest.documentId,
+            version: manifest.version,
+            project: manifest.project,
+            sessionId: manifest.sessionId,
+            createdAt: manifest.createdAt,
+            subjectKey: manifest.subjectKey,
+            sourceMessageKeys: manifest.sourceMessageKeys,
+          }, { replacementDocumentId: supersession.replacementDocumentId });
+          if (found.count > 0) dependents = found;
+        } catch (error) {
+          options.recordBackgroundError?.(error);
+        }
+      }
+    }
+    return unresolved(
+      status,
+      supersession.reason ?? `The archived version is ${supersession.status}.`,
+      claims,
+      dependents,
+    );
   }
   const history = await view.get(manifestKeys.documentHistory(claims.documentId));
   const retired = history?.project === claims.project

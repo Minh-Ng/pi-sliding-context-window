@@ -444,6 +444,10 @@ export class ArchiveRecallError extends Error {
     this.status = response.status;
     this.documentId = response.documentId;
     this.version = response.version;
+    // Surface-only invalidation cascade (ultracode task #36): only present
+    // when status is "superseded" and the daemon's bounded lookup found at
+    // least one later document already referencing this one.
+    this.dependents = response.dependents;
   }
 }
 
@@ -600,7 +604,7 @@ export class DaemonArchive {
       : undefined;
     const replacementText = String(text ?? note ?? "").trim()
       || `Supersedes ${targetId}@${targetVersion}.`;
-    const id = this.put({
+    const admitted = this.putDetailed({
       sessionId: requiredString(sessionId ?? head.sessionId, "sessionId"),
       project: this.project,
       kind: "decision-candidate",
@@ -613,8 +617,15 @@ export class DaemonArchive {
       ...(subjectKey === undefined ? {} : { subjectKey }),
       supersedes: { documentId: targetId, version: targetVersion },
     });
-    if (!id) throw new Error("Failed to admit superseding document.");
-    return { documentId: id, superseded: { documentId: targetId, version: targetVersion } };
+    if (!admitted?.documentId) throw new Error("Failed to admit superseding document.");
+    return {
+      documentId: admitted.documentId,
+      superseded: { documentId: targetId, version: targetVersion },
+      // Surface-only invalidation cascade (ultracode task #36): present only
+      // when a later document already showed signs of referencing the
+      // document this call just superseded.
+      ...(admitted.dependents === undefined ? {} : { dependents: admitted.dependents }),
+    };
   }
 
   redact({
@@ -698,7 +709,15 @@ export class DaemonArchive {
     }
   }
 
-  put(
+  put(document, options = {}) {
+    return this.putDetailed(document, options)?.documentId;
+  }
+
+  // Same admission as put(), but returns the full wire-visible result
+  // (currently just documentId plus an optional dependents summary) instead
+  // of collapsing it down to a bare ID. supersede() needs the dependents
+  // field put()'s callers otherwise never see (ultracode task #36).
+  putDetailed(
     {
       id,
       sessionId,
@@ -787,7 +806,10 @@ export class DaemonArchive {
           this.protectedDocumentIds.add(documentId);
           this.syncProtection();
         }
-        return result.documentId;
+        return {
+          documentId: result.documentId,
+          ...(result.dependents === undefined ? {} : { dependents: result.dependents }),
+        };
       } catch (error) {
         if (attempt === 3 || !retriableAdmissionConflict(error)) throw error;
         advanceAfterConflict = true;
@@ -799,6 +821,24 @@ export class DaemonArchive {
   get(id, options = {}) {
     if (looksLikeLocator(id)) return this.recall(id, options);
     return legacyDocument(this.canonicalGet(id));
+  }
+
+  /**
+   * Non-throwing companion to get()/recall() for exactly the case those two
+   * collapse to undefined: a plain documentId (not a locator) whose
+   * canonical record is not currently live. get() must keep returning
+   * "resolved document, or undefined" for its other callers (checkpoint
+   * reconstruction in particular chains several unguarded get() calls), so
+   * this is a separate, explicitly-named lookup rather than a change to
+   * get()'s own contract. Returns the raw failure detail -- status,
+   * documentId, version, reason and, for a superseded target, a bounded
+   * dependents summary (ultracode task #36) -- or undefined when `id` is a
+   * locator or the document is actually live.
+   */
+  recallStatus(id) {
+    if (looksLikeLocator(id)) return undefined;
+    const response = this.request("store.get", { documentId: requiredString(id, "id") });
+    return response.status === "resolved" ? undefined : response;
   }
 
   recall(id, {

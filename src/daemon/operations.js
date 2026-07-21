@@ -10,6 +10,7 @@ import {
   retiredDocumentStatus,
 } from "../rocksdb/manifests.js";
 import { encodeKey, KEYSPACE } from "../rocksdb/keys.js";
+import { findDependentDocuments } from "../rocksdb/dependents.js";
 import { createExactIndexHandler } from "../rocksdb/index/exact.js";
 import { createBm25IndexHandler } from "../rocksdb/index/bm25.js";
 import { createStructuralIndexHandler } from "../rocksdb/index/structural.js";
@@ -528,7 +529,42 @@ export class DaemonOperations {
       this.scheduleIndexing();
     }
     this.semantic.enqueueDocument(result.documentId, result.version);
+    if (payload.document.supersedes !== undefined) {
+      const dependents = await this.dependentsForSupersededTarget(
+        payload.document.supersedes,
+        context.project,
+        result.documentId,
+      );
+      if (dependents !== undefined && dependents.count > 0) {
+        return assertStoreResult("store.put", { ...result, dependents });
+      }
+    }
     return result;
+  }
+
+  // Surface-only invalidation cascade (ultracode task #36): once this
+  // admission's `supersedes` pointer retires an older document, report
+  // whether any later-admitted document already shows signs of referencing
+  // it (see findDependentDocuments). Best-effort: a lookup fault here must
+  // never turn a committed write into an apparent admission failure, so
+  // failures are recorded and swallowed rather than thrown.
+  async dependentsForSupersededTarget(target, project, replacementDocumentId) {
+    try {
+      const manifest = await this.store.get(manifestKeys.document(target.documentId, target.version));
+      if (manifest === undefined || manifest.project !== project) return undefined;
+      return this.store.snapshot((view) => findDependentDocuments(view, {
+        documentId: manifest.documentId,
+        version: manifest.version,
+        project: manifest.project,
+        sessionId: manifest.sessionId,
+        createdAt: manifest.createdAt,
+        subjectKey: manifest.subjectKey,
+        sourceMessageKeys: manifest.sourceMessageKeys,
+      }, { replacementDocumentId }));
+    } catch (error) {
+      this.recordBackgroundError(error);
+      return undefined;
+    }
   }
 
   async get(payload, context) {
@@ -578,12 +614,37 @@ export class DaemonOperations {
         const snapshotRetired = snapshotHistory?.project === context.project
           ? retiredDocumentStatus(snapshotHistory, version)
           : undefined;
-        return documentReadFailure(
+        const failure = documentReadFailure(
           snapshotManifest,
           marker ?? snapshotRetired,
           payload.documentId,
           version,
         );
+        // Surface-only invalidation cascade (ultracode task #36): recall of a
+        // superseded document is exactly the moment a caller learns it was
+        // stale, so this is where later-referencing documents (if any) get
+        // surfaced. snapshotManifest is the target's own immutable record,
+        // still readable here even though it is no longer live. Best-effort,
+        // like the put() path's own lookup: a fault here (e.g. a legacy
+        // manifest that fails the target-identity check) must not turn an
+        // otherwise-graceful "superseded" response into an RPC error.
+        if (failure.status === "superseded" && snapshotManifest !== undefined) {
+          try {
+            const dependents = await findDependentDocuments(view, {
+              documentId: snapshotManifest.documentId,
+              version: snapshotManifest.version,
+              project: snapshotManifest.project,
+              sessionId: snapshotManifest.sessionId,
+              createdAt: snapshotManifest.createdAt,
+              subjectKey: snapshotManifest.subjectKey,
+              sourceMessageKeys: snapshotManifest.sourceMessageKeys,
+            }, { replacementDocumentId: marker?.replacementDocumentId });
+            if (dependents.count > 0) return { ...failure, dependents };
+          } catch (error) {
+            this.recordBackgroundError(error);
+          }
+        }
+        return failure;
       }
       if (payload.view === "identity") return directDocumentIdentity(snapshotManifest);
       if (!canMaterializeDirectDocument(snapshotManifest)) return directChunkTable(snapshotManifest);
@@ -900,6 +961,7 @@ export class DaemonOperations {
         project,
         sessionIds,
         renderFormat: this.renderFormat,
+        recordBackgroundError: (error) => this.recordBackgroundError(error),
       });
       // A signed locator authorizes exactly one project; other projects report
       // it as invalid. Keep scanning aliases until one authorizes, and only fall

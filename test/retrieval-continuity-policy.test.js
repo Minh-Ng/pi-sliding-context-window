@@ -67,12 +67,39 @@ test("explicit historical intent yields a snippet only for strong unambiguous ev
   assert.equal(strong.outcome, "historical-snippet");
   assert.equal(strong.reason, CONTINUITY_REASON.EXPLICIT_HISTORY);
 
-  const ambiguous = decideContinuityDisclosure({
-    message,
-    candidate: lexicalCandidate({ margin: 0.01 }),
+  for (const margin of [0.01, 0.08]) {
+    const ambiguous = decideContinuityDisclosure({
+      message,
+      candidate: lexicalCandidate({ margin }),
+    });
+    assert.equal(ambiguous.outcome, "continuity-marker");
+    assert.equal(ambiguous.reason, CONTINUITY_REASON.AMBIGUOUS_HISTORY);
+  }
+});
+
+test("explicit decision recall tolerates IDF diluted by its rotated source turn", () => {
+  const message = "Remember discussed what color are canary deployments?";
+  const decisionCandidate = lexicalCandidate({
+    kind: "decision-candidate",
+    matchedTerms: ["canari", "color", "deploy"],
+    termCoverage: 0.60,
+    maxNormalizedIdf: 0.58,
   });
-  assert.equal(ambiguous.outcome, "continuity-marker");
-  assert.equal(ambiguous.reason, CONTINUITY_REASON.AMBIGUOUS_HISTORY);
+  assert.equal(
+    decideContinuityDisclosure({ message, candidate: decisionCandidate }).outcome,
+    "historical-snippet",
+  );
+  assert.equal(
+    decideContinuityDisclosure({ message, candidate: { ...decisionCandidate, kind: "turn" } }).reason,
+    CONTINUITY_REASON.WEAK_EVIDENCE,
+  );
+  assert.equal(
+    decideContinuityDisclosure({
+      message: "What color are canary deployments?",
+      candidate: decisionCandidate,
+    }).reason,
+    CONTINUITY_REASON.WEAK_EVIDENCE,
+  );
 });
 
 test("lexical continuity requires two terms, coverage, and distinctive evidence", () => {
@@ -94,7 +121,7 @@ test("continuity thresholds include their exact boundary values", () => {
     lexicalTerms: 2,
     termCoverage: 0.60,
     maxNormalizedIdf: 0.60,
-    ambiguityMargin: 0.05,
+    ambiguityMargin: 0.10,
   });
   const implicitMessage = "Could tablets help with compaction here?";
   const atLexicalBoundary = decideContinuityDisclosure({
@@ -110,11 +137,11 @@ test("continuity thresholds include their exact boundary values", () => {
   const historicalMessage = "What did we decide before about tablets and compaction?";
   assert.equal(decideContinuityDisclosure({
     message: historicalMessage,
-    candidate: lexicalCandidate({ margin: 0.05 }),
+    candidate: lexicalCandidate({ margin: 0.10 }),
   }).outcome, "continuity-marker");
   assert.equal(decideContinuityDisclosure({
     message: historicalMessage,
-    candidate: lexicalCandidate({ margin: 0.050_001 }),
+    candidate: lexicalCandidate({ margin: 0.100_001 }),
   }).outcome, "historical-snippet");
 });
 
@@ -227,6 +254,19 @@ test("a subterm-only match anchors on the whole identifier the user typed, not a
   });
   const decision = decideContinuityDisclosure({ message, candidate });
   assert.deepEqual(decision.anchors, ["handleRotationCheckpoint", "validateSnapshotSync"]);
+});
+
+test("routing intent recognizes explicit recall without broadening ordinary remember commands", () => {
+  for (const message of [
+    "Recall: What color are canary deploys?",
+    "Can you remember what we chose for canary deploys?",
+    "Remember when we chose the canary convention?",
+    "Remember discussed what color are canary deployments?",
+    "Do you remember our discussion about canary deployments?",
+  ]) {
+    assert.equal(continuityIntent(message).historical, true, message);
+  }
+  assert.equal(continuityIntent("Remember to run the tests.").historical, false);
 });
 
 test("routing intent remains narrow enough for implicit concepts", () => {

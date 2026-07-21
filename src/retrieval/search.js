@@ -115,6 +115,14 @@ function requireStore(store) {
   return store;
 }
 
+function recordStageTiming(options, stage, startedAt) {
+  if (typeof options.recordStageTiming !== "function") return;
+  const durationMs = Math.max(0, performance.now() - startedAt);
+  try {
+    options.recordStageTiming(stage, durationMs);
+  } catch { /* diagnostics must not affect retrieval */ }
+}
+
 function normalizeRequest(request) {
   assertStoreRequest("store.search", request);
   if (typeof request.project !== "string" || request.project.length === 0) {
@@ -377,6 +385,7 @@ async function structuralCandidate(view, result, generation, request) {
       project: manifest.project,
       sessionId: manifest.sessionId,
       turnId: semanticIdentifier(result.structural?.sourceTurnId)
+        ?? semanticIdentifier(manifest.metadata?.sourceTurnId)
         ?? semanticIdentifier(manifest.metadata?.turnId)
         ?? null,
       messageKey: semanticIdentifier(result.structural?.messageKey)
@@ -910,7 +919,13 @@ function shouldTrySemantic(collected, request, options) {
 
 async function broadenWithSemantic(collected, request, options) {
   if (!shouldTrySemantic(collected, request, options)) return collected;
-  const results = await options.semantic.search(request);
+  const startedAt = performance.now();
+  let results;
+  try {
+    results = await options.semantic.search(request);
+  } finally {
+    recordStageTiming(options, "semanticMs", startedAt);
+  }
   // Fuse over the pre-fusion pool (see broadenWithExpansion) so a document
   // whose lexical copy already lost the identity collapse still contributes
   // its lexical rank to this pass's cross-mode RRF recomputation.
@@ -1212,9 +1227,15 @@ export async function applyWorkingSetBoost(store, collected, request) {
  * preflight call) skips this entirely -- `options.reranker` is undefined, so
  * the ternary below never even constructs the ranked-candidates array.
  */
-async function rerankTierOne(reranker, collected, request) {
+async function rerankTierOne(reranker, collected, request, options) {
   if (!reranker || typeof reranker.rerank !== "function") return collected;
-  const reranked = await reranker.rerank(request.query, collected.candidates);
+  const startedAt = performance.now();
+  let reranked;
+  try {
+    reranked = await reranker.rerank(request.query, collected.candidates);
+  } finally {
+    recordStageTiming(options, "rerankerMs", startedAt);
+  }
   if (reranked === collected.candidates) return collected;
   return Object.freeze({ ...collected, candidates: Object.freeze(reranked) });
 }
@@ -1371,7 +1392,13 @@ export async function searchArchive(store, request, options = {}) {
     secret: resolvedOptions.secret,
     now,
   });
-  const lexical = await store.snapshot((view) => collectCandidates(view, normalized, resolvedOptions));
+  const candidateSearchStartedAt = performance.now();
+  let lexical;
+  try {
+    lexical = await store.snapshot((view) => collectCandidates(view, normalized, resolvedOptions));
+  } finally {
+    recordStageTiming(resolvedOptions, "candidateSearchMs", candidateSearchStartedAt);
+  }
   // Cheap, deterministic, index-only broadening runs before the heavier
   // (and only conditionally available) semantic fallback.
   const expanded = await broadenWithExpansion(store, lexical, normalized, resolvedOptions);
@@ -1400,7 +1427,12 @@ export async function searchArchive(store, request, options = {}) {
   // only (resolvedOptions.reranker, set by the daemon's store.search/gather
   // operations -- see rerankTierOne above). Automatic preflight never sets
   // this option, so frozen hints stay byte-identical.
-  const reranked = await rerankTierOne(resolvedOptions.reranker, workingSetRanked, normalized);
+  const reranked = await rerankTierOne(
+    resolvedOptions.reranker,
+    workingSetRanked,
+    normalized,
+    resolvedOptions,
+  );
   // Dedup is an explicit-search affordance only (options.dedupe, set by the
   // daemon's store.search operation). The automatic preflight path never opts
   // in, so frozen hints stay byte-identical. Runs last, over the fully ranked

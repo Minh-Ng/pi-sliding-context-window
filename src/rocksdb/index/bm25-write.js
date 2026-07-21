@@ -423,7 +423,8 @@ async function analyzeDocumentFromRanges(context) {
 }
 
 function sourceMetadata(manifest) {
-  const turnId = semanticIdentifier(manifest.metadata?.turnId);
+  const turnId = semanticIdentifier(manifest.metadata?.sourceTurnId)
+    ?? semanticIdentifier(manifest.metadata?.turnId);
   return {
     sessionId: manifest.sessionId,
     sourceMessageKeys: manifest.sourceMessageKeys,

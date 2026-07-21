@@ -37,6 +37,7 @@ const CAPACITY_BUSY = "capacity-busy";
 const STALE = "stale";
 const UNAVAILABLE = "unavailable";
 const upgradeSignals = new Set();
+const CLIENT_SLOW_REQUEST_MS = 250;
 
 function canonicalPath(path) {
   try {
@@ -287,6 +288,8 @@ async function ensureClient({
   launch = true,
   deadline = Date.now() + options.daemonStartTimeoutMs,
 } = {}) {
+  const ensureStartedAt = Date.now();
+  let launchAttempts = 0;
   if (!socketDirectoryValidated) {
     ensureSecureSocketDirectory(options.socketPath);
     socketDirectoryValidated = true;
@@ -311,6 +314,7 @@ async function ensureClient({
   let backoffMs = 10;
   while (Date.now() < deadline) {
     if (Date.now() >= nextLaunchAt) {
+      launchAttempts += 1;
       launchDaemon();
       // A launch may lose the store lock to a daemon that is still shutting
       // down. Retry ownership periodically until the shared readiness
@@ -318,7 +322,16 @@ async function ensureClient({
       nextLaunchAt = Date.now() + 500;
     }
     const outcome = await tryConnect();
-    if (outcome === CONNECTED) return client;
+    if (outcome === CONNECTED) {
+      if (launchAttempts > 0) {
+        recordLifecycle("daemon-ready", {
+          processId: client.server.processId,
+          durationMs: Math.max(0, Date.now() - ensureStartedAt),
+          launchAttempts,
+        });
+      }
+      return client;
+    }
     if (outcome === CAPACITY_BUSY) {
       // A live daemon owns the socket and store. Wait for a connection slot;
       // launching competitors only creates lock churn while it is saturated.
@@ -358,20 +371,50 @@ async function send(active, operation, payload, requestId) {
 }
 
 async function request(operation, payload, requestId) {
-  let reconnectDeadline;
-  for (;;) {
-    const active = reconnectDeadline === undefined
-      ? await ensureClient()
-      : await ensureClient({ deadline: reconnectDeadline });
-    try {
-      return await send(active, operation, payload, requestId);
-    } catch (error) {
-      if (!connectionFailure(error)) throw error;
-      discardClient();
-      reconnectDeadline ??= Date.now() + options.daemonStartTimeoutMs;
-      if (Date.now() >= reconnectDeadline) throw error;
-      // Preserve the envelope identity across every reconnect attempt so a
-      // daemon that survived the socket loss can replay its prior outcome.
+  const requestStartedAt = performance.now();
+  let connectMs = 0;
+  let rpcMs = 0;
+  let processId = null;
+  let ok = false;
+  try {
+    let reconnectDeadline;
+    for (;;) {
+      const connectStartedAt = performance.now();
+      const active = reconnectDeadline === undefined
+        ? await ensureClient()
+        : await ensureClient({ deadline: reconnectDeadline });
+      connectMs += performance.now() - connectStartedAt;
+      processId = active.server?.processId ?? processId;
+      const rpcStartedAt = performance.now();
+      try {
+        const result = await send(active, operation, payload, requestId);
+        ok = true;
+        return result;
+      } catch (error) {
+        if (!connectionFailure(error)) throw error;
+        discardClient();
+        reconnectDeadline ??= Date.now() + options.daemonStartTimeoutMs;
+        if (Date.now() >= reconnectDeadline) throw error;
+        // Preserve the envelope identity across every reconnect attempt so a
+        // daemon that survived the socket loss can replay its prior outcome.
+      } finally {
+        rpcMs += performance.now() - rpcStartedAt;
+      }
+    }
+  } finally {
+    const durationMs = Math.max(0, Math.floor(performance.now() - requestStartedAt));
+    if (durationMs >= CLIENT_SLOW_REQUEST_MS) {
+      const roundedConnectMs = Math.min(durationMs, Math.floor(connectMs));
+      const roundedRpcMs = Math.min(durationMs - roundedConnectMs, Math.floor(rpcMs));
+      recordLifecycle("client-slow-request", {
+        processId,
+        operation,
+        durationMs,
+        connectMs: roundedConnectMs,
+        rpcMs: roundedRpcMs,
+        clientOtherMs: durationMs - roundedConnectMs - roundedRpcMs,
+        ok,
+      });
     }
   }
 }

@@ -890,7 +890,12 @@ export class EpochWindowSession {
         const response = this.archive.preflight({
           messageKey: targetKey,
           message,
-          scope: "session",
+          // Automatic continuity is project-scoped so a cold session can
+          // discover eligible discussion from earlier sessions in the same
+          // authorized project. Disclosure policy still limits implicit
+          // matches to a marker and requires explicit history intent before
+          // archived source text is surfaced.
+          scope: "project",
           sessionId: this.sessionId,
           sessionIds: [...this.sessionIds],
           project: this.project,

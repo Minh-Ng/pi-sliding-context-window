@@ -782,6 +782,47 @@ test("every current and planned operation validates its request and result", () 
   assert.equal(assertStoreResult("daemon.status", legacyStatus), legacyStatus);
 });
 
+test("daemon slow-request stage timings are bounded to privacy-safe fields", () => {
+  const timedStatus = {
+    ...results["daemon.status"],
+    startupTimings: {
+      pathsAndLockMs: 1,
+      storeRuntimeMs: 12,
+      socketPreparationMs: 2,
+      listenMs: 3,
+      startupOtherMs: 1,
+      totalMs: 19,
+    },
+    slowRequests: [{
+      operation: "store.gather",
+      requestBytes: 512,
+      durationMs: 20,
+      completedAt: 2_000,
+      ok: true,
+      stageTimings: {
+        maintenanceMs: 1,
+        candidateSearchMs: 3,
+        semanticMs: 8,
+        requestOtherMs: 8,
+      },
+    }],
+  };
+  assert.equal(assertStoreResult("daemon.status", timedStatus), timedStatus);
+  expectContractError(
+    () => assertStoreResult("daemon.status", {
+      ...timedStatus,
+      slowRequests: [{
+        ...timedStatus.slowRequests[0],
+        stageTimings: {
+          ...timedStatus.slowRequests[0].stageTimings,
+          query: "private query text",
+        },
+      }],
+    }),
+    { code: "INVALID_RESPONSE", path: "$.result.slowRequests[0].stageTimings.query" },
+  );
+});
+
 test("search response evidence rejects negative and out-of-range confidence values", () => {
   const invalid = [
     ["score", -0.01],

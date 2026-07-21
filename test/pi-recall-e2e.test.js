@@ -74,10 +74,66 @@ function toolDefinition(session, name) {
   return registered.definition;
 }
 
+async function createSdkSession({ cwd, modelsPath, notifications, lifecycleFailures }) {
+  const modelRuntime = await ModelRuntime.create({ modelsPath, allowModelNetwork: false });
+  const model = modelRuntime.getModel("offline-fixture", "dummy");
+  const sessionManager = SessionManager.inMemory(cwd);
+  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: getAgentDir(),
+    settingsManager,
+    eventBus: createEventBus(),
+    noExtensions: true,
+    additionalExtensionPaths: [EXTENSION_PATH],
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await loader.reload();
+  const created = await createAgentSession({
+    cwd,
+    agentDir: getAgentDir(),
+    model,
+    modelRuntime,
+    thinkingLevel: "medium",
+    noTools: "builtin",
+    resourceLoader: loader,
+    sessionManager,
+    settingsManager,
+  });
+  const { session } = created;
+  // bindExtensions() emits session_start, so the extension session is live
+  // after this returns (its tools' requireSession() succeeds).
+  await bindEvaluationSession(session, lifecycleFailures);
+  assert.deepEqual(created.extensionsResult.errors, [], "extension must load clean");
+
+  const commandContext = {
+    cwd,
+    hasUI: false,
+    model,
+    isProjectTrusted: () => false,
+    sessionManager,
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+    },
+    getContextUsage: () => undefined,
+  };
+  const runWindow = async (args) => {
+    const before = notifications.length;
+    await session.extensionRunner.getCommand("window").handler(args, commandContext);
+    return notifications.slice(before);
+  };
+  return { session, model, sessionManager, runWindow };
+}
+
 // Boot a real SDK session with the context-window extension bound against an
-// isolated managed daemon. Returns the live session plus a bounded teardown
-// that runs session_shutdown, reaps the exact daemon PID, restores env, and
-// removes the workspace (harness invariants from eval/agent-memory/README.md).
+// isolated managed daemon. Additional sessions created from the returned
+// factory share that persisted project archive while retaining independent Pi
+// session state. Teardown shuts down every live session, reaps the exact daemon
+// PID, restores env, and removes the workspace.
 async function bootSession(envOverrides) {
   const workspace = createCaseWorkspace();
   const { cwd } = workspace;
@@ -95,11 +151,23 @@ async function bootSession(envOverrides) {
 
   const notifications = [];
   const lifecycleFailures = [];
+  const sessions = [];
   let managedDaemon;
-  let session;
 
+  const createSession = async () => {
+    const created = await createSdkSession({ cwd, modelsPath, notifications, lifecycleFailures });
+    sessions.push(created.session);
+    return created;
+  };
+  const shutdownSession = async (session) => {
+    await shutdownEvaluationSession(session);
+    const index = sessions.indexOf(session);
+    if (index >= 0) sessions.splice(index, 1);
+  };
   const teardown = async () => {
-    try { await shutdownEvaluationSession(session); } catch { /* bounded */ }
+    for (const session of [...sessions].reverse()) {
+      try { await shutdownSession(session); } catch { /* bounded */ }
+    }
     const stop = await stopManagedDaemon(managedDaemon);
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -113,59 +181,16 @@ async function bootSession(envOverrides) {
 
   try {
     managedDaemon = await startManagedDaemon(workspace, cwd);
-    const modelRuntime = await ModelRuntime.create({ modelsPath, allowModelNetwork: false });
-    const model = modelRuntime.getModel("offline-fixture", "dummy");
-    const sessionManager = SessionManager.inMemory(cwd);
-    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
-    const loader = new DefaultResourceLoader({
-      cwd,
-      agentDir: getAgentDir(),
-      settingsManager,
-      eventBus: createEventBus(),
-      noExtensions: true,
-      additionalExtensionPaths: [EXTENSION_PATH],
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-    });
-    await loader.reload();
-    const created = await createAgentSession({
-      cwd,
-      agentDir: getAgentDir(),
-      model,
-      modelRuntime,
-      thinkingLevel: "medium",
-      noTools: "builtin",
-      resourceLoader: loader,
-      sessionManager,
-      settingsManager,
-    });
-    session = created.session;
-    // bindExtensions() emits session_start, so the extension session is live
-    // after this returns (its tools' requireSession() succeeds).
-    await bindEvaluationSession(session, lifecycleFailures);
-    assert.deepEqual(created.extensionsResult.errors, [], "extension must load clean");
-
-    const commandContext = {
-      cwd,
-      hasUI: false,
-      model,
-      isProjectTrusted: () => false,
-      sessionManager,
-      ui: {
-        setStatus() {},
-        notify(message, level) { notifications.push({ message, level }); },
-      },
-      getContextUsage: () => undefined,
+    const created = await createSession();
+    return {
+      ...created,
+      notifications,
+      lifecycleFailures,
+      createSession,
+      shutdownSession,
+      teardown,
+      workspace,
     };
-    const runWindow = async (args) => {
-      const before = notifications.length;
-      await session.extensionRunner.getCommand("window").handler(args, commandContext);
-      return notifications.slice(before);
-    };
-
-    return { session, model, sessionManager, notifications, lifecycleFailures, runWindow, teardown, workspace };
   } catch (error) {
     await teardown();
     throw error;
@@ -186,6 +211,18 @@ function seededMessages(now) {
     { role: "assistant", content: [{ type: "text", text: "Noted the caching-layer climb." }], timestamp: now - 1 * day + 1 },
     { role: "user", content: [{ type: "text", text: "Remind me how many entries getUserProfileCache holds." }], timestamp: now - 100 },
     { role: "assistant", content: [{ type: "text", text: "Let me check the earlier history." }], timestamp: now - 99 },
+  ];
+}
+
+function coldSessionSourceMessages(now) {
+  return [
+    { role: "user", content: [{ type: "text", text: "We decided cobalt is the deployment color for canary deployments." }], timestamp: now - 7 },
+    { role: "assistant", content: [{ type: "text", text: "Recorded that deployment decision." }], timestamp: now - 6 },
+    { role: "user", content: [{ type: "text", text: "Next, verify the staging checklist." }], timestamp: now - 5 },
+    { role: "assistant", content: [{ type: "text", text: "The staging checklist is verified." }], timestamp: now - 4 },
+    { role: "user", content: [{ type: "text", text: "Now summarize the release notes." }], timestamp: now - 3 },
+    { role: "assistant", content: [{ type: "text", text: "The release notes are summarized." }], timestamp: now - 2 },
+    { role: "user", content: [{ type: "text", text: "Prepare the final handoff." }], timestamp: now - 1 },
   ];
 }
 
@@ -327,6 +364,56 @@ async function exerciseFlows(session, runWindow, { requireConflict }) {
 
   return observed;
 }
+
+test("a cold Pi session retrieves a decision rotated by an earlier real Pi session", {
+  timeout: 60_000,
+}, async () => {
+  const booted = await bootSession({
+    CONTEXT_WINDOW_SEMANTIC_RETRIEVAL: "0",
+    CONTEXT_WINDOW_RERANKER_ENABLED: "0",
+  });
+  try {
+    const sourceMessages = coldSessionSourceMessages(Date.now());
+    const sourceVisible = await booted.session.extensionRunner.emitContext(sourceMessages);
+    assert.ok(sourceVisible.length < sourceMessages.length, "source session must rotate its decision out of active context");
+
+    const search = toolDefinition(booted.session, "context_window_search");
+    const indexed = await executeUntil(
+      search,
+      { query: "cobalt canary deployment color", scope: "project", limit: 5 },
+      (result) => result.details.count >= 1 && /cobalt/u.test(result.content[0].text),
+    );
+    assert.ok(indexed.details.count >= 1, "the source session decision must reach the persisted project index");
+
+    await booted.shutdownSession(booted.session);
+    const cold = await booted.createSession();
+    const coldPrompt = {
+      role: "user",
+      content: [{ type: "text", text: "Remember discussed what color are canary deployments?" }],
+      timestamp: Date.now(),
+    };
+    const coldVisible = await cold.session.extensionRunner.emitContext([coldPrompt]);
+    assert.equal(coldVisible.length, 1, "a cold session must retain its only user turn");
+    const providerText = coldVisible[0].content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    const [why] = await cold.runWindow("recall why");
+    assert.match(
+      providerText,
+      /ARCHIVED HISTORICAL EVIDENCE/u,
+      `the provider prompt must receive source-bearing history; ${why.message}`,
+    );
+    assert.match(providerText, /cobalt/u, "the provider prompt must receive the earlier decision value");
+
+    assert.match(why.message, /Automatic retrieval: historical-snippet/u);
+    assert.match(why.message, /Reason: explicit-history-strong-evidence/u);
+    assert.deepEqual(booted.lifecycleFailures, [], "both SDK sessions must complete without lifecycle errors");
+  } finally {
+    const stop = await booted.teardown();
+    assert.equal(stop.reaped, true, "the exact shared daemon PID must be reaped");
+  }
+});
 
 test("Pi recall e2e round-trip on the lexical path (semantic + reranker disabled)", {
   timeout: 60_000,

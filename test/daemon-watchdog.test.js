@@ -64,6 +64,7 @@ test("daemon watchdog logs stalls and slow operations without request payloads",
       durationMs: 150,
       completedAt: Date.now(),
       ok: true,
+      stageTimings: { candidateSearchMs: 40, requestOtherMs: 110 },
     });
     watchdog.requestFinished(secondToken, {
       operation: "store.put",
@@ -94,8 +95,11 @@ test("daemon watchdog logs stalls and slow operations without request payloads",
   ]);
   assert.equal(stalls.length, 2);
   assert.deepEqual(stalls[1].activeRequests, []);
-  assert.ok(events.some(({ event, operation, durationMs }) =>
-    event === "slow-request" && operation === "store.search" && durationMs === 150));
+  assert.ok(events.some(({ event, operation, durationMs, stageTimings }) =>
+    event === "slow-request"
+      && operation === "store.search"
+      && durationMs === 150
+      && stageTimings?.candidateSearchMs === 40));
   assert.ok(events.some(({ event, operation, ok }) =>
     event === "slow-request" && operation === "store.put" && ok === false));
   assert.doesNotMatch(readFileSync(logPath, "utf8"), /payload|secret/iu);

@@ -85,6 +85,31 @@ test("rotation archives verbatim decision candidates with turn provenance", () =
   });
 });
 
+test("rotation keeps an interrogative choice reference in the raw turn without promoting it", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-interrogative-choice",
+    project: "/project",
+    onRotation: () => {},
+  });
+  const question = "Can you remember what we chose for canary deploys?";
+  const messages = [
+    user(question, 1), assistant("I will look it up.", 2),
+    user("two", 3), assistant("answer two", 4),
+    user("three", 5), assistant("answer three", 6),
+  ];
+
+  session.process(messages, { contextWindow: 200_000 });
+
+  const documents = [...archive.documents.values()];
+  assert.equal(documents.some((document) => document.kind === "decision-candidate"), false);
+  const rawTurn = documents.find((document) => document.kind === "turn"
+    && document.metadata.sourceMessageKeys[0] === messageKey(messages[0]));
+  assert.match(rawTurn.text, /Can you remember what we chose for canary deploys\?/u);
+});
+
 test("rotation archives verbatim fact candidates with anchor metadata and turn provenance", () => {
   const archive = memoryArchive();
   archive.resolveSubject = () => {
@@ -186,7 +211,7 @@ test("automatic preflight caches every frozen decision and survives later retrie
   assert.deepEqual(requests[0], {
     messageKey: messageKey(first),
     message: "What did we decide earlier?",
-    scope: "session",
+    scope: "project",
     sessionId: "hint-session",
     sessionIds: ["hint-session", "parent-session"],
     project: "/project",

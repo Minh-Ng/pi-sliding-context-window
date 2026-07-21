@@ -587,7 +587,9 @@ function exactMutationsForAnchors(context, anchors, options = {}) {
         sourceKey: manifest.sourceKey,
         sourceKeyStatus: manifest.sourceKeyStatus,
         sourceMessageKeys,
-        turnId: semanticIdentifier(manifest.metadata?.turnId) ?? null,
+        turnId: semanticIdentifier(manifest.metadata?.sourceTurnId)
+          ?? semanticIdentifier(manifest.metadata?.turnId)
+          ?? null,
         windowOrdinal: group.window.ordinal,
         windowStartByte: group.window.startByte,
         windowEndByte: group.window.endByte,

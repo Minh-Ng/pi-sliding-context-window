@@ -690,6 +690,10 @@ export function extractDecisionCandidates(text, {
   for (const raw of source.split(/(?<=[.!?])\s+|\n+/)) {
     const sentence = raw.trim();
     if (sentence.length < 15 || sentence.length > maxChars) continue;
+    // A question can mention a past choice without asserting what was chosen.
+    // Keep it in the raw archived turn, but do not grant it decision-specific
+    // indexing or ranking weight.
+    if (sentence.endsWith("?")) continue;
     if (!DECISION_CUE_PATTERN.test(sentence)) continue;
     if (seen.has(sentence)) continue;
     seen.add(sentence);

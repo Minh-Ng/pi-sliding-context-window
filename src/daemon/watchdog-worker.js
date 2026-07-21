@@ -123,6 +123,7 @@ parentPort.on("message", (message) => {
         requestBytes: message.requestBytes,
         durationMs: message.durationMs,
         ok: message.ok,
+        ...(message.stageTimings === undefined ? {} : { stageTimings: message.stageTimings }),
       });
     }
     return;

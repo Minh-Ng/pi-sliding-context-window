@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,27 +7,109 @@ import test from "node:test";
 import { DaemonArchive } from "../src/archive/daemon-archive.js";
 import { defaultSocketPath } from "../src/daemon/paths.js";
 import { canonicalProjectId } from "../src/identity/project-identity.js";
+import { StoreClient } from "../src/store/store-client.js";
 
 // Resolve the tmp base so a real repo directory created under it carries no
 // symlink of its own; only the alias we add below should differ from realpath.
 const BASE = realpathSync.native(mkdtempSync(join(tmpdir(), "project-identity-daemon-")));
 
-function scene(prefix) {
+function processExists(processId) {
+  if (!Number.isSafeInteger(processId)) return false;
+  try {
+    const state = execFileSync(
+      "/bin/ps",
+      ["-o", "stat=", "-p", String(processId)],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    // A stopped daemon may remain briefly as a zombie until its detached
+    // launcher reaps it. It no longer owns the socket or RocksDB store.
+    return state.length > 0 && !state.startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExit(processId, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (processExists(processId) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !processExists(processId);
+}
+
+async function cleanupScene(env) {
+  let lifecycleError;
+  for (const archive of env.archives) {
+    try { archive.close({ releaseProtection: false }); } catch (error) { lifecycleError ??= error; }
+  }
+
+  const client = new StoreClient({
+    socketPath: env.socketPath,
+    project: env.real,
+    requestTimeoutMs: 5_000,
+  });
+  try {
+    const status = await client.request("daemon.status", {});
+    assert.equal(status.processId, env.daemonProcessId, "scene must retain ownership of its original daemon");
+    assert.deepEqual(
+      await client.request("daemon.shutdown", { reason: "project identity test complete" }),
+      { accepted: true },
+    );
+  } catch (error) {
+    lifecycleError ??= error;
+  } finally {
+    client.close();
+  }
+
+  if (env.daemonProcessId && !await waitForExit(env.daemonProcessId)) {
+    lifecycleError ??= new Error(`context-windowd ${env.daemonProcessId} ignored graceful test shutdown`);
+    try { process.kill(env.daemonProcessId, "SIGTERM"); } catch {}
+    if (!await waitForExit(env.daemonProcessId, 1_000)) {
+      try { process.kill(env.daemonProcessId, "SIGKILL"); } catch {}
+      await waitForExit(env.daemonProcessId, 1_000);
+    }
+  }
+
+  rmSync(env.directory, { recursive: true, force: true });
+  assert.equal(
+    processExists(env.daemonProcessId),
+    false,
+    `project identity test leaked context-windowd ${env.daemonProcessId}`,
+  );
+  if (lifecycleError) throw lifecycleError;
+}
+
+function scene(t, prefix) {
   const directory = mkdtempSync(join(BASE, `${prefix}-`));
   const storePath = join(directory, "archive.rocks");
   const real = mkdtempSync(join(directory, "repo-"));
   const link = join(directory, "repo-symlink");
   symlinkSync(real, link, "dir");
-  return { directory, storePath, socketPath: defaultSocketPath(storePath), real, link };
+  const env = {
+    directory,
+    storePath,
+    socketPath: defaultSocketPath(storePath),
+    real,
+    link,
+    archives: new Set(),
+    daemonProcessId: undefined,
+  };
+  t.after(() => cleanupScene(env));
+  return env;
 }
 
 function openArchive(env, project, aliasProjects) {
-  return new DaemonArchive({
+  const archive = new DaemonArchive({
     storePath: env.storePath,
     socketPath: env.socketPath,
     project,
     ...(aliasProjects ? { aliasProjects } : {}),
   });
+  const processId = archive.daemonStatus().processId;
+  if (env.daemonProcessId === undefined) env.daemonProcessId = processId;
+  else assert.equal(processId, env.daemonProcessId, "one scene must use exactly one daemon");
+  env.archives.add(archive);
+  return archive;
 }
 
 function writeMarker(archive, { sessionId, project, marker, createdAt = 1_000 }) {
@@ -49,7 +132,7 @@ function writeMarker(archive, { sessionId, project, marker, createdAt = 1_000 })
 test.after(() => rmSync(BASE, { recursive: true, force: true }));
 
 test("a canonical connection recovers archives written under the pre-canonical symlink spelling", (t) => {
-  const env = scene("recover");
+  const env = scene(t, "recover");
   const canonical = canonicalProjectId(env.link);
   assert.equal(canonical, env.real, "the symlink must canonicalize to the real repository");
 
@@ -66,10 +149,6 @@ test("a canonical connection recovers archives written under the pre-canonical s
   // The fixed client canonicalizes and carries the literal spelling as a
   // read-only alias.
   const fixed = openArchive(env, canonical, [env.link]);
-  t.after(() => {
-    fixed.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
-  });
 
   const detailed = fixed.searchDetailed("LEGACYSYMLINKMARKER", {
     sessionId: "current-session",
@@ -90,7 +169,7 @@ test("a canonical connection recovers archives written under the pre-canonical s
 });
 
 test("writes always land on the canonical identity, never the alias", (t) => {
-  const env = scene("writes");
+  const env = scene(t, "writes");
   const canonical = canonicalProjectId(env.link);
 
   const fixed = openArchive(env, canonical, [env.link]);
@@ -107,11 +186,6 @@ test("writes always land on the canonical identity, never the alias", (t) => {
   // canonical repo, so with no alias it reads only that spelling's namespace)
   // must not see the canonical write.
   const aliasReader = openArchive(env, env.link);
-  t.after(() => {
-    canonicalReader.close({ releaseProtection: false });
-    aliasReader.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
-  });
 
   assert.equal(
     canonicalReader.search("FRESHCANONICALMARKER", { scope: "project" })[0].documentId,
@@ -125,7 +199,7 @@ test("writes always land on the canonical identity, never the alias", (t) => {
 });
 
 test("a forged alias for a different real project is rejected and cannot cross isolation", (t) => {
-  const env = scene("isolation");
+  const env = scene(t, "isolation");
   const canonical = canonicalProjectId(env.link);
   const other = mkdtempSync(join(env.directory, "other-repo-"));
   assert.notEqual(canonicalProjectId(other), canonical);
@@ -138,10 +212,6 @@ test("a forged alias for a different real project is rejected and cannot cross i
   // an unrelated real directory. The daemon re-verifies via realpath, so the
   // forged alias never widens reads.
   const attacker = openArchive(env, canonical, [other]);
-  t.after(() => {
-    attacker.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
-  });
 
   assert.equal(
     attacker.search("OTHERPROJECTSECRET", { scope: "project" }).length,
@@ -152,7 +222,7 @@ test("a forged alias for a different real project is rejected and cannot cross i
 });
 
 test("gather and traverse widen over the pre-canonical alias, not just search", (t) => {
-  const env = scene("gather-traverse");
+  const env = scene(t, "gather-traverse");
   const canonical = canonicalProjectId(env.link);
 
   // Two chronologically ordered legacy turns in one session, written through the
@@ -173,10 +243,6 @@ test("gather and traverse widen over the pre-canonical alias, not just search", 
   legacy.close({ releaseProtection: false });
 
   const fixed = openArchive(env, canonical, [env.link]);
-  t.after(() => {
-    fixed.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
-  });
 
   // gather must reach legacy anchors under the alias instead of hiding them
   // behind the (empty) canonical namespace.
@@ -214,7 +280,7 @@ test("gather and traverse widen over the pre-canonical alias, not just search", 
 });
 
 test("gather across the alias union caps pooled evidence at the request's maxEvidence, not the pooling ceiling", (t) => {
-  const env = scene("gather-cap");
+  const env = scene(t, "gather-cap");
   const canonical = canonicalProjectId(env.link);
 
   const legacy = openArchive(env, env.link);
@@ -233,10 +299,6 @@ test("gather across the alias union caps pooled evidence at the request's maxEvi
     marker: "GATHERCAPMARKER",
     createdAt: 2_000,
   });
-  t.after(() => {
-    fixed.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
-  });
 
   const gathered = fixed.gatherDetailed("GATHERCAPMARKER", {
     scope: "project",
@@ -254,7 +316,7 @@ test("gather across the alias union caps pooled evidence at the request's maxEvi
 });
 
 test("gather across the alias union returns evidence in chronological order, not pooling rank order", (t) => {
-  const env = scene("gather-chrono");
+  const env = scene(t, "gather-chrono");
   const canonical = canonicalProjectId(env.link);
 
   const legacy = openArchive(env, env.link);
@@ -272,10 +334,6 @@ test("gather across the alias union returns evidence in chronological order, not
     project: canonical,
     marker: "GATHERCHRONOMARKER",
     createdAt: 3_000,
-  });
-  t.after(() => {
-    fixed.close({ releaseProtection: false });
-    rmSync(env.directory, { recursive: true, force: true });
   });
 
   const gathered = fixed.gatherDetailed("GATHERCHRONOMARKER", {

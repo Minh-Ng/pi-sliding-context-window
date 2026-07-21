@@ -16,6 +16,13 @@ import { traverseArchive } from "./traverse.js";
 const MIN_RECALL_TOKENS = 39;
 const DEFAULT_SCAN_LIMIT = 2_048;
 
+function reportStageTiming(options, stage, durationMs) {
+  if (typeof options.recordStageTiming !== "function") return;
+  try {
+    options.recordStageTiming(stage, Math.max(0, durationMs));
+  } catch { /* diagnostics must not affect retrieval */ }
+}
+
 // Reversal-flavored half of the decision extractor's own cue lexicon
 // (session/window.js's DECISION_CUE_PATTERN, reused verbatim above as the
 // "this sentence is decision-shaped at all" test): reject/rule-out/won't/
@@ -319,6 +326,20 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     throw new TypeError("gatherArchive requires a RocksStore-compatible store.");
   }
   const request = normalizeRequest(rawRequest, options.project);
+  const gatherStartedAt = performance.now();
+  const stageDurations = new Map();
+  const recordStage = (stage, durationMs) => {
+    const duration = Math.max(0, durationMs);
+    stageDurations.set(stage, (stageDurations.get(stage) ?? 0) + duration);
+    reportStageTiming(options, stage, duration);
+  };
+  const finishGatherTiming = () => {
+    const attributedMs = [...stageDurations.values()]
+      .reduce((total, durationMs) => total + durationMs, 0);
+    recordStage("gatherOtherMs", Math.max(0, performance.now() - gatherStartedAt - attributedMs));
+  };
+  const searchStageDurations = new Map();
+  const searchStartedAt = performance.now();
   const search = await searchArchive(store, {
     query: request.query,
     ...(request.expansionTerms === undefined ? {} : { expansionTerms: request.expansionTerms }),
@@ -335,6 +356,11 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     ...(request.searchEffort === undefined ? {} : { searchEffort: request.searchEffort }),
   }, {
     ...options,
+    recordStageTiming: (stage, durationMs) => {
+      const duration = Math.max(0, durationMs);
+      searchStageDurations.set(stage, (searchStageDurations.get(stage) ?? 0) + duration);
+      recordStage(stage, duration);
+    },
     // RM3 expansion additionally requires this explicit-search-only
     // server-side opt-in (options.allowExpansion, src/retrieval/search.js);
     // gather's own internal search call never sets it on the normal path, so
@@ -344,8 +370,12 @@ export async function gatherArchive(store, rawRequest, options = {}) {
     // its own -- shouldTryExpansion's unconditional branch then takes over.
     ...(request.searchEffort === "wide" ? { allowExpansion: true } : {}),
   });
+  const measuredSearchMs = [...searchStageDurations.values()]
+    .reduce((total, durationMs) => total + durationMs, 0);
+  recordStage("searchOtherMs", Math.max(0, performance.now() - searchStartedAt - measuredSearchMs));
 
   if (search.results.length === 0) {
+    finishGatherTiming();
     return assertStoreResult("store.gather", {
       status: "not-found",
       mode: search.mode,
@@ -366,6 +396,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
   }
 
   let traversalHasMore = false;
+  const traversalStartedAt = performance.now();
   const neighborhoodAnchors = search.results.slice(0, request.neighborhoodAnchors);
   for (let anchorIndex = 0; anchorIndex < neighborhoodAnchors.length; anchorIndex += 1) {
     const anchor = neighborhoodAnchors[anchorIndex];
@@ -393,6 +424,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
       }
     }
   }
+  recordStage("traversalMs", performance.now() - traversalStartedAt);
 
   const orderedCandidates = [...candidates.values()]
     .sort((left, right) => left.priority - right.priority);
@@ -414,6 +446,7 @@ export async function gatherArchive(store, rawRequest, options = {}) {
   const evidence = [];
   let returnedTokens = 0;
   let recallIncomplete = false;
+  const recallStartedAt = performance.now();
   for (const item of selected) {
     const recallSessionIds = [...new Set([
       ...request.sessionIds,
@@ -465,12 +498,16 @@ export async function gatherArchive(store, rawRequest, options = {}) {
         : {}),
     });
   }
+  recordStage("recallMs", performance.now() - recallStartedAt);
   evidence.sort(chronological);
+  const conflictStartedAt = performance.now();
   await flagPossibleConflicts(store, evidence);
+  recordStage("conflictMs", performance.now() - conflictStartedAt);
 
   const candidateOverflow = deduped.length > selected.length;
   const searchMayHaveMore = search.results.length === request.limit;
   const truncated = traversalHasMore || candidateOverflow || recallIncomplete || searchMayHaveMore;
+  finishGatherTiming();
   return assertStoreResult("store.gather", {
     status: evidence.length > 0 ? "resolved" : "not-found",
     mode: search.mode,

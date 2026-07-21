@@ -268,6 +268,23 @@ async function readLineageFrozenHint(store, request) {
   return records[0];
 }
 
+function evidenceRoot(candidate) {
+  return candidate?.source?.turnId ?? candidate?.documentId;
+}
+
+function withDistinctEvidenceMargin(candidate, results) {
+  if (candidate === undefined) return undefined;
+  const contender = results.find((result) =>
+    result.retrievalMode === candidate.retrievalMode
+    && evidenceRoot(result) !== evidenceRoot(candidate));
+  const candidateScore = candidate.calibratedScore ?? candidate.score ?? 0;
+  const contenderScore = contender?.calibratedScore ?? contender?.score ?? 0;
+  return Object.freeze({
+    ...candidate,
+    margin: Number(Math.max(0, candidateScore - contenderScore).toFixed(6)),
+  });
+}
+
 async function previouslySurfacedInLineage(store, request, candidate, now) {
   const seen = new Set();
   for (const sessionId of [request.sessionId, ...request.sessionIds]) {
@@ -369,7 +386,10 @@ export async function preflightArchive(store, request, options = {}) {
     // Automatic preflight never sets recencyDecay: a frozen hint must stay
     // byte-identical however much older the corpus grows around it.
   });
-  const candidate = search.results[0];
+  // A rotated source turn and its extracted decision candidate are two index
+  // documents for one piece of evidence. Do not let that additive extraction
+  // manufacture ambiguity; compare rank 1 with the next distinct source turn.
+  const candidate = withDistinctEvidenceMargin(search.results[0], search.results);
   const epochId = options.epochId ?? normalized.sessionId;
   const requestHasActiveBudget = request.activeHintBudgetTokens !== undefined
     || request.epochBudgetTokens !== undefined;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -255,13 +255,19 @@ test("LocalReranker never closes a caller-injected client on latch -- only a wor
 });
 
 test("LocalReranker terminates its own worker once a non-timeout failure latches it unavailable", async (t) => {
+  const cachePath = mkdtempSync(join(tmpdir(), "context-window-reranker-load-failure-"));
+  const revision = "fake-revision";
+  const modelDirectory = join(cachePath, FAKE_RERANKER_MISSING_MODEL, revision);
+  mkdirSync(modelDirectory, { recursive: true });
+  writeFileSync(join(modelDirectory, "config.json"), "{}");
+  t.after(() => rmSync(cachePath, { recursive: true, force: true }));
   const reranker = new LocalReranker({
     enabled: true,
-    // The sentinel model id makes the fake worker simulate the pinned model
-    // never having been installed, exactly like production would.
+    // The cache marker lets execution reach the fake worker; the sentinel
+    // model id then makes that worker simulate a load failure after startup.
     model: FAKE_RERANKER_MISSING_MODEL,
-    revision: "fake-revision",
-    cachePath: "/tmp/does-not-matter",
+    revision,
+    cachePath,
     workerUrl: FAKE_WORKER_URL,
   });
   t.after(() => reranker.close());
@@ -302,6 +308,27 @@ test("LocalReranker.isOperational is false for a self-constructed worker whose p
     });
     assert.equal(reranker.isOperational(), false);
     assert.equal(reranker.client, undefined, "probing operational status must never construct (let alone load) a worker client");
+  } finally {
+    rmSync(missingCacheDir, { recursive: true, force: true });
+  }
+});
+
+test("LocalReranker.rerank does not construct a worker when the pinned model is absent", async () => {
+  const missingCacheDir = mkdtempSync(join(tmpdir(), "context-window-reranker-skip-missing-"));
+  try {
+    const reranker = new LocalReranker({
+      enabled: true,
+      model: "some-org/never-installed-model",
+      revision: "v1",
+      cachePath: missingCacheDir,
+    });
+    const candidates = [
+      candidate({ documentId: "a", retrievalMode: "lexical" }),
+      candidate({ documentId: "b", retrievalMode: "semantic" }),
+    ];
+    assert.equal(await reranker.rerank("query", candidates), candidates);
+    assert.equal(reranker.client, undefined, "missing model files must not construct a worker client");
+    assert.equal(reranker.isOperational(), false, "the next request must continue probing the on-disk install state");
   } finally {
     rmSync(missingCacheDir, { recursive: true, force: true });
   }

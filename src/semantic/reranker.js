@@ -169,6 +169,10 @@ export class LocalReranker {
       if (RERANKED_MODES.has(candidates[index].retrievalMode)) tierOneIndexes.push(index);
     }
     if (tierOneIndexes.length <= 1) return candidates;
+    // A real worker runs with local_files_only. If its pinned files are not
+    // present, constructing it can only fail; preserve the fused order and
+    // recheck on the next request so a later install is picked up live.
+    if (!this.isOperational()) return candidates;
     const windowIndexes = tierOneIndexes.slice(0, this.candidateWindow);
     const passages = windowIndexes.map((index) => (
       truncateCenteredTokens(candidates[index].snippet, this.textTokenBudget)

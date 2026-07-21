@@ -1058,6 +1058,17 @@ test("the launcher persists an abnormal daemon exit signal", async (t) => {
     rmSync(paths.directory, { recursive: true, force: true });
   });
   const status = bridge.request("daemon.status", {});
+  const launchEvents = readFileSync(daemonLaunchLogPath, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().startsWith("{"))
+    .map(JSON.parse);
+  assert.ok(launchEvents.some((event) =>
+    event.event === "daemon-ready"
+      && event.processId === status.processId
+      && Number.isSafeInteger(event.durationMs)
+      && event.durationMs >= 0
+      && Number.isSafeInteger(event.launchAttempts)
+      && event.launchAttempts >= 1));
   process.kill(status.processId, "SIGKILL");
   await waitFor(() => {
     if (!existsSync(daemonLaunchLogPath)) return false;
@@ -1260,6 +1271,15 @@ test("status is schema-valid and shutdown is explicitly gated", async (t) => {
   assert.equal(status.clientConnections, 1);
   assert.equal(status.activeRequests, 1);
   assert.equal(status.idleShutdownAt, undefined);
+  assert.equal(
+    status.startupTimings.pathsAndLockMs
+      + status.startupTimings.storeRuntimeMs
+      + status.startupTimings.socketPreparationMs
+      + status.startupTimings.listenMs
+      + status.startupTimings.startupOtherMs,
+    status.startupTimings.totalMs,
+  );
+  assert.ok(Object.values(status.startupTimings).every(Number.isSafeInteger));
   assert.deepEqual(status.counts, { documents: 0, events: 0, chunks: 0, logicalBytes: 0 });
   await assert.rejects(
     client.request("daemon.shutdown", { reason: "test" }),
@@ -1285,7 +1305,12 @@ test("slow requests are exposed in status and reported to the watchdog observer"
     slowRequestMs: 5,
     requestObserver,
     operationHandlers: {
-      "store.count": async () => {
+      "store.count": async (_payload, context) => {
+        context.stageTimings = {
+          candidateSearchMs: 3.9,
+          semanticMs: 5.2,
+          ignoredStageMs: 100,
+        };
         await new Promise((resolve) => setTimeout(resolve, 20));
         return { count: 1 };
       },
@@ -1300,9 +1325,23 @@ test("slow requests are exposed in status and reported to the watchdog observer"
   assert.ok(slow);
   assert.ok(slow.durationMs >= 5);
   assert.equal(slow.ok, true);
-  assert.ok(observed.some(({ phase, token, operation, ok }) =>
-    phase === "finish" && token === 7 && operation === "store.count" && ok === true));
+  assert.deepEqual(slow.stageTimings, {
+    candidateSearchMs: 3,
+    semanticMs: 5,
+    requestOtherMs: slow.durationMs - 8,
+  });
+  assert.equal(
+    Object.values(slow.stageTimings).reduce((total, durationMs) => total + durationMs, 0),
+    slow.durationMs,
+  );
+  assert.ok(observed.some(({ phase, token, operation, ok, stageTimings }) =>
+    phase === "finish"
+      && token === 7
+      && operation === "store.count"
+      && ok === true
+      && stageTimings?.semanticMs === 5));
   assert.equal(JSON.stringify(observed).includes("payload"), false);
+  assert.equal(JSON.stringify(observed).includes("ignoredStageMs"), false);
 });
 
 test("slow-request history is bounded and records failed operations", async (t) => {

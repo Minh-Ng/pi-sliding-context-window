@@ -4,7 +4,13 @@ export const CONTINUITY_THRESHOLDS = Object.freeze({
   lexicalTerms: 2,
   termCoverage: 0.60,
   maxNormalizedIdf: 0.60,
-  ambiguityMargin: 0.05,
+  // Conservative automatic-disclosure policy, not an empirical probability:
+  // abstain when rank 1 is within ten calibrated-score points of rank 2 in
+  // the same retrieval mode. False automatic snippets cost more than a
+  // source-free marker because the explicit search tools remain available.
+  // Recalibrate only from labeled ambiguity outcomes; the incident that
+  // introduced this gate was an exact tie and does not identify 0.10 itself.
+  ambiguityMargin: 0.10,
 });
 
 export const CONTINUITY_REASON = Object.freeze({
@@ -18,7 +24,7 @@ export const CONTINUITY_REASON = Object.freeze({
   IMPLICIT_CONTINUITY: "implicit-concept-continuity",
 });
 
-const HISTORICAL_CUE = /\b(?:earlier|histor(?:y|ical)|previous(?:ly)?|prior|we decided|did we decide|what did we|how did we|why did we|when (?:we|it|context)|reconstruct(?:ed|ion)?|restored|used to)\b/iu;
+const HISTORICAL_CUE = /\b(?:earlier|histor(?:y|ical)|previous(?:ly)?|prior|recall(?:ed|ing)?|(?:do|can) you remember|remember when|remember(?:ed|ing)?(?:\s+(?:we|our))?\s+discuss(?:ed|ion)|we decided|did we decide|what did we|how did we|why did we|when (?:we|it|context)|reconstruct(?:ed|ion)?|restored|used to)\b/iu;
 const CURRENT_STATE_CUE = /\b(?:right now|currently|current (?:code|config|configuration|file|files|implementation|repository|state|status|tree|runtime)|working tree|(?:code|file|files|repository) on disk|on-disk (?:code|file|files|repository)|checked[- ]out (?:code|file|files|repository)|local (?:code|file|files|repository|tree)|live (?:code|repository|state|runtime|status)|today|latest (?:code|config|configuration|file|implementation|repository|status|runtime))\b/iu;
 const GENERAL_KNOWLEDGE_CUE = /(?:\b(?:in general|generally|as a general concept)\b|^(?:what does .+ stand for|define |what is the definition of ))/iu;
 const CONVERSATION_KINDS = new Set([
@@ -123,16 +129,25 @@ function strongExact(message, candidate) {
     && exactSpans(message, candidate.matchedAnchors).length > 0;
 }
 
-function strongLexical(message, candidate) {
+function strongLexical(message, candidate, { historical }) {
   const matchedTerms = Array.isArray(candidate.matchedTerms) ? new Set(candidate.matchedTerms) : new Set();
   // Count distinct whole message words with evidence, not distinct terms:
   // a compound identifier's camelCase/snake_case subterms must count as one
   // word, and a literally repeated word must not count twice.
   const words = matchedMessageWords(message, matchedTerms);
+  const decisionRecall = historical
+    && candidate.kind === "decision-candidate"
+    && words.length >= CONTINUITY_THRESHOLDS.lexicalTerms + 1;
   return candidate.retrievalMode === "lexical"
     && words.length >= CONTINUITY_THRESHOLDS.lexicalTerms
     && finiteNumber(candidate.termCoverage) >= CONTINUITY_THRESHOLDS.termCoverage
-    && finiteNumber(candidate.maxNormalizedIdf) >= CONTINUITY_THRESHOLDS.maxNormalizedIdf;
+    // A decision-shaped source answering explicit historical intent may use
+    // three query words instead of corpus-relative IDF. Rotation archives the
+    // same source turn and its decision candidate separately, which lowers IDF
+    // without weakening the underlying evidence. Implicit recall and ordinary
+    // turn records retain the distinctiveness gate.
+    && (decisionRecall
+      || finiteNumber(candidate.maxNormalizedIdf) >= CONTINUITY_THRESHOLDS.maxNormalizedIdf);
 }
 
 function isAmbiguous(candidate, explicitAmbiguity) {
@@ -170,7 +185,7 @@ export function decideContinuityDisclosure({
   }
 
   const exact = strongExact(message, candidate);
-  const lexical = strongLexical(message, candidate);
+  const lexical = strongLexical(message, candidate, { historical: intent.historical });
   const anchors = continuityAnchors(message, candidate);
   if (!exact && !lexical) {
     return Object.freeze({ outcome: "suppress", reason: CONTINUITY_REASON.WEAK_EVIDENCE, anchors: Object.freeze([]) });

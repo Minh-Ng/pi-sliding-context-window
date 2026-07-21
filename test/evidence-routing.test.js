@@ -101,6 +101,9 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(SEARCH_TOOL_DESCRIPTION, /preserve temporal qualifiers.*inspect every returned candidate.*do not default to rank 1/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /newest relevant candidate.*snippet is truncated or omits the requested value.*older explicit value/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /event dates or old→new values.*preserve uncertainty/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /materially disagree.*top result is only an assistant assertion.*never accept rank 1/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /own visible answer.*claims, not source evidence.*explicit user decisions/i);
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /materially disagree.*assistant assertion.*never accept rank 1/i.test(guideline)));
   assert.match(SEARCH_TOOL_DESCRIPTION, /acting on specific files, symbols, or identifiers.*workingSet.*never overrides a clearly stronger match/i);
   assert.match(GATHER_TOOL_DESCRIPTION, /acting on specific files, symbols, or identifiers.*workingSet.*without overriding a clearly stronger match/i);
   assert.match(SEARCH_TOOL_DESCRIPTION, /searchEffort=wide only after a normal search missed or when uncertainty is genuinely high.*costs latency and tokens/i);
@@ -148,13 +151,14 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   // negative-evidence archiving rule (confirmed-absence findings) appended
   // above bumps it again to "15". The artifact-versioning rule (successive
   // versions of one working artifact under a stable subjectKey; ultracode
-  // task #38) bumps it again to "16". Any held-out/reference eval artifact
-  // captured against an older version (see the persisted-artifact test
-  // below, still pinned at "4") already fails
-  // validateEvidenceRoutingEvalRecord's version check by design — once
-  // guidance moves, its recorded routing accuracy is regression-only
-  // evidence for that snapshot, not a live held-out measurement.
-  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "16");
+  // task #38) bumps it again to "16". Conflict-aware recall guidance bumps
+  // it to "17". Any held-out/reference eval artifact captured against an
+  // older version (see the persisted-artifact test below, still pinned at
+  // "4") already fails validateEvidenceRoutingEvalRecord's version check by
+  // design — once guidance moves, its recorded routing accuracy is
+  // regression-only evidence for that snapshot, not a live held-out
+  // measurement.
+  assert.equal(EFFECTIVE_PRODUCTION_GUIDANCE_VERSION, "17");
 });
 
 test("archive-state reconciliation intent covers broad time-sensitive language without treating every historical question as an update", () => {

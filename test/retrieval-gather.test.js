@@ -90,6 +90,8 @@ test("state gather forces hybrid broadening and materializes distinct dated valu
   await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
 
   let semanticCalls = 0;
+  let rerankerCalls = 0;
+  const stageTimings = new Map();
   const gather = await gatherArchive(store, gatherRequest(), {
     project: PROJECT,
     now: 1_000,
@@ -99,9 +101,19 @@ test("state gather forces hybrid broadening and materializes distinct dated valu
         return [];
       },
     },
+    reranker: {
+      rerank: async (_query, candidates) => {
+        rerankerCalls += 1;
+        return candidates;
+      },
+    },
+    recordStageTiming(stage, durationMs) {
+      stageTimings.set(stage, (stageTimings.get(stage) ?? 0) + durationMs);
+    },
   });
 
   assert.equal(semanticCalls, 1);
+  assert.equal(rerankerCalls, 1);
   assert.equal(gather.status, "resolved");
   assert.equal(gather.mode, "hybrid");
   assert.deepEqual(gather.evidence.map(({ document }) => document.documentId), [
@@ -112,6 +124,19 @@ test("state gather forces hybrid broadening and materializes distinct dated valu
   assert.match(gather.evidence[1].document.text, /close to 30/u);
   assert.ok(gather.returnedTokens <= 2_000);
   assert.ok(gather.evidence.every(({ document }) => document.sourceMessages.status === "available"));
+  assert.deepEqual([...stageTimings.keys()].sort(), [
+    "candidateSearchMs",
+    "conflictMs",
+    "gatherOtherMs",
+    "recallMs",
+    "rerankerMs",
+    "searchOtherMs",
+    "semanticMs",
+    "traversalMs",
+  ]);
+  assert.ok([...stageTimings.values()].every((durationMs) =>
+    Number.isFinite(durationMs) && durationMs >= 0));
+  assert.doesNotMatch(JSON.stringify([...stageTimings]), /River gauge|query/iu);
 });
 
 test("workflow gather follows bounded successors on the anchor branch", async (t) => {

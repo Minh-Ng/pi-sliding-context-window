@@ -24,6 +24,8 @@ import {
   hintDecisionFingerprint,
   preflightArchive,
 } from "../src/retrieval/preflight.js";
+import { recallArchive } from "../src/retrieval/recall.js";
+import { searchArchive } from "../src/retrieval/search.js";
 
 function temporaryStorePath(t, name) {
   const directory = mkdtempSync(join(tmpdir(), `context-window-${name}-`));
@@ -209,6 +211,110 @@ test("natural deployment wording triggers continuity for an archived decision ca
       margin: response.diagnostics.candidate.margin,
     },
   });
+});
+
+test("explicit recall can retrieve a decision from an earlier session in the same project", async (t) => {
+  const { store, worker } = await fixture(t, "hint-cold-project-recall");
+  await admit(
+    store,
+    "cross-session-canary-decision",
+    "Remember this exact decision: cobalt is the deployment color for canary deploys.",
+    {
+      kind: "decision-candidate",
+      sourceKey: "user:cross-session-canary-decision",
+      sessionId: "source-session",
+      createdAt: 300,
+    },
+  );
+  await worker.drain();
+
+  const response = await preflightArchive(store, request(
+    "user:cold-project-recall",
+    "Recall: What color is used for canary deploys?",
+    {
+      scope: "project",
+      sessionId: "cold-session",
+      sessionIds: ["cold-session"],
+      includeDiagnostics: true,
+    },
+  ), { now: 1_000 });
+
+  assert.equal(response.diagnostics.outcome, "historical-snippet");
+  assert.equal(response.diagnostics.reason, "explicit-history-strong-evidence");
+  assert.equal(response.diagnostics.candidate.documentId, "cross-session-canary-decision");
+  assert.match(response.modelVisibleText, /cobalt/u);
+});
+
+test("explicit recall exposes no rank-1 source when project candidates compete closely", async (t) => {
+  const { store, worker } = await fixture(t, "hint-competing-project-decisions");
+  await admit(
+    store,
+    "canary-color-cobalt",
+    "CANARY_DEPLOY_COLOR decision: use cobalt for canary deploys.",
+    {
+      kind: "decision-candidate",
+      sourceKey: "user:canary-color-cobalt",
+      sessionId: "older-cobalt-session",
+      createdAt: 300,
+    },
+  );
+  await admit(
+    store,
+    "canary-color-yellow",
+    "CANARY_DEPLOY_COLOR proposal: use yellow for canary deploys.",
+    {
+      kind: "decision-candidate",
+      sourceKey: "assistant:canary-color-yellow",
+      sessionId: "newer-yellow-session",
+      createdAt: 400,
+    },
+  );
+  await worker.drain();
+
+  const response = await preflightArchive(store, request(
+    "user:competing-project-recall",
+    "Recall: What did we decide for CANARY_DEPLOY_COLOR?",
+    {
+      scope: "project",
+      sessionId: "cold-session",
+      sessionIds: ["cold-session"],
+      includeDiagnostics: true,
+    },
+  ), { now: 1_000 });
+
+  assert.equal(response.diagnostics.outcome, "continuity-marker");
+  assert.equal(response.diagnostics.reason, "ambiguous-history-continuity");
+  assert.ok(response.diagnostics.candidate.margin <= 0.10);
+  assert.equal(response.hints[0].disclosureType, "continuity-marker");
+  assert.doesNotMatch(response.modelVisibleText, /cobalt|yellow/u);
+
+  // The safe marker is not a reconciliation result. Prove the explicit tool
+  // path can recover both competing records and their author-role provenance
+  // rather than silently accepting rank 1.
+  const explicit = await searchArchive(store, {
+    query: "Recall: What did we decide for CANARY_DEPLOY_COLOR?",
+    relation: null,
+    scope: "project",
+    sessionId: "cold-session",
+    sessionIds: ["cold-session"],
+    project: "/fixture/project",
+    limit: 5,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 160,
+  }, { now: 1_000, ownerId: "competing-project-recall-test" });
+  assert.deepEqual(
+    new Set(explicit.results.map(({ documentId }) => documentId)),
+    new Set(["canary-color-cobalt", "canary-color-yellow"]),
+  );
+  const recalled = await Promise.all(explicit.results.map((result) => recallArchive(store, {
+    locator: result.locator,
+    neighbors: 0,
+    maxTokens: 160,
+  }, { project: "/fixture/project", now: 1_000 })));
+  assert.deepEqual(
+    new Set(recalled.flatMap(({ sourceMessages }) => sourceMessages.keys)),
+    new Set(["user:canary-color-cobalt", "assistant:canary-color-yellow"]),
+  );
 });
 
 test("current-only, already-visible, and general questions add zero model-visible tokens", async (t) => {

@@ -816,8 +816,18 @@ export class DaemonOperations {
   async gather(payload, context) {
     this.continueIndexing();
     const now = Date.now();
-    await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
-    await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
+    const stageTimings = context.stageTimings ??= Object.create(null);
+    const recordStageTiming = (stage, durationMs) => {
+      if (!Number.isFinite(durationMs) || durationMs < 0) return;
+      stageTimings[stage] = (stageTimings[stage] ?? 0) + durationMs;
+    };
+    const maintenanceStartedAt = performance.now();
+    try {
+      await cleanupExpiredProtections(this.store, { now, limit: 1_000 });
+      await cleanupExpiredLeases(this.store, { now, limit: 1_000 });
+    } finally {
+      recordStageTiming("maintenanceMs", performance.now() - maintenanceStartedAt);
+    }
     const readProjects = readProjectsFor(context);
     // Dedup is a per-request opt-in (payload.dedupe), same as store.search.
     if (readProjects.length <= 1) {
@@ -836,16 +846,17 @@ export class DaemonOperations {
         now,
         recencyDecay: true,
         dedupe: payload.dedupe === true,
+        recordStageTiming,
       });
     }
-    return this.#gatherAcrossProjects(payload, readProjects, now);
+    return this.#gatherAcrossProjects(payload, readProjects, now, recordStageTiming);
   }
 
   // Read-compatibility union for evidence packets. Each per-project gather is a
   // self-consistent search/traverse/recall over one namespace; pooling their
   // evidence lets a symlink-migrated repo's legacy docs compete for the shared
   // token budget instead of being hidden behind the canonical project's results.
-  async #gatherAcrossProjects(payload, readProjects, now) {
+  async #gatherAcrossProjects(payload, readProjects, now, recordStageTiming) {
     const maxTokens = Number.isSafeInteger(payload.maxTokens) && payload.maxTokens > 0
       ? payload.maxTokens
       : Infinity;
@@ -871,6 +882,7 @@ export class DaemonOperations {
         now,
         recencyDecay: true,
         dedupe: payload.dedupe === true,
+        recordStageTiming,
       });
       modes.add(result.mode);
       intent ??= result.intent;
@@ -924,7 +936,12 @@ export class DaemonOperations {
     // This is idempotent (flagPossibleConflicts overwrites or clears every
     // item's flag) and cheap: one more manifest snapshot read per surviving
     // item, bounded by the same evidenceCap as everything else here.
-    await flagPossibleConflicts(this.store, evidence);
+    const conflictStartedAt = performance.now();
+    try {
+      await flagPossibleConflicts(this.store, evidence);
+    } finally {
+      recordStageTiming("conflictMs", performance.now() - conflictStartedAt);
+    }
     // Single-project gather returns evidence in chronological order (gather.js)
     // and the model-facing guidance asserts that ordering; re-sort after budget
     // selection so the alias-widened merge matches it instead of leaking the

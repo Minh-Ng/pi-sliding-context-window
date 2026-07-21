@@ -46,6 +46,33 @@ const HANDSHAKE_TIMEOUT_MS = 5_000;
 export const DEFAULT_IDLE_SHUTDOWN_MS = 5 * 60 * 1_000;
 const MAX_SLOW_REQUESTS = 100;
 const DEFAULT_SLOW_REQUEST_MS = 250;
+const GATHER_STAGE_TIMING_FIELDS = Object.freeze([
+  "maintenanceMs",
+  "candidateSearchMs",
+  "semanticMs",
+  "rerankerMs",
+  "searchOtherMs",
+  "traversalMs",
+  "recallMs",
+  "conflictMs",
+  "gatherOtherMs",
+]);
+
+function normalizedStageTimings(raw, durationMs) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const result = {};
+  let remainingMs = durationMs;
+  for (const field of GATHER_STAGE_TIMING_FIELDS) {
+    const rawDuration = raw[field];
+    if (!Number.isFinite(rawDuration) || rawDuration < 0) continue;
+    const measuredMs = Math.min(remainingMs, Math.floor(rawDuration));
+    result[field] = measuredMs;
+    remainingMs -= measuredMs;
+  }
+  if (Object.keys(result).length === 0) return undefined;
+  result.requestOtherMs = remainingMs;
+  return Object.freeze(result);
+}
 
 function codedError(code, message, details) {
   const error = new Error(message);
@@ -291,6 +318,7 @@ export class StoreDaemon {
     this.ownerLockToken = 0;
     this.draining = false;
     this.storeClosePrepared = false;
+    this.startupTimings = undefined;
     this.idleShutdownTimer = undefined;
     this.idleShutdownAt = undefined;
   }
@@ -316,7 +344,13 @@ export class StoreDaemon {
   }
 
   async #start() {
+    const startupStartedAt = performance.now();
+    const stageDurations = {};
+    const recordStartupStage = (field, startedAt) => {
+      stageDurations[field] = Math.max(0, performance.now() - startedAt);
+    };
     try {
+      const pathsStartedAt = performance.now();
       ensureSecureSocketDirectory(this.socketPath);
       this.storePath = ensureSecureStoreDirectory(this.storePath);
       if (!this.socketPathExplicit) this.socketPath = defaultSocketPath(this.storePath);
@@ -326,7 +360,9 @@ export class StoreDaemon {
       if (!this.ownerLockToken) {
         throw codedError("STORE_BUSY", `RocksDB store is already owned: ${this.storePath}.`);
       }
+      recordStartupStage("pathsAndLockMs", pathsStartedAt);
       this.storeClosePrepared = false;
+      const storeStartedAt = performance.now();
       try {
         this.store = await this.createStore(this.storePath);
       } catch (error) {
@@ -338,9 +374,13 @@ export class StoreDaemon {
         }
         throw error;
       }
+      recordStartupStage("storeRuntimeMs", storeStartedAt);
       this.#assertStartActive();
+      const socketStartedAt = performance.now();
       await prepareSocket(this.socketPath);
+      recordStartupStage("socketPreparationMs", socketStartedAt);
       this.#assertStartActive();
+      const listenStartedAt = performance.now();
       this.server = createServer((socket) => this.#accept(socket));
       await new Promise((resolve, reject) => {
         const onError = (error) => {
@@ -357,6 +397,17 @@ export class StoreDaemon {
       });
       this.#assertStartActive();
       chmodSync(this.socketPath, 0o600);
+      recordStartupStage("listenMs", listenStartedAt);
+      const roundedStages = Object.fromEntries(Object.entries(stageDurations)
+        .map(([field, durationMs]) => [field, Math.floor(durationMs)]));
+      const measuredMs = Object.values(roundedStages)
+        .reduce((total, durationMs) => total + durationMs, 0);
+      const totalMs = Math.max(measuredMs, Math.floor(performance.now() - startupStartedAt));
+      this.startupTimings = Object.freeze({
+        ...roundedStages,
+        startupOtherMs: totalMs - measuredMs,
+        totalMs,
+      });
       this.state = "running";
       this.#scheduleIdleShutdown();
       return this;
@@ -1024,6 +1075,7 @@ export class StoreDaemon {
       if (this.activeRequestBytes < 0) this.activeRequestBytes = 0;
       const completedAt = Date.now();
       const durationMs = Math.max(0, completedAt - requestStartedAt);
+      const stageTimings = normalizedStageTimings(context.stageTimings, durationMs);
       if (durationMs >= this.slowRequestMs) {
         this.slowRequests.push(Object.freeze({
           operation: request.operation,
@@ -1031,6 +1083,7 @@ export class StoreDaemon {
           durationMs,
           completedAt,
           ok,
+          ...(stageTimings === undefined ? {} : { stageTimings }),
         }));
         if (this.slowRequests.length > MAX_SLOW_REQUESTS) {
           this.slowRequests.splice(0, this.slowRequests.length - MAX_SLOW_REQUESTS);
@@ -1043,6 +1096,7 @@ export class StoreDaemon {
           durationMs,
           completedAt,
           ok,
+          ...(stageTimings === undefined ? {} : { stageTimings }),
         });
       } catch { /* diagnostics must not affect request handling */ }
     };
@@ -1106,6 +1160,7 @@ export class StoreDaemon {
       storePath: this.storePath,
       runtimeVersion: this.serverVersion,
       startedAt: this.startedAt,
+      ...(this.startupTimings === undefined ? {} : { startupTimings: this.startupTimings }),
       schemaVersion: STORE_SCHEMA_VERSION,
       protocolVersion: STORE_PROTOCOL_VERSION,
       capabilities: this.capabilities,

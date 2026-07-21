@@ -678,6 +678,16 @@ test("extractDecisionCandidates quotes decision-shaped sentences verbatim", () =
   }
 
   assert.deepEqual(extractDecisionCandidates("Nothing conclusive was discussed today."), []);
+  assert.deepEqual(
+    extractDecisionCandidates("Can you remember what we chose for canary deploys?"),
+    [],
+    "an interrogative reference to a choice is not itself a decision",
+  );
+  assert.deepEqual(
+    extractDecisionCandidates("We chose cobalt for canary deploys."),
+    ["We chose cobalt for canary deploys."],
+    "the equivalent declarative choice remains eligible",
+  );
   assert.deepEqual(extractDecisionCandidates(`We decided that ${"x".repeat(400)}.`), [], "over-length sentences are skipped");
   const many = Array.from({ length: 9 }, (_, i) => `We decided option ${i} works.`).join(" ");
   assert.equal(extractDecisionCandidates(many).length, 5, "caps candidates per turn");

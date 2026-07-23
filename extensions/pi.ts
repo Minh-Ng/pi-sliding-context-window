@@ -15,8 +15,11 @@ import { loadConfig, saveGlobalConfig } from "../src/config.js";
 import { readGrantedReadScope } from "../src/daemon/read-scope.js";
 import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import {
-  EpochWindowSession,
-  ROTATION_STATE_ENTRY,
+  EpochWindowSession as StaticEpochWindowSession,
+  ROTATION_STATE_ENTRY as STATIC_ROTATION_STATE_ENTRY,
+} from "../src/session/epoch-window.js";
+import type {
+  EpochWindowSession as EpochWindowSessionType,
 } from "../src/session/epoch-window.js";
 import {
   formatArchiveStorage,
@@ -63,7 +66,7 @@ const WINDOW_COMMAND_USAGE = WINDOW_ARGUMENTS.map(({ label }) => label).join("|"
 
 function windowArgumentCompletions(
   prefix: string,
-  active?: EpochWindowSession,
+  active?: EpochWindowSessionType,
 ): AutocompleteItem[] | null {
   const items: AutocompleteItem[] = WINDOW_ARGUMENTS.map(({ value, label, description }) => ({
     value,
@@ -332,6 +335,12 @@ function isArchiveCompactionResult(value: unknown): value is ArchiveCompactionRe
   return true;
 }
 
+async function loadFreshEpochWindow(): Promise<typeof import("../src/session/epoch-window.js")> {
+  const epochWindowUrl = new URL("../src/session/epoch-window.js", import.meta.url);
+  epochWindowUrl.searchParams.set("pi-reload", `${Date.now()}-${Math.random()}`);
+  return await import(epochWindowUrl.href) as typeof import("../src/session/epoch-window.js");
+}
+
 function startupContextMessages(sessionManager: ExtensionContext["sessionManager"]): any[] {
   const entries = typeof sessionManager.buildContextEntries === "function"
     ? sessionManager.buildContextEntries()
@@ -347,16 +356,25 @@ export function createContextEpochWindow({
   configLoader = loadConfig,
   configSaver = saveGlobalConfig,
   archiveFactory,
+  epochWindowLoader,
 }: {
   configLoader?: typeof loadConfig;
   configSaver?: typeof saveGlobalConfig | null;
   archiveFactory?: (path: string, options?: any) => any;
+  epochWindowLoader?: () => Promise<typeof import("../src/session/epoch-window.js")>;
 } = {}) {
   const persistConfig = typeof configSaver === "function" ? configSaver : saveGlobalConfig;
   return async function contextEpochWindow(pi: ExtensionAPI) {
-    // Pi reloads the TypeScript entrypoint, but under Node its Jiti loader may
-    // retain native ESM dependencies from the prior generation. A unique URL
-    // keeps the extension-facing routing contract generation-consistent.
+    // The packaged default supplies a cache-busted epoch loader because Jiti
+    // can retain native ESM dependencies across `/reload`. Injected/test
+    // adapters use the stable constructor unless they request another loader.
+    const epochWindowModule: typeof import("../src/session/epoch-window.js") = epochWindowLoader
+      ? await epochWindowLoader()
+      : {
+          EpochWindowSession: StaticEpochWindowSession,
+          ROTATION_STATE_ENTRY: STATIC_ROTATION_STATE_ENTRY,
+        } as typeof import("../src/session/epoch-window.js");
+    const { EpochWindowSession, ROTATION_STATE_ENTRY } = epochWindowModule;
     const routingUrl = new URL("../src/evidence-routing.js", import.meta.url);
     routingUrl.searchParams.set("pi-reload", `${Date.now()}-${Math.random()}`);
     const {
@@ -385,7 +403,7 @@ export function createContextEpochWindow({
         import("../src/archive/backend-authority.js"),
       ]);
     }
-    let session: EpochWindowSession | undefined;
+    let session: EpochWindowSessionType | undefined;
     let recallHandles = new Map<string, string>();
     let recallHandleTargets = new Map<string, string>();
     let recallHandleByTarget = new Map<string, string>();
@@ -680,6 +698,7 @@ export function createContextEpochWindow({
       let warmupMs = 0;
       let warmupMessageCount = 0;
       let warmupArtifactCount = 0;
+      let warmupAvailable = true;
       const previousSession = session;
       session = undefined;
       recallHandles = new Map();
@@ -697,7 +716,7 @@ export function createContextEpochWindow({
         throw error;
       }
       let archive: any;
-      let nextSession: EpochWindowSession | undefined;
+      let nextSession: EpochWindowSessionType | undefined;
       try {
         const config = configLoader({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted?.() === true });
         // Canonicalize project identity so one repository opened through a
@@ -768,7 +787,7 @@ export function createContextEpochWindow({
                   candidateWindow: (config as any).rerankerCandidates,
                 },
               });
-        nextSession = new EpochWindowSession({
+        const createdSession = new EpochWindowSession({
           archive,
           config,
           sessionId: stableSessionId(ctx.sessionManager, project),
@@ -777,16 +796,25 @@ export function createContextEpochWindow({
           model: ctx.model,
           onRotation: (state) => pi.appendEntry(ROTATION_STATE_ENTRY, state),
         });
+        nextSession = createdSession;
         const branch = ctx.sessionManager.getBranch();
-        nextSession.restore(branch);
+        createdSession.restore(branch);
         archiveSetupMs = performance.now() - startupStartedAt;
 
         const warmupMessages = startupContextMessages(ctx.sessionManager);
         warmupMessageCount = warmupMessages.length;
         const warmupStartedAt = performance.now();
         if (warmupMessages.length > 0) {
-          const warmup = nextSession.warmToolArtifacts(warmupMessages);
-          warmupArtifactCount = warmup.artifactCount;
+          const warmToolArtifacts = (createdSession as any).warmToolArtifacts;
+          if (typeof warmToolArtifacts === "function") {
+            const warmup = warmToolArtifacts.call(createdSession, warmupMessages);
+            warmupArtifactCount = warmup.artifactCount;
+          } else {
+            // A stale dependency generation must not make `/reload` fail. The
+            // cache-busted import above should prevent this, but skipping the
+            // optional warmup remains safe if a host loader violates URL identity.
+            warmupAvailable = false;
+          }
         }
         warmupMs = performance.now() - warmupStartedAt;
       } catch (error) {
@@ -814,6 +842,7 @@ export function createContextEpochWindow({
         warmupMs,
         warmupMessageCount,
         warmupArtifactCount,
+        warmupAvailable,
         totalMs: performance.now() - startupStartedAt,
       });
       // Status is presentation-only. A healthy session must not be reported to
@@ -1389,4 +1418,4 @@ export function createContextEpochWindow({
   };
 }
 
-export default createContextEpochWindow();
+export default createContextEpochWindow({ epochWindowLoader: loadFreshEpochWindow });

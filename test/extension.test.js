@@ -1132,6 +1132,7 @@ test("session startup warms tool artifacts without running the mutating epoch st
   assert.equal(timings[0].phase, "startup");
   assert.equal(timings[0].warmupMessageCount, 4);
   assert.equal(timings[0].warmupArtifactCount, 2);
+  assert.equal(timings[0].warmupAvailable, true);
   assert.ok(timings[0].warmupMs >= 0);
 
   const nextUser = {
@@ -1145,6 +1146,64 @@ test("session startup warms tool artifacts without running the mutating epoch st
   assert.equal(timings.at(-1).phase, "context");
   assert.equal(timings.at(-1).messageCount, 5);
 
+  handlers.get("session_shutdown")({}, ctx);
+});
+
+test("hot reload tolerates a stale epoch generation without the optional warmup method", async () => {
+  class LegacyEpochWindowSession extends EpochWindowSession {}
+  Object.defineProperty(LegacyEpochWindowSession.prototype, "warmToolArtifacts", {
+    configurable: true,
+    value: undefined,
+  });
+  const handlers = new Map();
+  const timings = [];
+  const archive = memoryCheckpointArchive();
+  const userMessage = {
+    role: "user",
+    content: [{ type: "text", text: "resume" }],
+    timestamp: 1,
+  };
+  const branch = [{
+    type: "message",
+    id: "legacy-entry",
+    parentId: null,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    message: userMessage,
+  }];
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig(),
+    archiveFactory: () => archive,
+    epochWindowLoader: async () => ({
+      EpochWindowSession: LegacyEpochWindowSession,
+      ROTATION_STATE_ENTRY,
+    }),
+  })({
+    events: {
+      emit(name, details) {
+        if (name === "context-window:timing") timings.push(details);
+      },
+    },
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 100_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "legacy-hot-reload",
+      getBranch: () => branch,
+      buildContextEntries: () => branch,
+    },
+    ui: { setStatus() {} },
+  };
+
+  assert.doesNotThrow(() => handlers.get("session_start")({ reason: "reload" }, ctx));
+  assert.equal(timings[0].warmupAvailable, false);
+  assert.equal(timings[0].warmupArtifactCount, 0);
   handlers.get("session_shutdown")({}, ctx);
 });
 

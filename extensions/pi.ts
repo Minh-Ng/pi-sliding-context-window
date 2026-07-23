@@ -679,6 +679,7 @@ export function createContextEpochWindow({
       let archiveSetupMs = 0;
       let warmupMs = 0;
       let warmupMessageCount = 0;
+      let warmupArtifactCount = 0;
       const previousSession = session;
       session = undefined;
       recallHandles = new Map();
@@ -783,7 +784,10 @@ export function createContextEpochWindow({
         const warmupMessages = startupContextMessages(ctx.sessionManager);
         warmupMessageCount = warmupMessages.length;
         const warmupStartedAt = performance.now();
-        if (warmupMessages.length > 0) nextSession.process(warmupMessages, ctx.model);
+        if (warmupMessages.length > 0) {
+          const warmup = nextSession.warmToolArtifacts(warmupMessages);
+          warmupArtifactCount = warmup.artifactCount;
+        }
         warmupMs = performance.now() - warmupStartedAt;
       } catch (error) {
         startupState = "failed";
@@ -809,6 +813,7 @@ export function createContextEpochWindow({
         archiveSetupMs,
         warmupMs,
         warmupMessageCount,
+        warmupArtifactCount,
         totalMs: performance.now() - startupStartedAt,
       });
       // Status is presentation-only. A healthy session must not be reported to

@@ -208,6 +208,67 @@ export class EpochWindowSession {
     this.refreshArchiveProtection();
   }
 
+  warmToolArtifacts(messages) {
+    const sourceMessages = Array.isArray(messages) ? messages : [];
+    if (sourceMessages.length === 0) {
+      this.reconcileStoredArtifactIds([]);
+      return Object.freeze({ messageCount: 0, artifactCount: 0 });
+    }
+
+    let active = sourceMessages;
+    const archiveIds = new Set();
+    if (this.config.dedupToolResults !== false) {
+      const deduplicated = deduplicateToolResults(active, {
+        store: (message, text) => this.storeToolResult(message, text, { activate: false }),
+      });
+      active = deduplicated.messages;
+      for (const id of deduplicated.archiveIds) archiveIds.add(id);
+    }
+
+    const budgetPolicy = resolveToolResultBudget(
+      this.config,
+      this.contextLimits.rotationTokens,
+    );
+    const visibleSourceKeys = sourceMessages.map(messageKey);
+    const rebalanceThroughIndex = this.toolResultRebalanceThroughKey === undefined
+      ? -1
+      : visibleSourceKeys.lastIndexOf(this.toolResultRebalanceThroughKey);
+    const externalized = externalizeLargeToolResults(active, {
+      maxTokens: budgetPolicy.maxToolResultTokens,
+      store: (message, text) => this.storeToolResult(message, text, { activate: false }),
+      budgetTokens: budgetPolicy.budgetTokens,
+      floorTokens: budgetPolicy.floorTokens,
+      floorThroughIndex: rebalanceThroughIndex,
+    });
+    active = externalized.messages;
+    for (const id of externalized.archiveIds) archiveIds.add(id);
+
+    const configuredArgumentLimit = Number(this.config.maxToolArgumentTokens);
+    const maxToolArgumentTokens = Number.isSafeInteger(configuredArgumentLimit) && configuredArgumentLimit > 0
+      ? configuredArgumentLimit
+      : 4_000;
+    const externalizedArguments = externalizeLargeToolArguments(active, {
+      maxTokens: maxToolArgumentTokens,
+      store: (message, part, text) => this.storeToolArgument(message, part, text, { activate: false }),
+    });
+    for (const id of externalizedArguments.archiveIds) archiveIds.add(id);
+
+    this.reconcileStoredArtifactIds(sourceMessages);
+    if (archiveIds.size > 0) {
+      const previousActiveArchiveIds = this.activeArchiveIds;
+      this.activeArchiveIds = new Set([...previousActiveArchiveIds, ...archiveIds]);
+      try {
+        this.refreshArchiveProtection();
+      } finally {
+        this.activeArchiveIds = previousActiveArchiveIds;
+      }
+    }
+    return Object.freeze({
+      messageCount: sourceMessages.length,
+      artifactCount: archiveIds.size,
+    });
+  }
+
   process(messages, model) {
     this.contextLimits = resolveContextLimits(this.config, model);
     if (this.contextLimits.inputWindowTokens === 0
@@ -1162,7 +1223,7 @@ export class EpochWindowSession {
     }
   }
 
-  storeToolResult(message, text) {
+  storeToolResult(message, text, { activate = true, protect = activate } = {}) {
     const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
     const id = toolResultId(this.sessionId, message, text);
     if (this.storedArtifactIds.has(id)) return id;
@@ -1178,15 +1239,15 @@ export class EpochWindowSession {
         toolName: message.toolName ?? message.name,
         sourceMessageKey: messageKey(message),
       },
-    }, { deferPrune: true, protect: true });
+    }, { deferPrune: true, protect });
     if (storedId) {
       this.storedArtifactIds.add(storedId);
-      this.activeArchiveIds.add(storedId);
+      if (activate) this.activeArchiveIds.add(storedId);
     }
     return storedId;
   }
 
-  storeToolArgument(message, part, text) {
+  storeToolArgument(message, part, text, { activate = true, protect = activate } = {}) {
     const toolCallId = String(part.id ?? part.toolCallId ?? part.tool_call_id ?? "");
     const id = toolArgumentId(this.sessionId, part, text);
     if (this.storedArtifactIds.has(id)) return id;
@@ -1202,10 +1263,10 @@ export class EpochWindowSession {
         toolName: part.name ?? part.toolName,
         sourceMessageKey: messageKey(message),
       },
-    }, { deferPrune: true, protect: true });
+    }, { deferPrune: true, protect });
     if (storedId) {
       this.storedArtifactIds.add(storedId);
-      this.activeArchiveIds.add(storedId);
+      if (activate) this.activeArchiveIds.add(storedId);
     }
     return storedId;
   }

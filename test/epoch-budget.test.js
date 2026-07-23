@@ -133,6 +133,40 @@ test("failed tool-artifact writes retry and cache only after success", () => {
   assert.equal(archive.putCalls, 2, "successful retry is reused by later passes");
 });
 
+test("tool-artifact warmup populates the cache without mutating epoch state", () => {
+  const archive = trackingMemoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, maxToolResultTokens: 32, maxToolArgumentTokens: 32 },
+    sessionId: "artifact-warmup-session",
+    project: "/project",
+  });
+  const toolCall = {
+    role: "assistant",
+    content: [{
+      type: "toolCall",
+      id: "warm-call",
+      name: "write",
+      arguments: { path: "/tmp/large", content: "a".repeat(1_000) },
+    }],
+    timestamp: 2,
+  };
+  const result = toolResult("b".repeat(1_000), 3, "warm-call");
+  const messages = [user("warm", 1), toolCall, result];
+
+  const warmup = session.warmToolArtifacts(messages);
+  assert.deepEqual(warmup, { messageCount: 3, artifactCount: 2 });
+  assert.equal(archive.putCalls, 2);
+  assert.equal(session.storedArtifactIds.size, 2);
+  assert.equal(session.activeArchiveIds.size, 0);
+  assert.equal(session.activeMessages, undefined);
+  assert.equal(session.rotations, 0);
+
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, 2);
+  assert.equal(session.storedArtifactIds.size, 2);
+});
+
 test("rotation bounds the artifact cache to the retained epoch without repeated writes", () => {
   const archive = trackingMemoryArchive();
   const session = new EpochWindowSession({

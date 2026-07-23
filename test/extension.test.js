@@ -1046,30 +1046,56 @@ function compactionEvent(reason, preparation, branchEntries = []) {
   };
 }
 
-test("session startup warms active context artifacts before the first context event", async () => {
+test("session startup warms tool artifacts without running the mutating epoch state machine", async () => {
   const handlers = new Map();
   const timings = [];
+  const appendedEntries = [];
   const archive = memoryCheckpointArchive();
+  let pruneCalls = 0;
+  let searchCalls = 0;
+  let removeHintCalls = 0;
+  archive.prune = () => { pruneCalls += 1; };
+  archive.search = () => { searchCalls += 1; return []; };
+  archive.removeHints = () => { removeHintCalls += 1; return 0; };
+
   const userMessage = {
     role: "user",
-    content: [{ type: "text", text: "run the large tool" }],
+    content: [{ type: "text", text: "run the first large tool" }],
     timestamp: 1,
   };
   const toolMessage = {
     role: "toolResult",
-    toolCallId: "warmup-tool",
+    toolCallId: "warmup-tool-1",
     toolName: "read",
     content: [{ type: "text", text: "x".repeat(1_000) }],
     timestamp: 2,
   };
-  const branch = [
-    { type: "message", id: "entry-1", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: userMessage },
-    { type: "message", id: "entry-2", parentId: "entry-1", timestamp: "2026-01-01T00:00:01.000Z", message: toolMessage },
-  ];
+  const secondUser = {
+    role: "user",
+    content: [{ type: "text", text: "run the second large tool" }],
+    timestamp: 3,
+  };
+  const secondTool = {
+    role: "toolResult",
+    toolCallId: "warmup-tool-2",
+    toolName: "read",
+    content: [{ type: "text", text: "y".repeat(1_000) }],
+    timestamp: 4,
+  };
+  const sourceMessages = [userMessage, toolMessage, secondUser, secondTool];
+  const branch = sourceMessages.map((message, index) => ({
+    type: "message",
+    id: `entry-${index + 1}`,
+    parentId: index === 0 ? null : `entry-${index}`,
+    timestamp: `2026-01-01T00:00:0${index}.000Z`,
+    message,
+  }));
   await createContextEpochWindow({
     configLoader: () => compactionConfig({
-      rotationTurns: 50,
+      rotationTurns: 2,
+      retainTurns: 1,
       maxToolResultTokens: 32,
+      automaticRetrieval: true,
     }),
     archiveFactory: () => archive,
   })({
@@ -1081,7 +1107,7 @@ test("session startup warms active context artifacts before the first context ev
     on(name, handler) { handlers.set(name, handler); },
     registerTool() {},
     registerCommand() {},
-    appendEntry() {},
+    appendEntry(type, data) { appendedEntries.push({ type, data }); },
   });
   const ctx = {
     cwd: "/project",
@@ -1097,23 +1123,27 @@ test("session startup warms active context artifacts before the first context ev
   };
 
   handlers.get("session_start")({ reason: "resume" }, ctx);
-  const artifactWritesAfterStartup = archive.puts.filter(({ kind }) => kind === "tool-result").length;
-  assert.equal(artifactWritesAfterStartup, 1);
+  assert.equal(archive.puts.filter(({ kind }) => kind === "tool-result").length, 2);
+  assert.equal(archive.puts.some(({ kind }) => kind === "turn"), false);
+  assert.equal(appendedEntries.length, 0);
+  assert.equal(pruneCalls, 0);
+  assert.equal(searchCalls, 0);
+  assert.equal(removeHintCalls, 0);
   assert.equal(timings[0].phase, "startup");
-  assert.equal(timings[0].warmupMessageCount, 2);
+  assert.equal(timings[0].warmupMessageCount, 4);
+  assert.equal(timings[0].warmupArtifactCount, 2);
   assert.ok(timings[0].warmupMs >= 0);
 
-  const writesAfterStartup = archive.puts.length;
   const nextUser = {
     role: "user",
     content: [{ type: "text", text: "continue" }],
-    timestamp: 3,
+    timestamp: 5,
   };
-  const result = handlers.get("context")({ messages: [userMessage, toolMessage, nextUser] }, ctx);
-  assert.equal(archive.puts.length, writesAfterStartup);
+  const result = handlers.get("context")({ messages: [...sourceMessages, nextUser] }, ctx);
+  assert.equal(archive.puts.filter(({ kind }) => kind === "tool-result").length, 2);
   assert.equal(result.messages.at(-1), nextUser);
   assert.equal(timings.at(-1).phase, "context");
-  assert.equal(timings.at(-1).messageCount, 3);
+  assert.equal(timings.at(-1).messageCount, 5);
 
   handlers.get("session_shutdown")({}, ctx);
 });

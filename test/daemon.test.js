@@ -299,6 +299,21 @@ async function waitFor(predicate, message) {
   assert.fail(message);
 }
 
+async function removeDirectoryEventually(directory, attempts = 50) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      rmSync(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (error?.code !== "ENOTEMPTY" && error?.code !== "EBUSY") throw error;
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw lastError;
+}
+
 async function settlesWithin(promise, milliseconds, message) {
   let timer;
   const deadline = new Promise((_, reject) => {
@@ -1098,7 +1113,7 @@ test("an operator restart drains and replaces the shared daemon", async (t) => {
     bridge.close();
     try { process.kill(processId, "SIGKILL"); } catch { /* already stopped */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    rmSync(paths.directory, { recursive: true, force: true });
+    await removeDirectoryEventually(paths.directory);
   });
 
   const peer = new SynchronousStoreBridge({ ...paths, project: paths.directory });
@@ -1129,7 +1144,7 @@ test("operator restart falls back to verified SIGTERM for a legacy daemon", asyn
     legacy.stop();
     try { process.kill(processId, "SIGKILL"); } catch { /* already stopped */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    rmSync(paths.directory, { recursive: true, force: true });
+    await removeDirectoryEventually(paths.directory);
   });
 
   const result = bridge.restart("test legacy restart");

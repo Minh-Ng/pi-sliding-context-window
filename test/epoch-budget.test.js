@@ -81,7 +81,9 @@ test("repeated large context passes reuse successfully stored tool artifacts", (
 
   const first = session.process(messages, { contextWindow: 200_000 });
   const writesAfterFirstPass = archive.putCalls;
+  const protectionsAfterFirstPass = archive.protectionRequests.length;
   assert.ok(writesAfterFirstPass >= 350);
+  assert.equal(protectionsAfterFirstPass, 2, "constructor and pass-level protection refresh only");
 
   const startedAt = performance.now();
   const second = session.process(messages, { contextWindow: 200_000 });
@@ -89,7 +91,49 @@ test("repeated large context passes reuse successfully stored tool artifacts", (
 
   assert.deepEqual(second, first);
   assert.equal(archive.putCalls, writesAfterFirstPass);
+  assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 1);
   assert.ok(elapsedMs < 100, `cached context pass took ${elapsedMs.toFixed(1)}ms`);
+
+  const appended = [
+    ...messages,
+    toolResult(`new:${"y".repeat(1_000)}`, messages.length + 2, "new-result"),
+  ];
+  session.process(appended, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, writesAfterFirstPass + 1, "only the appended artifact is stored");
+  assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 2);
+});
+
+test("failed tool-artifact writes retry and cache only after success", () => {
+  const archive = trackingMemoryArchive();
+  const successfulPut = archive.put.bind(archive);
+  let rejectWrite = true;
+  archive.put = (document, options) => {
+    if (rejectWrite) {
+      archive.putCalls += 1;
+      return undefined;
+    }
+    return successfulPut(document, options);
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, maxToolResultTokens: 32 },
+    sessionId: "artifact-retry-session",
+    project: "/project",
+  });
+  const messages = [user("run", 1), toolResult("x".repeat(1_000), 2, "retry-result")];
+
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, 1);
+  assert.equal(archive.documents.size, 0);
+
+  rejectWrite = false;
+  const second = session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, 2);
+  assert.equal(archive.documents.size, 1);
+  assert.match(second[1].content[0].text, /archived as tool-/);
+
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, 2, "successful retry is reused by later passes");
 });
 
 test("externalized tool-call arguments retain their one original source message key", () => {

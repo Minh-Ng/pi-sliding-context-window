@@ -897,6 +897,9 @@ test("synchronous facade preserves the legacy archive surface over a real daemon
     assert.equal(stats.noRoutineSizeCap, true);
     assert.equal(stats.maxBytes, null);
     assert.equal(stats.retention.liveDocuments, 3);
+    assert.ok(stats.memory.rssBytes > 0);
+    assert.ok(stats.memory.maxRssBytes >= stats.memory.rssBytes);
+    assert.equal(typeof stats.semantic.enabled, "boolean");
     archive.releaseProtectionOwner("nonexistent-owner");
   } finally {
     try { archive?.close(); } catch {}

@@ -785,6 +785,14 @@ test("every current and planned operation validates its request and result", () 
 test("daemon slow-request stage timings are bounded to privacy-safe fields", () => {
   const timedStatus = {
     ...results["daemon.status"],
+    memory: {
+      rssBytes: 1_024,
+      maxRssBytes: 2_048,
+      heapTotalBytes: 512,
+      heapUsedBytes: 256,
+      externalBytes: 128,
+      arrayBuffersBytes: 64,
+    },
     startupTimings: {
       pathsAndLockMs: 1,
       storeRuntimeMs: 12,

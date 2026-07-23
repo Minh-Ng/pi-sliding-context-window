@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   rename,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -28,8 +29,21 @@ export const DEFAULT_SEMANTIC_MODEL_REVISION = "751bff37182d3f1213fa05d7196b954e
 // @huggingface/transformers feature-extraction pipeline accepts.
 const POOLING_MODES = new Set(["mean", "cls", "first_token", "last_token", "eos", "none"]);
 
+async function fileSize(path) {
+  try {
+    return (await stat(path)).size;
+  } catch {
+    // Observability must never make a valid derived index unavailable.
+    return 0;
+  }
+}
+
 function digest(value, length = 24) {
   return createHash("sha256").update(value).digest("hex").slice(0, length);
+}
+
+function documentIdentity(documentId, version) {
+  return `${documentId}\0${version}`;
 }
 
 function vectorLabel(identity, salt = 0) {
@@ -110,6 +124,11 @@ export class LocalSemanticIndex {
     this.recordError = recordError;
     this.states = new Map();
     this.queue = Promise.resolve();
+    this.entryCount = 0;
+    this.documentCount = 0;
+    this.queuedDocuments = 0;
+    this.metadataBytes = 0;
+    this.indexBytes = 0;
     this.closed = false;
     this.unavailable = false;
     // Pooling changes the vectors a model produces for the same text, so it
@@ -155,19 +174,39 @@ export class LocalSemanticIndex {
         index: undefined,
         entries: new Map(),
         documents: new Set(),
+        entryCountByDocumentIdentity: new Map(),
+        metadataBytes: 0,
+        indexBytes: 0,
         dirty: false,
       };
       try {
-        const metadata = JSON.parse(await readFile(join(directory, "metadata.json"), "utf8"));
+        const metadataPath = join(directory, "metadata.json");
+        const indexPath = join(directory, "index.usearch");
+        const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
         if (metadata.formatVersion !== FORMAT_VERSION
           || metadata.fingerprint !== this.fingerprint
           || metadata.project !== project
           || metadata.dimensions !== this.dimensions
           || !Array.isArray(metadata.entries)) return state;
         state.index = newIndex(this.dimensions);
-        state.index.load(join(directory, "index.usearch"));
-        for (const entry of metadata.entries) state.entries.set(entry.label, Object.freeze(entry));
-        for (const identity of metadata.documents ?? []) state.documents.add(identity);
+        state.index.load(indexPath);
+        for (const entry of metadata.entries) {
+          state.entries.set(entry.label, Object.freeze(entry));
+          const identity = documentIdentity(entry.documentId, entry.version);
+          state.documents.add(identity);
+          state.entryCountByDocumentIdentity.set(
+            identity,
+            (state.entryCountByDocumentIdentity.get(identity) ?? 0) + 1,
+          );
+        }
+        [state.metadataBytes, state.indexBytes] = await Promise.all([
+          fileSize(metadataPath),
+          fileSize(indexPath),
+        ]);
+        this.entryCount += state.entries.size;
+        this.documentCount += state.documents.size;
+        this.metadataBytes += state.metadataBytes;
+        this.indexBytes += state.indexBytes;
       } catch {
         // A missing, partial, or incompatible derived snapshot is rebuilt from
         // canonical RocksDB records. It never makes lexical retrieval fail.
@@ -193,8 +232,18 @@ export class LocalSemanticIndex {
       entries: [...state.entries.values()],
       documents: [...state.documents],
     }), { mode: 0o600 });
-    await rename(temporaryIndex, join(state.directory, "index.usearch"));
-    await rename(temporaryMetadata, join(state.directory, "metadata.json"));
+    const indexPath = join(state.directory, "index.usearch");
+    const metadataPath = join(state.directory, "metadata.json");
+    await rename(temporaryIndex, indexPath);
+    await rename(temporaryMetadata, metadataPath);
+    const [metadataBytes, indexBytes] = await Promise.all([
+      fileSize(metadataPath),
+      fileSize(indexPath),
+    ]);
+    this.metadataBytes += metadataBytes - state.metadataBytes;
+    this.indexBytes += indexBytes - state.indexBytes;
+    state.metadataBytes = metadataBytes;
+    state.indexBytes = indexBytes;
     state.dirty = false;
   }
 
@@ -229,8 +278,8 @@ export class LocalSemanticIndex {
     if (!source || source.spans.length === 0) return;
     const { manifest, spans } = source;
     const state = await this.#loadProject(manifest.project);
-    const documentIdentity = `${documentId}\0${version}`;
-    if (state.documents.has(documentIdentity)) return;
+    const identityForDocument = documentIdentity(documentId, version);
+    if (state.documents.has(identityForDocument)) return;
     for (let offset = 0; offset < spans.length; offset += this.batchSize) {
       const batch = spans.slice(offset, offset + this.batchSize);
       const embedded = await this.#embedder().embed(batch.map(({ text }) => text));
@@ -250,6 +299,11 @@ export class LocalSemanticIndex {
           label = vectorLabel(identity, ++salt);
         }
         labels[index] = label;
+        this.entryCount += 1;
+        state.entryCountByDocumentIdentity.set(
+          identityForDocument,
+          (state.entryCountByDocumentIdentity.get(identityForDocument) ?? 0) + 1,
+        );
         state.entries.set(label.toString(), Object.freeze({
           label: label.toString(),
           identity,
@@ -267,17 +321,24 @@ export class LocalSemanticIndex {
       }
       state.index.add(labels, embedded.vectors, 1);
     }
-    state.documents.add(documentIdentity);
+    state.documents.add(identityForDocument);
+    this.documentCount += 1;
     state.dirty = true;
     await this.#persist(state);
   }
 
   enqueueDocument(documentId, version) {
     if (!this.enabled || this.closed || this.unavailable) return;
-    this.queue = this.queue.then(() => this.#indexDocument(documentId, version)).catch((error) => {
-      this.unavailable = true;
-      this.recordError(error);
-    });
+    this.queuedDocuments += 1;
+    this.queue = this.queue
+      .then(() => this.#indexDocument(documentId, version))
+      .catch((error) => {
+        this.unavailable = true;
+        this.recordError(error);
+      })
+      .finally(() => {
+        this.queuedDocuments -= 1;
+      });
   }
 
   async #warmExisting() {
@@ -318,6 +379,15 @@ export class LocalSemanticIndex {
           if (!manifest || manifest.project !== request.project || retired) {
             state.index.remove(label);
             state.entries.delete(label.toString());
+            this.entryCount -= 1;
+            const identityForDocument = documentIdentity(entry.documentId, entry.version);
+            const remainingEntries = (state.entryCountByDocumentIdentity.get(identityForDocument) ?? 1) - 1;
+            if (remainingEntries === 0) {
+              state.entryCountByDocumentIdentity.delete(identityForDocument);
+              if (state.documents.delete(identityForDocument)) this.documentCount -= 1;
+            } else {
+              state.entryCountByDocumentIdentity.set(identityForDocument, remainingEntries);
+            }
             state.dirty = true;
             removed += 1;
             continue;
@@ -350,6 +420,11 @@ export class LocalSemanticIndex {
       revision: this.revision,
       dimensions: this.dimensions,
       pooling: this.pooling,
+      entries: this.entryCount,
+      documents: this.documentCount,
+      queuedDocuments: this.queuedDocuments,
+      metadataBytes: this.metadataBytes,
+      indexBytes: this.indexBytes,
     };
   }
 

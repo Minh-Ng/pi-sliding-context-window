@@ -74,6 +74,20 @@ const INDEX_RETRY_MAX_MS = 5_000;
 const FOREGROUND_INDEX_MAX_BYTES = 64 * 1_024;
 const STATUS_PROJECT_CHUNK_LIMIT = 10_000;
 const STATUS_PROJECT_CHUNK_BYTES = 1 * 1_024 * 1_024;
+const KIBIBYTE = 1_024;
+
+function processMemoryStatus() {
+  const memory = process.memoryUsage();
+  const maxRssBytes = process.resourceUsage().maxRSS * KIBIBYTE;
+  return Object.freeze({
+    rssBytes: memory.rss,
+    maxRssBytes: Math.max(memory.rss, maxRssBytes),
+    heapTotalBytes: memory.heapTotal,
+    heapUsedBytes: memory.heapUsed,
+    externalBytes: memory.external,
+    arrayBuffersBytes: memory.arrayBuffers,
+  });
+}
 
 function retryableBackgroundError(error) {
   return error?.retryable === true
@@ -1488,6 +1502,7 @@ export class DaemonOperations {
           : { oldestPendingAgeMs: outbox.oldestPendingAgeMs }),
       },
       index: { generation: publication?.generation ?? 0 },
+      memory: processMemoryStatus(),
       semantic: this.semantic.status(),
       reranker: this.reranker.status(),
       retention,

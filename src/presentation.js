@@ -594,8 +594,21 @@ export function formatArchiveStorage(storage) {
       `RocksDB archive: ${lowerBound}${Number(counts.documents ?? 0).toLocaleString()} document(s); ${lowerBound}${formatByteSize(counts.logicalBytes ?? 0)} logical source bytes${approximationLabel}`,
       `Physical data: ${formatByteSize(rocksdb.totalSstBytes ?? 0)} SST; ${formatByteSize(rocksdb.liveDataBytes ?? 0)} estimated live data; ${formatByteSize(rocksdb.pendingCompactionBytes ?? 0)} pending compaction`,
       `Retention: ${lowerBound}${Number(retention.pins ?? 0)} pin(s), ${lowerBound}${Number(retention.leases ?? 0)} active lease(s), ${lowerBound}${Number(retention.cleanupBacklog ?? 0)} cleanup item(s)${approximationLabel}`,
-      "Capacity policy: no routine archive-size cap; semantic expiry and compaction reclaim obsolete data.",
+      "Capacity policy: no routine archive-size cap; retention expiry and compaction reclaim obsolete archive data.",
     ];
+    const memory = storage.memory;
+    if (memory) {
+      sections.push(
+        `Daemon memory: ${formatByteSize(memory.rssBytes ?? 0)} RSS; ${formatByteSize(memory.heapUsedBytes ?? 0)} / ${formatByteSize(memory.heapTotalBytes ?? 0)} JavaScript heap; ${formatByteSize(memory.maxRssBytes ?? 0)} peak RSS`,
+      );
+    }
+    const semantic = storage.semantic;
+    if (semantic?.enabled) {
+      const snapshotBytes = Number(semantic.metadataBytes ?? 0) + Number(semantic.indexBytes ?? 0);
+      sections.push(
+        `Semantic index: ${Number(semantic.entries ?? 0).toLocaleString()} span(s) from ${Number(semantic.documents ?? 0).toLocaleString()} document(s) across ${Number(semantic.projects ?? 0).toLocaleString()} loaded project(s); ${formatByteSize(snapshotBytes)} active snapshot data; ${Number(semantic.queuedDocuments ?? 0).toLocaleString()} document(s) queued`,
+      );
+    }
     if (storage.filesystem?.emergencyMode || retention.emergencyMode) {
       sections.push("Emergency disk-low mode is active.");
     }
@@ -724,7 +737,7 @@ export function formatStatusLine(status, style = {}) {
     sections.push(warning(`emergency retention ${status.effectiveRetainTurns}/${status.retainTurns}`));
   }
   const budgetState = toolResultBudgetState(status);
-  if (budgetState === "over") sections.push(warning("tool-result budget reached"));
+  if (budgetState === "over") sections.push(warning("tool-result guard active"));
   else if (budgetState === "near") sections.push(warning("tool-result budget near"));
   if (status.compactionFallbackReason) sections.push(warning("history checkpoint needed"));
   return sections.join(separator);

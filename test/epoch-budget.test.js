@@ -5,6 +5,7 @@ import {
   ROTATION_STATE_ENTRY,
 } from "../src/session/epoch-window.js";
 import { archiveDocumentProvenance } from "../src/identity/provenance.js";
+import { MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS } from "../src/session/epoch-budget.js";
 import { messageKey } from "../src/session/window.js";
 import {
   config,
@@ -181,6 +182,30 @@ function toolResult(text, timestamp, id) {
   return { role: "toolResult", content: [{ type: "text", text }], timestamp, toolCallId: id, toolName: "read" };
 }
 
+test("tool-result gates leave room for a retrievable archive reference", () => {
+  const session = new EpochWindowSession({
+    archive: memoryArchive(),
+    config: {
+      ...config,
+      maxToolResultTokens: 1,
+      toolResultBudgetFloorTokens: 1,
+    },
+    sessionId: "minimum-reference-gate",
+    project: "/project",
+  });
+  const result = session.process([
+    user("run tool", 1),
+    toolResult("x".repeat(2_000), 2, "minimum-reference-result"),
+  ], { contextWindow: 200_000 });
+  const status = session.status();
+  const replacement = result[1].content[0].text;
+
+  assert.equal(status.toolResultMaxTokens, MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS);
+  assert.equal(status.toolResultBudgetFloorTokens, MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS);
+  assert.ok(replacement.length <= MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS * 4);
+  assert.match(replacement, /tool-[a-f0-9]{16}/);
+});
+
 test("over-budget epoch externalizes new tool results below the base gate", () => {
   const archive = memoryArchive();
   const session = new EpochWindowSession({
@@ -263,6 +288,103 @@ test("resume reproduces the tool-result budget counter from the filtered prefix"
   assert.equal(resumedStatus.toolResultTokens, firstStatus.toolResultTokens);
   assert.equal(resumedStatus.toolResultOverBudget, firstStatus.toolResultOverBudget);
   assert.equal(resumedStatus.toolResultBudgetTokens, firstStatus.toolResultBudgetTokens);
+});
+
+test("rotation rebalances retained tool results and resume reproduces the new epoch", () => {
+  const budgetConfig = {
+    ...config,
+    rotationTurns: 2,
+    retainTurns: 1,
+    maxToolResultTokens: 4_000,
+    toolResultBudgetRatio: 0.02, // budget = 2,000 tokens = 8,000 chars
+    toolResultBudgetFloorTokens: 500,
+  };
+  const messages = [
+    user("light", 1),
+    toolResult("a".repeat(100), 2, "light-result"),
+    assistant("done light", 3),
+    user("heavy", 4),
+    toolResult("b".repeat(18_000), 5, "heavy-result"),
+    assistant("done heavy", 6),
+  ];
+  const archive = memoryArchive();
+  const rotations = [];
+  const session = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "rebalance-budget",
+    project: "/project",
+    onRotation: (state) => rotations.push(state),
+  });
+
+  const first = session.process(messages, { contextWindow: 200_000 });
+  assert.equal(session.status().rotations, 1);
+  assert.equal(session.status().toolResultOverBudget, false);
+  assert.ok(session.status().toolResultTokens < session.status().toolResultBudgetTokens);
+  assert.match(first.find((message) => message.toolCallId === "heavy-result").content[0].text, /tool-[a-f0-9]{16}/);
+  assert.equal(
+    [...archive.documents.values()].find((document) => document.metadata.toolCallId === "heavy-result").text,
+    "b".repeat(18_000),
+  );
+  assert.equal(
+    rotations.at(-1).toolResultRebalanceThroughKey,
+    messageKey(messages.at(-1)),
+  );
+
+  const restored = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "rebalance-budget",
+    project: "/project",
+  });
+  restored.restore([{ type: "custom", customType: ROTATION_STATE_ENTRY, data: rotations.at(-1) }]);
+  const resumed = restored.process(messages, { contextWindow: 200_000 });
+  assert.deepEqual(resumed, first);
+  assert.equal(restored.status().toolResultOverBudget, false);
+});
+
+test("rotation preserves deduplicated archive references without nesting", () => {
+  const budgetConfig = {
+    ...config,
+    rotationTurns: 2,
+    retainTurns: 1,
+    maxToolResultTokens: 1,
+    toolResultBudgetFloorTokens: 1,
+  };
+  const payload = "duplicate".repeat(300);
+  const messages = [
+    user("light", 1),
+    assistant("done light", 2),
+    user("repeat tool", 3),
+    toolResult(payload, 4, "duplicate-1"),
+    toolResult(payload, 5, "duplicate-2"),
+    assistant("done repeat", 6),
+  ];
+  const archive = memoryArchive();
+  const rotations = [];
+  const session = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "rebalance-duplicate",
+    project: "/project",
+    onRotation: (state) => rotations.push(state),
+  });
+
+  const first = session.process(messages, { contextWindow: 200_000 });
+  const toolResultDocuments = [...archive.documents.values()]
+    .filter((document) => document.kind === "tool-result");
+  assert.equal(toolResultDocuments.length, 2);
+  assert.ok(toolResultDocuments.every((document) => document.text === payload));
+  assert.ok(toolResultDocuments.every((document) => !document.text.includes("Identical to earlier result")));
+
+  const restored = new EpochWindowSession({
+    archive,
+    config: budgetConfig,
+    sessionId: "rebalance-duplicate",
+    project: "/project",
+  });
+  restored.restore([{ type: "custom", customType: ROTATION_STATE_ENTRY, data: rotations.at(-1) }]);
+  assert.deepEqual(restored.process(messages, { contextWindow: 200_000 }), first);
 });
 
 test("rotation resets the tool-result budget counter to the retained epoch", () => {

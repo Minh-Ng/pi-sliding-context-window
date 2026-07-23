@@ -95,6 +95,7 @@ export class EpochWindowSession {
     this.project = project;
     this.onRotation = onRotation;
     this.boundaryKey = undefined;
+    this.toolResultRebalanceThroughKey = undefined;
     this.activeTokens = undefined;
     this.activeTurns = undefined;
     this.activeMessages = undefined;
@@ -124,6 +125,7 @@ export class EpochWindowSession {
 
   restore(entries) {
     this.boundaryKey = undefined;
+    this.toolResultRebalanceThroughKey = undefined;
     this.rotations = 0;
     this.forceRotation = false;
     this.lastRotationReason = undefined;
@@ -155,6 +157,9 @@ export class EpochWindowSession {
       const data = entry.data;
       if (!data || typeof data !== "object" || Array.isArray(data)) continue;
       this.boundaryKey = typeof data.boundaryKey === "string" ? data.boundaryKey : undefined;
+      this.toolResultRebalanceThroughKey = typeof data.toolResultRebalanceThroughKey === "string"
+        ? data.toolResultRebalanceThroughKey
+        : undefined;
       if (Number.isSafeInteger(data.rotations) && data.rotations >= 0) {
         this.rotations = data.rotations;
       }
@@ -206,6 +211,7 @@ export class EpochWindowSession {
     let boundaryPrefix = [];
     if (!sliced.found) {
       this.boundaryKey = undefined;
+      this.toolResultRebalanceThroughKey = undefined;
       sliced = { messages: contextMessages, found: true, start: 0 };
     } else if (this.boundaryKey !== undefined
       && this.hintReconciledBoundaryKey !== this.boundaryKey
@@ -233,18 +239,24 @@ export class EpochWindowSession {
       ? deduplicateToolResults(active, {
         store: (message, text) => this.storeToolResult(message, text),
       })
-      : { messages: active, archiveIds: [] };
-    active = deduplicated.messages;
+      : { messages: active, archiveIds: [], externalizedMessageIndexes: [] };
+    const deduplicatedMessages = deduplicated.messages;
+    active = deduplicatedMessages;
     for (const id of deduplicated.archiveIds) this.activeArchiveIds.add(id);
     const budgetPolicy = resolveToolResultBudget(
       this.config,
       this.contextLimits.rotationTokens,
     );
+    const rebalanceThroughIndex = this.toolResultRebalanceThroughKey === undefined
+      ? -1
+      : visibleSourceKeys.lastIndexOf(this.toolResultRebalanceThroughKey);
     const externalized = externalizeLargeToolResults(active, {
       maxTokens: budgetPolicy.maxToolResultTokens,
       store: (message, text) => this.storeToolResult(message, text),
       budgetTokens: budgetPolicy.budgetTokens,
       floorTokens: budgetPolicy.floorTokens,
+      floorThroughIndex: rebalanceThroughIndex,
+      protectedMessageIndexes: new Set(deduplicated.externalizedMessageIndexes),
     });
     active = externalized.messages;
     for (const id of externalized.archiveIds) this.activeArchiveIds.add(id);
@@ -293,10 +305,32 @@ export class EpochWindowSession {
       this.lastRotationMode = plan.mode;
       this.effectiveRetainTurns = plan.retainedTurns;
       this.compactionFallbackReason = undefined;
+      active = deduplicatedMessages.slice(plan.start);
+      visibleSourceKeys = visibleSourceKeys.slice(plan.start);
+      this.toolResultRebalanceThroughKey = visibleSourceKeys.at(-1);
+      const retainedProtectedMessageIndexes = new Set(
+        deduplicated.externalizedMessageIndexes
+          .filter((messageIndex) => messageIndex >= plan.start)
+          .map((messageIndex) => messageIndex - plan.start),
+      );
+      const rebalanced = externalizeLargeToolResults(active, {
+        maxTokens: budgetPolicy.maxToolResultTokens,
+        store: (message, text) => this.storeToolResult(message, text),
+        budgetTokens: budgetPolicy.budgetTokens,
+        floorTokens: budgetPolicy.floorTokens,
+        floorThroughIndex: active.length - 1,
+        protectedMessageIndexes: retainedProtectedMessageIndexes,
+      });
+      active = rebalanced.messages;
+      for (const id of rebalanced.archiveIds) this.activeArchiveIds.add(id);
+      const rebalancedArguments = externalizeLargeToolArguments(active, {
+        maxTokens: maxToolArgumentTokens,
+        store: (message, part, text) => this.storeToolArgument(message, part, text),
+      });
+      active = rebalancedArguments.messages;
+      for (const id of rebalancedArguments.archiveIds) this.activeArchiveIds.add(id);
       this.refreshArchiveProtection();
       this.onRotation(this.rotationState());
-      active = active.slice(plan.start);
-      visibleSourceKeys = visibleSourceKeys.slice(plan.start);
       boundaryPrefix = [...boundaryPrefix, ...rotatedMessages];
       marker = this.tocMarkerMessage();
       this.activeTokens = estimateTokens(marker ? [marker, ...active] : active);
@@ -605,6 +639,7 @@ export class EpochWindowSession {
     // reconcile against its actual user-message keys. Clearing here would let
     // the same live messages consume a fresh automatic-hint allowance.
     this.boundaryKey = undefined;
+    this.toolResultRebalanceThroughKey = undefined;
     this.forceRotation = false;
     this.lastRotationReason = undefined;
     this.lastRotationMode = undefined;
@@ -1068,6 +1103,9 @@ export class EpochWindowSession {
       sessionId: this.sessionId,
       sessionIds: [...this.sessionIds],
       boundaryKey: this.boundaryKey,
+      ...(this.toolResultRebalanceThroughKey === undefined
+        ? {}
+        : { toolResultRebalanceThroughKey: this.toolResultRebalanceThroughKey }),
       rotations: this.rotations,
       reason: this.lastRotationReason,
       mode: this.lastRotationMode,

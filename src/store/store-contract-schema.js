@@ -1181,6 +1181,21 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
         skippedHandlers: nonNegativeInteger,
       }),
       index: optionalObject({ generation: nonNegativeInteger }),
+      memory: optionalObject({
+        rssBytes: nonNegativeInteger,
+        maxRssBytes: nonNegativeInteger,
+        heapTotalBytes: nonNegativeInteger,
+        heapUsedBytes: nonNegativeInteger,
+        externalBytes: nonNegativeInteger,
+        arrayBuffersBytes: nonNegativeInteger,
+      }, [
+        "rssBytes",
+        "maxRssBytes",
+        "heapTotalBytes",
+        "heapUsedBytes",
+        "externalBytes",
+        "arrayBuffersBytes",
+      ]),
       semantic: optionalObject({
         enabled: boolean(),
         available: boolean(),
@@ -1189,6 +1204,11 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
         revision: identifier,
         dimensions: nonNegativeInteger,
         pooling: identifier,
+        entries: nonNegativeInteger,
+        documents: nonNegativeInteger,
+        queuedDocuments: nonNegativeInteger,
+        metadataBytes: nonNegativeInteger,
+        indexBytes: nonNegativeInteger,
       }),
       reranker: optionalObject({
         enabled: boolean(),

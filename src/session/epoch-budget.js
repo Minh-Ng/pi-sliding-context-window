@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { contentToText } from "./window.js";
 
+// A replacement must retain its archive ID even when no head/tail preview fits.
+export const MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS = 32;
+
 export function toolResultId(sessionId, message, text) {
   const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
   return `tool-${createHash("sha256").update(`${sessionId}\0${toolCallId}\0${text}`).digest("hex").slice(0, 16)}`;
@@ -30,15 +33,17 @@ export function measureToolResultTokens(messages) {
 // policy. The floor never raises the base per-result gate.
 export function resolveToolResultBudget(config, rotationTokens) {
   const configuredMax = Number(config.maxToolResultTokens);
-  const maxToolResultTokens = Number.isSafeInteger(configuredMax) && configuredMax > 0
-    ? configuredMax
-    : 4_000;
+  const maxToolResultTokens = Math.max(
+    MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS,
+    Number.isSafeInteger(configuredMax) && configuredMax > 0 ? configuredMax : 4_000,
+  );
   const ratio = Number(config.toolResultBudgetRatio);
   const effectiveRatio = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : 0.3;
   const configuredFloor = Number(config.toolResultBudgetFloorTokens);
-  const effectiveFloor = Number.isSafeInteger(configuredFloor) && configuredFloor > 0
-    ? configuredFloor
-    : 1_000;
+  const effectiveFloor = Math.max(
+    MIN_TOOL_RESULT_ARCHIVE_REFERENCE_TOKENS,
+    Number.isSafeInteger(configuredFloor) && configuredFloor > 0 ? configuredFloor : 1_000,
+  );
   const target = Number.isFinite(rotationTokens) && rotationTokens > 0 ? rotationTokens : 1;
   return {
     maxToolResultTokens,

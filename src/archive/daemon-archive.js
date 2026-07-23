@@ -1465,6 +1465,8 @@ export class DaemonArchive {
       runtimeVersion: status.runtimeVersion,
       storePath: status.storePath,
       filesystem: status.filesystem,
+      memory: status.memory,
+      semantic: status.semantic,
       rocksdb,
       retention,
       lastPrune: this.lastCleanup ?? this.lastPrune,

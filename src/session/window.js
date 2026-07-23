@@ -369,15 +369,19 @@ function replaceTextContent(content, replacement) {
  * kept inline and the bounded previews of externalized ones — every character
  * that lands in the window counts). Once that running total reaches the budget,
  * NEW results are gated at the lower `floorTokens` threshold instead of
- * `maxTokens`.
+ * `maxTokens`. `floorThroughIndex` applies that lower gate to a retained
+ * rotation prefix; rotation has already broken the provider prompt prefix, so
+ * this can rebalance carry-over results without rewriting an active epoch.
+ * `protectedMessageIndexes` preserves deduplication markers that already point
+ * at an exact archived result instead of nesting one archive reference in another.
  *
  * Forward-only by construction: each result's decision depends only on the
  * characters admitted by results BEFORE it — a strictly append-only prefix
  * within an epoch — so an already-exposed result is never re-externalized on a
  * later pass, preserving the provider prompt cache. The running total is not
- * persisted: it is recomputed from the same filtered prefix on every pass
- * (including after session resume) and resets naturally when epoch rotation
- * advances the boundary to a new, shorter active slice.
+ * persisted: it is recomputed from the same filtered prefix on every pass.
+ * Rotation persists only the carry-over cutoff, allowing resume to reproduce
+ * the rebalanced prefix while later results keep normal forward-only gating.
  */
 export function externalizeLargeToolResults(messages, {
   maxTokens,
@@ -385,6 +389,8 @@ export function externalizeLargeToolResults(messages, {
   previewTokens = Math.min(800, Math.floor(maxTokens / 2)),
   budgetTokens,
   floorTokens,
+  floorThroughIndex = -1,
+  protectedMessageIndexes = new Set(),
 } = {}) {
   const maxChars = Math.max(1, maxTokens) * 4;
   const previewChars = Math.max(1, previewTokens) * 4;
@@ -398,11 +404,16 @@ export function externalizeLargeToolResults(messages, {
   let admittedChars = 0;
   let changed = false;
   const archiveIds = [];
-  const output = messages.map((message) => {
+  const output = messages.map((message, messageIndex) => {
     const isToolResult = message?.role === "toolResult" || message?.role === "tool";
     if (!isToolResult) return message;
     const text = contentToText(message.content);
-    const effectiveMaxChars = admittedChars >= budgetChars ? floorChars : maxChars;
+    if (protectedMessageIndexes.has(messageIndex)) {
+      admittedChars += text.length;
+      return message;
+    }
+    const shouldUseFloor = messageIndex <= floorThroughIndex || admittedChars >= budgetChars;
+    const effectiveMaxChars = shouldUseFloor ? floorChars : maxChars;
     if (text.length <= effectiveMaxChars) {
       admittedChars += text.length;
       return message;
@@ -416,12 +427,25 @@ export function externalizeLargeToolResults(messages, {
       return message;
     }
     archiveIds.push(id);
-    // A preview must not exceed the gate that admitted it, so the head/tail is
-    // bounded by the effective threshold as well as the configured preview.
-    const effectivePreviewChars = Math.min(previewChars, effectiveMaxChars);
-    const head = text.slice(0, Math.floor(effectivePreviewChars * 0.7));
-    const tail = text.slice(-Math.floor(effectivePreviewChars * 0.3));
-    const replacement = `${head}\n\n[… ${text.length - head.length - tail.length} characters archived as ${id}; use context_recall …]\n\n${tail}`;
+    // Account for the archive marker itself so the complete replacement, not
+    // only its head/tail payload, stays within the gate that admitted it.
+    const markerFor = (omittedChars) =>
+      `\n\n[… ${omittedChars} characters archived as ${id}; use context_recall …]\n\n`;
+    let retainedPreviewChars = Math.min(previewChars, effectiveMaxChars);
+    let replacement;
+    while (true) {
+      const headChars = Math.floor(retainedPreviewChars * 0.7);
+      const tailChars = Math.floor(retainedPreviewChars * 0.3);
+      const head = text.slice(0, headChars);
+      const tail = tailChars > 0 ? text.slice(-tailChars) : "";
+      const marker = markerFor(text.length - head.length - tail.length);
+      replacement = `${head}${marker}${tail}`;
+      if (replacement.length <= effectiveMaxChars || retainedPreviewChars === 0) break;
+      retainedPreviewChars = Math.max(
+        0,
+        retainedPreviewChars - Math.max(1, replacement.length - effectiveMaxChars),
+      );
+    }
     admittedChars += replacement.length;
     changed = true;
     return { ...message, content: replaceTextContent(message.content, replacement) };
@@ -563,7 +587,8 @@ export function deduplicateToolResults(messages, { store } = {}) {
   const seen = new Map();
   let changed = false;
   const archiveIds = [];
-  const output = messages.map((message) => {
+  const externalizedMessageIndexes = [];
+  const output = messages.map((message, messageIndex) => {
     const isToolResult = message?.role === "toolResult" || message?.role === "tool";
     if (!isToolResult) return message;
     const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
@@ -584,11 +609,17 @@ export function deduplicateToolResults(messages, { store } = {}) {
       return message;
     }
     archiveIds.push(id);
+    externalizedMessageIndexes.push(messageIndex);
     changed = true;
     const marker = `[Identical to earlier result ${earlier.ref} in this conversation, archived as ${id}; use context_recall on ${id} if needed.]`;
     return { ...message, content: replaceTextContent(message.content, marker) };
   });
-  return { messages: changed ? output : messages, changed, archiveIds };
+  return {
+    messages: changed ? output : messages,
+    changed,
+    archiveIds,
+    externalizedMessageIndexes,
+  };
 }
 
 export const TOC_TERMS_PER_ENTRY = 8;

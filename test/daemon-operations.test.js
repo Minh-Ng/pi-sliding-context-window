@@ -109,7 +109,17 @@ test("daemon.status reports catalog-derived semantic dimensions and pooling over
     revision: "main",
     dimensions: 768,
     pooling: "mean",
+    entries: 0,
+    documents: 0,
+    queuedDocuments: 0,
+    metadataBytes: 0,
+    indexBytes: 0,
   });
+  assert.ok(status.memory.rssBytes > 0);
+  assert.ok(status.memory.maxRssBytes >= status.memory.rssBytes);
+  assert.ok(status.memory.heapTotalBytes >= status.memory.heapUsedBytes);
+  assert.ok(status.memory.externalBytes >= 0);
+  assert.ok(status.memory.arrayBuffersBytes >= 0);
 });
 
 test("daemon admission reports oversized native keys as invalid requests", async (t) => {

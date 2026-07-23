@@ -339,6 +339,22 @@ test("cumulative tool-result budget is forward-only within an epoch", () => {
   assert.equal(result.overBudget, true);
 });
 
+test("rotation rebalance applies the floor only through the retained cutoff", () => {
+  const gate = { maxTokens: 1_000, floorTokens: 100, budgetTokens: 500, previewTokens: 40 };
+  const retained = tool("r".repeat(1_000), 1, "retained");
+  const newResult = tool("n".repeat(1_000), 2, "new");
+  const result = externalizeLargeToolResults([retained, newResult], {
+    ...gate,
+    floorThroughIndex: 0,
+    store: (message) => `arc-${message.toolCallId}`,
+  });
+
+  assert.match(result.messages[0].content[0].text, /arc-retained/);
+  assert.equal(result.messages[1], newResult);
+  assert.ok(result.messages[0].content[0].text.length <= gate.floorTokens * 4);
+  assert.equal(result.overBudget, false);
+});
+
 test("suppresses an exact-duplicate tool result regardless of size and never touches the earlier one", () => {
   const first = tool("same output", 1, "call-1");
   const second = tool("same output", 2, "call-2");

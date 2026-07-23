@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { admitDocument } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
+import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { searchArchive } from "../src/retrieval/search.js";
 import { LocalSemanticIndex } from "../src/semantic/index.js";
 import { createSemanticSpans } from "../src/semantic/spans.js";
@@ -93,7 +94,15 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
   };
   const first = new LocalSemanticIndex(store, options);
   first.enqueueDocument("semantic-cat", 1);
+  assert.equal(first.status().queuedDocuments, 1);
   await first.flush();
+  const firstStatus = first.status();
+  assert.equal(firstStatus.projects, 1);
+  assert.equal(firstStatus.entries, 1);
+  assert.equal(firstStatus.documents, 1);
+  assert.equal(firstStatus.queuedDocuments, 0);
+  assert.ok(firstStatus.metadataBytes > 0);
+  assert.ok(firstStatus.indexBytes > 0);
   assert.equal((await first.search(request))[0].documentId, "semantic-cat");
   const hybrid = await searchArchive(store, {
     query: "house pet",
@@ -112,7 +121,28 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
 
   const reloaded = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
   assert.equal((await reloaded.search(request))[0].documentId, "semantic-cat");
+  assert.deepEqual(
+    reloaded.status(),
+    { ...firstStatus, queuedDocuments: 0 },
+  );
+
+  await store.put([KEYSPACE.SUPERSESSION, "semantic-cat", 1], {
+    documentId: "semantic-cat",
+    documentVersion: 1,
+    status: "expired",
+    reason: "Semantic status retirement test.",
+    recordedAt: Date.now(),
+  });
+  assert.deepEqual(await reloaded.search(request), []);
+  assert.equal(reloaded.status().entries, 0);
+  assert.equal(reloaded.status().documents, 0);
   await reloaded.close();
+
+  const cleaned = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
+  assert.deepEqual(await cleaned.search(request), []);
+  assert.equal(cleaned.status().entries, 0);
+  assert.equal(cleaned.status().documents, 0);
+  await cleaned.close();
 });
 
 test("local semantic index derives dimensions and pooling from the configured model's catalog entry", async (t) => {

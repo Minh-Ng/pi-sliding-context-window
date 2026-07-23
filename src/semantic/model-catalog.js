@@ -6,11 +6,14 @@
 // pooling call always match the configured model instead of a hardcoded
 // literal sized for only the shipped default.
 //
-// Dimensions/pooling below are sourced from each model's published card, not
-// measured locally: the "small" and "quality" entries have not been run in
-// this environment (no network access to download weights). Verify with
-// `context-window-semantic install <model>` before relying on them; the
-// installer reports the actual dimensions the model returns.
+// Dimensions/pooling below are sourced from each model's published card. The
+// EmbeddingGemma "small" candidate was later installed and compared with the
+// default in local retrieval evaluations: it showed no meaningful improvement
+// while adding about 210MB to the published quantized model footprint (300MB
+// versus 90MB), and no retained artifact supports an independent benchmark
+// claim. The Qwen3/Jina "quality" candidates remain unrun in this environment.
+// Verify a candidate revision with `context-window-semantic install <model>`;
+// the installer reports the dimensions the model actually returns.
 export const SEMANTIC_MODEL_PROFILES = Object.freeze({
   "Xenova/all-MiniLM-L6-v2": Object.freeze({
     dimensions: 384,

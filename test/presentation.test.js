@@ -961,7 +961,7 @@ test("footer and details surface the adaptive tool-result budget state", () => {
     toolResultOverBudget: true,
   });
   assert.equal(toolResultBudgetState(overBudget), "over");
-  assert.match(formatStatusLine(overBudget), /tool-result budget reached/u);
+  assert.match(formatStatusLine(overBudget), /tool-result guard active/u);
   assert.match(
     formatStatusDetails({ ...overBudget, rotations: 0, archivedDocuments: 0, dbPath: "/archive", retainTurns: 5 }),
     /Tool-result budget: 31,000\/30,000 tokens admitted; new results externalized at 1,000 tokens/u,
@@ -1053,9 +1053,28 @@ test("RocksDB status reports compaction evidence without inventing a routine siz
     retention: { pins: 1, leases: 2, cleanupBacklog: 3, emergencyMode: false },
     rocksdb: { totalSstBytes: 8_192, liveDataBytes: 3_072, pendingCompactionBytes: 1_024 },
     filesystem: { freeBytes: 1_000_000, emergencyMode: false },
+    memory: {
+      rssBytes: 33_554_432,
+      maxRssBytes: 67_108_864,
+      heapTotalBytes: 16_777_216,
+      heapUsedBytes: 8_388_608,
+      externalBytes: 4_194_304,
+      arrayBuffersBytes: 2_097_152,
+    },
+    semantic: {
+      enabled: true,
+      projects: 2,
+      entries: 1_200,
+      documents: 300,
+      queuedDocuments: 4,
+      metadataBytes: 10_485_760,
+      indexBytes: 5_242_880,
+    },
   });
   assert.match(output, /RocksDB archive: 12 document/u);
   assert.match(output, /Physical data:/u);
+  assert.match(output, /Daemon memory: 32\.0 MiB RSS; 8\.0 MiB \/ 16\.0 MiB JavaScript heap; 64\.0 MiB peak RSS/u);
+  assert.match(output, /Semantic index: 1,200 span\(s\) from 300 document\(s\) across 2 loaded project\(s\); 15\.0 MiB active snapshot data; 4 document\(s\) queued/u);
   assert.match(output, /no routine archive-size cap/u);
   assert.doesNotMatch(output, /1\.0 GiB/u);
 });

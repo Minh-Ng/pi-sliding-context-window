@@ -13,6 +13,7 @@ import {
   assistant,
   memoryArchive,
   pressureArchive,
+  trackingMemoryArchive,
 } from "./epoch-window-helpers.js";
 
 test("externalized tool results retain their one original source message key", () => {
@@ -51,6 +52,44 @@ test("externalized tool results retain their one original source message key", (
     sourceMessageKey: sourceKey,
     archivedTurn: false,
   });
+});
+
+test("repeated large context passes reuse successfully stored tool artifacts", () => {
+  const archive = trackingMemoryArchive();
+  const put = archive.put.bind(archive);
+  const waitArray = new Int32Array(new SharedArrayBuffer(4));
+  archive.put = (document, options) => {
+    Atomics.wait(waitArray, 0, 0, 1);
+    return put(document, options);
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config: {
+      ...config,
+      rotationTurns: 1_000,
+      maxToolResultTokens: 32,
+      toolResultBudgetRatio: 0.5,
+    },
+    sessionId: "artifact-cache-session",
+    project: "/project",
+  });
+  const messages = [
+    user("run many tools", 1),
+    ...Array.from({ length: 350 }, (_, index) =>
+      toolResult(`${index}:${"x".repeat(1_000)}`, index + 2, `result-${index}`)),
+  ];
+
+  const first = session.process(messages, { contextWindow: 200_000 });
+  const writesAfterFirstPass = archive.putCalls;
+  assert.ok(writesAfterFirstPass >= 350);
+
+  const startedAt = performance.now();
+  const second = session.process(messages, { contextWindow: 200_000 });
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.deepEqual(second, first);
+  assert.equal(archive.putCalls, writesAfterFirstPass);
+  assert.ok(elapsedMs < 100, `cached context pass took ${elapsedMs.toFixed(1)}ms`);
 });
 
 test("externalized tool-call arguments retain their one original source message key", () => {

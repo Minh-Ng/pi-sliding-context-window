@@ -111,6 +111,11 @@ export class EpochWindowSession {
     this.lastHintCleanupError = undefined;
     this.toc = [];
     this.activeArchiveIds = new Set();
+    // Tool-result and tool-argument IDs are deterministic for this session.
+    // Context preparation revisits the full active epoch on every provider
+    // request, so avoid repeating synchronous daemon writes for artifacts that
+    // this live session has already stored successfully.
+    this.storedArtifactIds = new Set();
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -137,6 +142,7 @@ export class EpochWindowSession {
     this.lastHintCleanupError = undefined;
     this.toc = [];
     this.activeArchiveIds = new Set();
+    this.storedArtifactIds = new Set();
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -1128,6 +1134,7 @@ export class EpochWindowSession {
   storeToolResult(message, text) {
     const toolCallId = String(message.toolCallId ?? message.tool_call_id ?? "");
     const id = toolResultId(this.sessionId, message, text);
+    if (this.storedArtifactIds.has(id)) return id;
     const storedId = this.archive.put({
       id,
       sessionId: this.sessionId,
@@ -1142,8 +1149,8 @@ export class EpochWindowSession {
       },
     }, { deferPrune: true, protect: true });
     if (storedId) {
+      this.storedArtifactIds.add(storedId);
       this.activeArchiveIds.add(storedId);
-      this.refreshArchiveProtection();
     }
     return storedId;
   }
@@ -1151,6 +1158,7 @@ export class EpochWindowSession {
   storeToolArgument(message, part, text) {
     const toolCallId = String(part.id ?? part.toolCallId ?? part.tool_call_id ?? "");
     const id = toolArgumentId(this.sessionId, part, text);
+    if (this.storedArtifactIds.has(id)) return id;
     const storedId = this.archive.put({
       id,
       sessionId: this.sessionId,
@@ -1165,8 +1173,8 @@ export class EpochWindowSession {
       },
     }, { deferPrune: true, protect: true });
     if (storedId) {
+      this.storedArtifactIds.add(storedId);
       this.activeArchiveIds.add(storedId);
-      this.refreshArchiveProtection();
     }
     return storedId;
   }

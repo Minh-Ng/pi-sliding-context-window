@@ -1046,6 +1046,78 @@ function compactionEvent(reason, preparation, branchEntries = []) {
   };
 }
 
+test("session startup warms active context artifacts before the first context event", async () => {
+  const handlers = new Map();
+  const timings = [];
+  const archive = memoryCheckpointArchive();
+  const userMessage = {
+    role: "user",
+    content: [{ type: "text", text: "run the large tool" }],
+    timestamp: 1,
+  };
+  const toolMessage = {
+    role: "toolResult",
+    toolCallId: "warmup-tool",
+    toolName: "read",
+    content: [{ type: "text", text: "x".repeat(1_000) }],
+    timestamp: 2,
+  };
+  const branch = [
+    { type: "message", id: "entry-1", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: userMessage },
+    { type: "message", id: "entry-2", parentId: "entry-1", timestamp: "2026-01-01T00:00:01.000Z", message: toolMessage },
+  ];
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({
+      rotationTurns: 50,
+      maxToolResultTokens: 32,
+    }),
+    archiveFactory: () => archive,
+  })({
+    events: {
+      emit(name, details) {
+        if (name === "context-window:timing") timings.push(details);
+      },
+    },
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "startup-warmup",
+      getBranch: () => branch,
+      buildContextEntries: () => branch,
+    },
+    ui: { setStatus() {} },
+  };
+
+  handlers.get("session_start")({ reason: "resume" }, ctx);
+  const artifactWritesAfterStartup = archive.puts.filter(({ kind }) => kind === "tool-result").length;
+  assert.equal(artifactWritesAfterStartup, 1);
+  assert.equal(timings[0].phase, "startup");
+  assert.equal(timings[0].warmupMessageCount, 2);
+  assert.ok(timings[0].warmupMs >= 0);
+
+  const writesAfterStartup = archive.puts.length;
+  const nextUser = {
+    role: "user",
+    content: [{ type: "text", text: "continue" }],
+    timestamp: 3,
+  };
+  const result = handlers.get("context")({ messages: [userMessage, toolMessage, nextUser] }, ctx);
+  assert.equal(archive.puts.length, writesAfterStartup);
+  assert.equal(result.messages.at(-1), nextUser);
+  assert.equal(timings.at(-1).phase, "context");
+  assert.equal(timings.at(-1).messageCount, 3);
+
+  handlers.get("session_shutdown")({}, ctx);
+});
+
 test("startup archive failure closes its backend and fails closed for oversized context", async () => {
   const handlers = new Map();
   const notifications = [];

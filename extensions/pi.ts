@@ -3,6 +3,7 @@ import {
   getSettingsListTheme,
   type ExtensionAPI,
   type ExtensionContext,
+  sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteItem,
@@ -331,6 +332,13 @@ function isArchiveCompactionResult(value: unknown): value is ArchiveCompactionRe
   return true;
 }
 
+function startupContextMessages(sessionManager: ExtensionContext["sessionManager"]): any[] {
+  const entries = typeof sessionManager.buildContextEntries === "function"
+    ? sessionManager.buildContextEntries()
+    : sessionManager.getBranch();
+  return entries.flatMap((entry: any) => sessionEntryToContextMessages(entry));
+}
+
 /**
  * Build the Pi adapter with replaceable configuration and archive providers.
  * The default export below is the normal packaged extension.
@@ -390,6 +398,10 @@ export function createContextEpochWindow({
     } | undefined;
     let protectionRefreshTimer: ReturnType<typeof setInterval> | undefined;
     let startupState: "not-started" | "starting" | "ready" | "failed" | "stopped" = "not-started";
+
+    function emitTiming(details: Record<string, unknown>) {
+      try { pi.events?.emit?.("context-window:timing", details); } catch { /* diagnostics only */ }
+    }
 
     function stopProtectionRefresh() {
       const timer = protectionRefreshTimer;
@@ -663,6 +675,10 @@ export function createContextEpochWindow({
     }
 
     pi.on("session_start", (event, ctx) => {
+      const startupStartedAt = performance.now();
+      let archiveSetupMs = 0;
+      let warmupMs = 0;
+      let warmupMessageCount = 0;
       const previousSession = session;
       session = undefined;
       recallHandles = new Map();
@@ -760,7 +776,15 @@ export function createContextEpochWindow({
           model: ctx.model,
           onRotation: (state) => pi.appendEntry(ROTATION_STATE_ENTRY, state),
         });
-        nextSession.restore(ctx.sessionManager.getBranch());
+        const branch = ctx.sessionManager.getBranch();
+        nextSession.restore(branch);
+        archiveSetupMs = performance.now() - startupStartedAt;
+
+        const warmupMessages = startupContextMessages(ctx.sessionManager);
+        warmupMessageCount = warmupMessages.length;
+        const warmupStartedAt = performance.now();
+        if (warmupMessages.length > 0) nextSession.process(warmupMessages, ctx.model);
+        warmupMs = performance.now() - warmupStartedAt;
       } catch (error) {
         startupState = "failed";
         try { (nextSession ?? archive)?.close?.(); } catch { /* preserve the startup failure */ }
@@ -779,6 +803,14 @@ export function createContextEpochWindow({
       session = nextSession;
       startupState = "ready";
       diskPressureMonitor.reset();
+      emitTiming({
+        phase: "startup",
+        reason: event.reason,
+        archiveSetupMs,
+        warmupMs,
+        warmupMessageCount,
+        totalMs: performance.now() - startupStartedAt,
+      });
       // Status is presentation-only. A healthy session must not be reported to
       // Pi as a failed startup merely because the UI cannot render its footer.
       try { updateStatus(ctx); } catch {}
@@ -790,6 +822,7 @@ export function createContextEpochWindow({
         return failClosedContext(ctx);
       }
       let messages;
+      const contextStartedAt = performance.now();
       try {
         messages = session.process(event.messages, ctx.model);
       } catch (error) {
@@ -803,6 +836,11 @@ export function createContextEpochWindow({
         } catch { /* diagnostics must never weaken fail-closed behavior */ }
         return failClosedContext(ctx);
       }
+      emitTiming({
+        phase: "context",
+        elapsedMs: performance.now() - contextStartedAt,
+        messageCount: event.messages.length,
+      });
       // Status is presentation-only. Once the provider copy is safely bounded,
       // a UI failure must not make Pi discard it and restore the raw input.
       try { updateStatus(ctx); } catch {}

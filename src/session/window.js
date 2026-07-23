@@ -463,7 +463,7 @@ function toolCallArgumentField(part) {
   return part?.arguments !== undefined ? "arguments" : "input";
 }
 
-function stringifyToolCallArguments(value) {
+export function stringifyToolCallArguments(value) {
   if (typeof value === "string") return value;
   try {
     return JSON.stringify(value) ?? String(value);

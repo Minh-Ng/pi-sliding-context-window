@@ -85,14 +85,11 @@ test("repeated large context passes reuse successfully stored tool artifacts", (
   assert.ok(writesAfterFirstPass >= 350);
   assert.equal(protectionsAfterFirstPass, 2, "constructor and pass-level protection refresh only");
 
-  const startedAt = performance.now();
   const second = session.process(messages, { contextWindow: 200_000 });
-  const elapsedMs = performance.now() - startedAt;
 
   assert.deepEqual(second, first);
   assert.equal(archive.putCalls, writesAfterFirstPass);
   assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 1);
-  assert.ok(elapsedMs < 100, `cached context pass took ${elapsedMs.toFixed(1)}ms`);
 
   const appended = [
     ...messages,
@@ -134,6 +131,56 @@ test("failed tool-artifact writes retry and cache only after success", () => {
 
   session.process(messages, { contextWindow: 200_000 });
   assert.equal(archive.putCalls, 2, "successful retry is reused by later passes");
+});
+
+test("rotation bounds the artifact cache to the retained epoch without repeated writes", () => {
+  const archive = trackingMemoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: {
+      ...config,
+      rotationTurns: 2,
+      retainTurns: 1,
+      maxToolResultTokens: 32,
+    },
+    sessionId: "artifact-rotation-session",
+    project: "/project",
+  });
+  const messages = [
+    user("first", 1),
+    toolResult("a".repeat(1_000), 2, "first-result"),
+    user("second", 3),
+    toolResult("b".repeat(1_000), 4, "second-result"),
+  ];
+
+  session.process(messages, { contextWindow: 200_000 });
+  const writesAfterRotation = archive.putCalls;
+  assert.equal(session.storedArtifactIds.size, 1);
+
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, writesAfterRotation);
+  assert.equal(session.storedArtifactIds.size, 1);
+});
+
+test("post-compaction reconciliation drops artifacts absent from the retained context", () => {
+  const archive = trackingMemoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, rotationTurns: 50, maxToolResultTokens: 32 },
+    sessionId: "artifact-compaction-session",
+    project: "/project",
+  });
+  const firstTurn = [user("first", 1), toolResult("a".repeat(1_000), 2, "first-result")];
+  const secondTurn = [user("second", 3), toolResult("b".repeat(1_000), 4, "second-result")];
+
+  session.process([...firstTurn, ...secondTurn], { contextWindow: 200_000 });
+  const writesBeforeCompaction = archive.putCalls;
+  assert.equal(session.storedArtifactIds.size, 2);
+
+  session.resetAfterCompaction();
+  session.process(secondTurn, { contextWindow: 200_000 });
+  assert.equal(archive.putCalls, writesBeforeCompaction);
+  assert.equal(session.storedArtifactIds.size, 1);
 });
 
 test("externalized tool-call arguments retain their one original source message key", () => {

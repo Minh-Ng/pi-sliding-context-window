@@ -7,6 +7,7 @@ import {
 } from "../archive/archive-checkpoint.js";
 import {
   buildTocMarkerText,
+  contentToText,
   deduplicateToolResults,
   estimateTokens,
   extractDecisionCandidates,
@@ -22,6 +23,7 @@ import {
   serializeMessage,
   serializeMessages,
   sliceFromBoundary,
+  stringifyToolCallArguments,
   TOC_TOKEN_BUDGET,
   turnTopic,
 } from "./window.js";
@@ -226,9 +228,11 @@ export class EpochWindowSession {
     }
 
     let active = sliced.messages;
+    let artifactSourceMessages = sliced.messages;
     if (active.length === 0) {
       this.reconcileHintLifecycle([], boundaryPrefix);
       this.activeArchiveIds = new Set();
+      this.reconcileStoredArtifactIds([]);
       this.refreshArchiveProtection();
       this.archive.prune?.();
       this.clearMeasurement();
@@ -286,6 +290,7 @@ export class EpochWindowSession {
     this.activeTurns = this.countUserTurns(active);
     if (this.activeTokens === 0 && this.activeTurns === 0) {
       this.reconcileHintLifecycle(active, boundaryPrefix);
+      this.reconcileStoredArtifactIds(artifactSourceMessages);
       this.clearMeasurement();
       return active;
     }
@@ -304,6 +309,7 @@ export class EpochWindowSession {
       // Indices are stable because externalization replaces messages in place.
       // Archive the exact source messages, not their provider-facing previews.
       const rotatedMessages = sliced.messages.slice(0, plan.start);
+      artifactSourceMessages = sliced.messages.slice(plan.start);
       this.archiveTurns(rotatedMessages);
       this.boundaryKey = messageKey(sliced.messages[plan.start]);
       this.rotations += 1;
@@ -369,6 +375,7 @@ export class EpochWindowSession {
       maxTokens: budgetPolicy.maxToolResultTokens,
       overBudget: toolResultTokens >= budgetPolicy.budgetTokens,
     });
+    this.reconcileStoredArtifactIds(artifactSourceMessages);
     return this.activeMessages;
   }
 
@@ -1129,6 +1136,30 @@ export class EpochWindowSession {
       },
       archivedAt: Date.now(),
     };
+  }
+
+  reconcileStoredArtifactIds(messages) {
+    const reachableIds = new Set();
+    for (const message of messages) {
+      if (message?.role === "toolResult" || message?.role === "tool") {
+        reachableIds.add(toolResultId(this.sessionId, message, contentToText(message.content)));
+      }
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content) {
+        if (!part || typeof part !== "object") continue;
+        if (part.type !== "toolCall" && part.type !== "tool_call") continue;
+        const value = part.arguments !== undefined ? part.arguments : part.input;
+        if (value === undefined) continue;
+        reachableIds.add(toolArgumentId(
+          this.sessionId,
+          part,
+          stringifyToolCallArguments(value),
+        ));
+      }
+    }
+    for (const id of this.storedArtifactIds) {
+      if (!reachableIds.has(id)) this.storedArtifactIds.delete(id);
+    }
   }
 
   storeToolResult(message, text) {

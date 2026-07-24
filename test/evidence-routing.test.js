@@ -96,7 +96,8 @@ test("routing policy defines archive, live, both, and neither semantics", () => 
   assert.match(EVIDENCE_ROUTING_POLICY.both, /authoritative for mutable current state/);
   assert.match(EVIDENCE_ROUTING_POLICY.neither, /Avoid speculative broad archive searches/);
   assert.match(SEARCH_TOOL_DESCRIPTION, /continuity marker confirms only.*exact anchor copied from the current user message/i);
-  assert.match(SEARCH_TOOL_DESCRIPTION, /search the marker's exact anchor before using it/i);
+  assert.match(SEARCH_TOOL_DESCRIPTION, /search the marker's exact anchor with scope=auto .* project scope.*before using it/i);
+  assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /search that exact anchor with scope=auto .* project scope.*before answering/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /marker itself as a recovered fact, decision, definition, or current-state claim/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /archive candidate.*plain language.*archived discussion or a live source/i.test(guideline)));
   assert.ok(EVIDENCE_ROUTING_GUIDELINES.some((guideline) => /project-specific term.*not defined in visible context.*about to search.*live source.*also run context_window_search.*exact term/i.test(guideline)));

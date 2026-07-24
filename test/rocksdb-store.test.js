@@ -414,6 +414,28 @@ test("prefix scans preserve binary key order and enforce their cap", async (t) =
     () => store.scan([KEYSPACE.EVENT, "nested"], { after: nested[0].keyBytes, reverse: true }),
     /only supported for forward scans/u,
   );
+  const reverseFirst = store.scan([KEYSPACE.EVENT, "nested"], {
+    reverse: true,
+    limit: 1,
+  });
+  const reverseSecond = store.scan([KEYSPACE.EVENT, "nested"], {
+    reverse: true,
+    before: reverseFirst[0].keyBytes,
+    limit: 1,
+  });
+  const reverseThird = store.scan([KEYSPACE.EVENT, "nested"], {
+    reverse: true,
+    before: reverseSecond[0].keyBytes,
+    limit: 1,
+  });
+  assert.deepEqual(
+    [...reverseFirst, ...reverseSecond, ...reverseThird].map(({ payload }) => payload.sequence),
+    [12, 11, 10],
+  );
+  assert.throws(
+    () => store.scan([KEYSPACE.EVENT, "nested"], { before: reverseFirst[0].keyBytes }),
+    /only supported for reverse scans/u,
+  );
 });
 
 test("native key limits fail closed before exact, canonical, and prefix operations", async (t) => {

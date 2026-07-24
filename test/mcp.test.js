@@ -109,13 +109,19 @@ function processExists(processId) {
 async function stopProcess(processId) {
   if (!processId || !processExists(processId)) return;
   process.kill(processId, "SIGTERM");
-  const deadline = Date.now() + 1_000;
+  let deadline = Date.now() + 1_000;
   while (processExists(processId) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   if (processExists(processId)) {
     process.kill(processId, "SIGKILL");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    deadline = Date.now() + 1_000;
+    while (processExists(processId) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (processExists(processId)) {
+    throw new Error(`Process ${processId} did not terminate.`);
   }
 }
 
@@ -128,11 +134,28 @@ async function daemonStatus(socketPath, project) {
   }
 }
 
-async function stopServerAuthority(child) {
+async function waitForServerAuthority(child) {
+  const { socketPath, project } = child.authority;
+  const deadline = Date.now() + 5_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      return (await daemonStatus(socketPath, project)).processId;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError ?? new Error("Timed out waiting for the MCP archive authority.");
+}
+
+async function stopServerAuthority(child, knownProcessId) {
   const authority = child.authority;
   if (!authority) return;
-  let processId;
-  try { processId = (await daemonStatus(authority.socketPath, authority.project)).processId; } catch {}
+  let processId = knownProcessId;
+  if (!processId) {
+    try { processId = (await daemonStatus(authority.socketPath, authority.project)).processId; } catch {}
+  }
   await stopProcess(processId);
   rmSync(authority.socketPath, { force: true });
 }
@@ -280,7 +303,12 @@ test("MCP bounds oversized and unterminated stdin before JSON parsing", async ()
       CONTEXT_WINDOW_MCP_TEST_MAX_FRAME_BYTES: "1024",
     });
     const responses = collectLines(child.stdout, 1);
+    let daemonProcessId;
     try {
+      // The malformed frame exits the MCP process immediately. Capture its
+      // detached authority first so teardown cannot race that daemon's startup
+      // and remove the directory while RocksDB files are still being created.
+      daemonProcessId = await waitForServerAuthority(child);
       child.stdin.end(candidate.bytes);
       const [response] = await responses;
       assert.equal(response.id, null);
@@ -290,7 +318,7 @@ test("MCP bounds oversized and unterminated stdin before JSON parsing", async ()
       assert.equal(exitCode, 1);
     } finally {
       if (child.exitCode === null) child.kill("SIGKILL");
-      await stopServerAuthority(child);
+      await stopServerAuthority(child, daemonProcessId);
       rmSync(directory, { recursive: true, force: true });
     }
   }

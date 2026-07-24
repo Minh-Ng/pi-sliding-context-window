@@ -127,9 +127,9 @@ function snippetText(snippet, createdAt) {
   ].join("\n");
 }
 
-function boundedHint(candidate, classification, message, budget) {
+function boundedHint(candidate, classification, message, budget, searchScope) {
   if (classification.outcome === "continuity-marker") {
-    const text = renderContinuityMarker(message, classification.anchors);
+    const text = renderContinuityMarker(message, classification.anchors, { scope: searchScope });
     const tokenCount = estimateHintTokens(text);
     return tokenCount <= budget
       ? { text, tokenCount, sourceKind: candidate.kind, archivedDataDelimited: false }
@@ -270,6 +270,13 @@ async function readLineageFrozenHint(store, request) {
 
 function evidenceRoot(candidate) {
   return candidate?.source?.turnId ?? candidate?.documentId;
+}
+
+function continuitySearchScope(candidate, request) {
+  const sourceSessionId = candidate?.source?.sessionId;
+  return typeof sourceSessionId === "string" && request.sessionIds.includes(sourceSessionId)
+    ? "session"
+    : request.scope;
 }
 
 function withDistinctEvidenceMargin(candidate, results) {
@@ -427,7 +434,13 @@ export async function preflightArchive(store, request, options = {}) {
         messageKeys: normalized.activeMessageKeys,
       });
       const remaining = Math.max(0, Math.min(normalized.hintBudgetTokens, activeBudget - used));
-      rendered = boundedHint(candidate, classification, normalized.message, remaining);
+      rendered = boundedHint(
+        candidate,
+        classification,
+        normalized.message,
+        remaining,
+        continuitySearchScope(candidate, normalized),
+      );
       if (rendered === undefined) {
         classification = Object.freeze({ outcome: "suppress", reason: "hint-budget", anchors: Object.freeze([]) });
       }

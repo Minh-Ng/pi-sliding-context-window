@@ -66,6 +66,9 @@ export const bm25Keys = Object.freeze({
   corpusCurrent(project) {
     return [...ROOT, "corpus-current", identifier(project, "project")];
   },
+  corpusDelta(project, generation) {
+    return [...ROOT, "corpus-delta", identifier(project, "project"), positiveInteger(generation, "generation")];
+  },
   // Prefix over every project's corpus-current pointer. Exactly one such key
   // exists per project with indexed content, so scanning this prefix is the
   // cheap canonical enumeration of project namespaces in the store.
@@ -146,6 +149,9 @@ export const bm25Keys = Object.freeze({
   postingPrefix(project, term) {
     return [...ROOT, "term", identifier(project, "project"), identifier(term, "term")];
   },
+  postingRoot() {
+    return [...ROOT, "term"];
+  },
   sessionPosting(
     project,
     sessionId,
@@ -180,6 +186,9 @@ export const bm25Keys = Object.freeze({
       identifier(term, "term"),
     ];
   },
+  sessionPostingRoot() {
+    return [...ROOT, "session-term"];
+  },
   termStatistics(project, term, generation) {
     return [
       ...ROOT,
@@ -198,6 +207,15 @@ export const bm25Keys = Object.freeze({
       "df-current",
       identifier(project, "project"),
       identifier(term, "term"),
+    ];
+  },
+  termDelta(project, term, generation) {
+    return [
+      ...ROOT,
+      "df-delta",
+      identifier(project, "project"),
+      identifier(term, "term"),
+      positiveInteger(generation, "generation"),
     ];
   },
 });
@@ -261,7 +279,9 @@ export async function readBm25Statistics(view, { project, terms = [], generation
         bm25Keys.termStatisticsPrefix(normalizedProject, term),
         resolvedGeneration,
       );
-    if (record !== undefined) termStatistics[term] = record.payload;
+    if (record !== undefined && record.payload.documentFrequency > 0) {
+      termStatistics[term] = record.payload;
+    }
   }
   return Object.freeze({
     generation: resolvedGeneration,

@@ -20,6 +20,7 @@
   "bin": {
     "context-window-mcp": "./bin/context-window-mcp.js",
     "context-windowd": "./bin/context-windowd.js",
+    "context-window-index-maintenance": "./bin/context-window-index-maintenance.js",
     "context-window-semantic": "./bin/context-window-semantic.js",
     "context-window-migrate": "./bin/context-window-migrate.js"
   },
@@ -30,6 +31,7 @@
   },
   "scripts": {
     "bench:archive": "node bench/archive/cli.js",
+    "bench:posting-storage": "node bench/archive/posting-storage-cli.js",
     "bench:archive:release": "node bench/archive/release-cli.js",
     "bench:archive:system": "node bench/archive/system-cli.js",
     "test": "node --test",
@@ -43,7 +45,7 @@
     "eval:retrieval": "node eval/retrieval/release-gate.js",
     "eval:hints": "node eval/retrieval/cli.js --backend eval/retrieval/rocksdb-backend.js --suite hints --output artifacts/retrieval/rocksdb-hints.json --require-all",
     "eval:sqlite-baseline": "node eval/retrieval/cli.js --backend sqlite --suite lexical --output artifacts/retrieval/sqlite-baseline.json --require-all",
-    "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --check bin/context-windowd.js && node --check bin/context-window-migrate.js && node --test"
+    "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --check bin/context-windowd.js && node --check bin/context-window-migrate.js && node --check bin/context-window-index-maintenance.js && node --check bench/archive/posting-storage-cli.js && node --test"
   },
   "dependencies": {
     "@harperfast/rocksdb-js": "2.4.0",

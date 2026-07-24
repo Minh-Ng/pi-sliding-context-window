@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { boundedStoreErrorMessage } from "../store/store-contract.js";
 import { addDerivedReferences } from "./derived.js";
 import {
+  derivedViewKeys,
+  isDerivedViewQueryCutover,
+} from "./derived-view.js";
+import {
   applyGenerationTablets,
   claimNextOutbox,
   cleanupPublishedStage,
@@ -114,7 +118,7 @@ function assertHandlerMutationKeys(handlerId, mutations) {
   }
 }
 
-function skippedHandlerResult(claim, handlerId, error) {
+function skippedHandlerResult(claim, handlerId, error, reverseReferences = true) {
   const details = error.details ?? {};
   const status = {
     indexPreparationStatusVersion: 1,
@@ -144,11 +148,9 @@ function skippedHandlerResult(claim, handlerId, error) {
     kind: "index-preparation-status",
     payload,
   };
-  const mutations = addDerivedReferences(
-    [mutation],
-    payload.documentId,
-    payload.documentVersion,
-  );
+  const mutations = reverseReferences
+    ? addDerivedReferences([mutation], payload.documentId, payload.documentVersion)
+    : [mutation];
   try {
     assertHandlerMutationKeys(handlerId, mutations);
   } catch (statusError) {
@@ -282,6 +284,9 @@ export class IndexWorker {
       has: this.store.has.bind(this.store),
       scan: this.store.scan.bind(this.store),
     });
+    const reverseReferences = !isDerivedViewQueryCutover(
+      await view.get(derivedViewKeys.queryCutover()),
+    );
     await this.boundary("before-load", { claim });
     const manifest = await view.get(manifestKeys.document(
       claim.entry.payload.documentId,
@@ -330,7 +335,8 @@ export class IndexWorker {
         const handlerIds = selected.map(({ id }) => id);
         await this.boundary("after-load", { claim, manifest, windows, skipped: error.details });
         await this.boundary("before-handlers", { claim, handlerIds });
-        const skipped = selected.map(({ id }) => skippedHandlerResult(claim, id, error));
+        const skipped = selected.map(({ id }) =>
+          skippedHandlerResult(claim, id, error, reverseReferences));
         await this.boundary("after-handlers", { claim, handlerIds });
         return skipped;
       }
@@ -393,7 +399,7 @@ export class IndexWorker {
           );
         }
         assertHandlerMutationKeys(handler.id, normalized.mutations);
-        const stagedMutations = claim.operation === "index"
+        const stagedMutations = claim.operation === "index" && reverseReferences
           ? addDerivedReferences(normalized.mutations, manifest.documentId, manifest.version)
           : normalized.mutations;
         assertHandlerMutationKeys(handler.id, stagedMutations);
@@ -438,7 +444,7 @@ export class IndexWorker {
         documentStagedBytes += stagedBytes;
       } catch (error) {
         if (!isPreparationLimit(error)) throw error;
-        results.push(skippedHandlerResult(claim, handler.id, error));
+        results.push(skippedHandlerResult(claim, handler.id, error, reverseReferences));
       }
       await this.yieldControl();
     }

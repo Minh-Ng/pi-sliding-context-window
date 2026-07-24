@@ -91,9 +91,13 @@ test("archive tools advertise evidence-source routing", async () => {
     // never mentions it gets today's behavior.
     assert.equal(tool.parameters.properties.searchEffort.default, "normal");
     assert.equal(tool.parameters.properties.searchEffort.description, SEARCH_EFFORT_DESCRIPTION);
+    assert.equal(tool.parameters.properties.scope.default, "auto");
+    assert.ok(tool.parameters.properties.scope.anyOf.some(({ const: value }) => value === "auto"));
   }
   assert.equal(search.parameters.properties.scope.description, SEARCH_SCOPE_DESCRIPTION);
+  assert.match(search.parameters.properties.scope.description, /auto.*continuity marker.*scope that produced it/i);
   assert.match(search.parameters.properties.scope.description, /all.*does not bypass project authorization/i);
+  assert.equal(traverse.parameters.properties.scope.default, "auto");
   assert.equal(recall.description, RECALL_TOOL_DESCRIPTION);
   assert.equal(traverse.description, TRAVERSE_TOOL_DESCRIPTION);
   assert.equal(supersede.description, SUPERSEDE_TOOL_DESCRIPTION);
@@ -520,6 +524,7 @@ test("/window settings persists and applies turn and token caps from its TUI", a
   assert.match(initial, /Context Window Settings/);
   assert.match(initial, /Turn cap\s+20/);
   assert.match(initial, /Context cap\s+adaptive/);
+  assert.match(initial, /Recall scope\s+auto/);
   assert.match(initial, /Read scope ceiling\s+project/);
 
   panel.handleInput("\r");
@@ -533,6 +538,14 @@ test("/window settings persists and applies turn and token caps from its TUI", a
   assert.equal(persisted.rotationTokens, 64_000);
   assert.match(notifications.at(-1).message, /effective 30 turns \/ 64k tokens/);
   assert.match(String(statuses.at(-1)), /30 turns/);
+
+  // Recall scope persists globally and is reloaded by the normal config path.
+  panel.handleInput("\x1b[B");
+  panel.handleInput("\r");
+  persisted = JSON.parse(readFileSync(settingsPath, "utf8"))["context-window"];
+  assert.equal(persisted.recallScope, "session");
+  assert.equal(loadConfig({ cwd: directory, projectTrusted: false, env: {}, home: directory }).recallScope, "session");
+  assert.match(notifications.at(-1).message, /recall scope: session .* survives reload/iu);
 
   // The read scope ceiling persists to the same user-global settings file and
   // never touches project-local configuration.

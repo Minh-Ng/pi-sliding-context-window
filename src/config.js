@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { defaultSocketPath } from "./daemon/paths.js";
+import { parseRecallScope } from "./retrieval/recall-scope.js";
 import { SEMANTIC_TIER_ALIASES, semanticModelProfile } from "./semantic/model-catalog.js";
 
 export const DEFAULT_CONFIG = Object.freeze({
@@ -40,6 +41,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   searchResults: 3,
   searchResultTokens: 1_500,
   automaticRetrieval: true,
+  // Default boundary for explicit recall tools and automatic continuity.
+  // `auto` keeps ordinary tool calls session-scoped while following a
+  // continuity marker at the marker preflight's project scope.
+  recallScope: "auto",
   // Explicit search/gather ranking signal only (ultracode task #32), never
   // consulted by automatic preflight: the Pi adapter's own deterministic
   // conversation-prefix digest (src/session/session-context.js) is computed
@@ -485,6 +490,12 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
     automaticRetrieval: booleanValue(
       env.CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL ?? merged.automaticRetrieval,
       DEFAULT_CONFIG.automaticRetrieval,
+    ),
+    recallScope: firstValid(
+      parseRecallScope,
+      env.CONTEXT_WINDOW_RECALL_SCOPE,
+      ...values("recallScope"),
+      DEFAULT_CONFIG.recallScope,
     ),
     // See DEFAULT_CONFIG.sessionContextRanking above for why this defaults on
     // and is scoped to the Pi adapter's own automatic digest only.

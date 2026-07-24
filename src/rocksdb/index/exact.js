@@ -7,10 +7,26 @@ import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
 import { assertVisibleSourceKeys } from "../../store/store-contract.js";
 import { DEFAULT_RETENTION_CLASS_BY_KIND } from "../../daemon/retention-policy.js";
 import {
+  derivedViewKeys,
+  documentOrdinalLiveness,
+  isDerivedViewQueryCutover,
+} from "../derived-view.js";
+import {
   MAX_EXACT_INDEX_ANCHORS,
   MAX_EXACT_POSTING_MUTATIONS,
   preparationLimit,
 } from "../index-preparation.js";
+import {
+  decodePostingLocator,
+  encodePostingLocator,
+  isPostingLocator,
+  POSTING_LOCATOR_KIND,
+} from "./posting-locator.js";
+import {
+  decodeExactPostingBlock,
+  encodeExactPostingBlock,
+  isPostingBlock,
+} from "./posting-block.js";
 
 export const EXACT_POSTING_VERSION = 1;
 export const EXACT_INDEX_HANDLER_ID = "exact-postings-v1";
@@ -45,6 +61,7 @@ export const DEFAULT_WORKING_SET_WORK_LIMIT = 512;
 export const MAX_WORKING_SET_ANCHORS_PER_RESULT = 8;
 
 const MAX_SCAN_LIMIT = 100_000;
+const SEARCH_SCAN_PAGE = 256;
 const MAX_ANCHOR_BYTES = 512;
 const MAX_MATCHES_PER_POSTING = 256;
 
@@ -508,6 +525,10 @@ function compareMatches(left, right) {
     || compareText(left.type, right.type) || compareText(left.value, right.value);
 }
 
+function exactMatchIdentity(match) {
+  return `${match.type}\0${match.value}\0${match.startByte}\0${match.endByte}`;
+}
+
 function exactMutationsForAnchors(context, anchors, options = {}) {
   const bucketMs = positiveInteger(options.bucketMs ?? DEFAULT_EXACT_BUCKET_MS, "bucketMs");
   const manifest = context.manifest;
@@ -562,7 +583,7 @@ function exactMutationsForAnchors(context, anchors, options = {}) {
   }
 
   const sourceMessageKeys = [...manifest.sourceMessageKeys];
-  const mutations = [...groups.values()].flatMap((group) => {
+  const fullMutations = [...groups.values()].flatMap((group) => {
     group.matches.sort(compareMatches);
     const postings = [];
     for (let offset = 0, segment = 0; offset < group.matches.length;
@@ -571,9 +592,8 @@ function exactMutationsForAnchors(context, anchors, options = {}) {
       type: "put",
       key: [...group.key.slice(0, -1), segment],
       kind: "exact-posting",
-      // Derived postings are replaceable during an explicit index rebuild;
-      // canonical sources remain immutable.
-      immutable: false,
+      // Generation-addressed canonical postings are immutable. Retirement and
+      // replacement are handled by the ordinal tombstone/current overlays.
       payload: {
         postingVersion: EXACT_POSTING_VERSION,
         generation: context.generation,
@@ -602,12 +622,49 @@ function exactMutationsForAnchors(context, anchors, options = {}) {
     }
     return postings;
   });
+  const exactTargets = new Map();
+  for (const mutation of fullMutations) {
+    if (mutation.payload.caseMode !== "exact") continue;
+    const encoded = encodeKey(mutation.key);
+    for (const match of mutation.payload.matches) {
+      const identity = exactMatchIdentity(match);
+      let targets = exactTargets.get(identity);
+      if (targets === undefined) {
+        targets = [];
+        exactTargets.set(identity, targets);
+      }
+      targets.push(encoded);
+    }
+  }
+  const mutations = fullMutations.map((mutation) => {
+    if (mutation.payload.caseMode !== "folded") {
+      return { ...mutation, payload: encodeExactPostingBlock(mutation.payload) };
+    }
+    const targets = [];
+    const seen = new Set();
+    for (const match of mutation.payload.matches) {
+      for (const target of exactTargets.get(exactMatchIdentity(match)) ?? []) {
+        const identity = target.toString("base64url");
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        targets.push(target);
+      }
+    }
+    if (targets.length === 0) {
+      throw new ExactIndexError("A folded exact posting has no canonical posting target.");
+    }
+    return {
+      ...mutation,
+      kind: "exact-folded-posting-locator",
+      payload: encodePostingLocator(POSTING_LOCATOR_KIND.EXACT_FOLDED, targets),
+    };
+  });
   mutations.sort((left, right) => Buffer.compare(encodeKey(left.key), encodeKey(right.key)));
   return Object.freeze({
     metadata: Object.freeze({
       anchorCount: anchors.length,
       postingCount: mutations.length,
-      indexedMatchCount: mutations.reduce((total, mutation) =>
+      indexedMatchCount: fullMutations.reduce((total, mutation) =>
         total + mutation.payload.matches.length, 0),
       omittedMatchCount: omittedMatches,
       ...(omittedMatches === 0 ? {} : {
@@ -749,12 +806,64 @@ function normalizedLookupOptions(request) {
 }
 
 function validatePosting(record) {
-  const posting = record?.payload;
+  const posting = isPostingBlock(record?.payload)
+    ? decodeExactPostingBlock(record.payload)
+    : record?.payload;
   if (!posting || posting.postingVersion !== EXACT_POSTING_VERSION
     || !Number.isSafeInteger(posting.bucket) || !Array.isArray(posting.matches)) {
     throw new ExactIndexError("An exact posting is malformed.", { key: record?.key });
   }
   return posting;
+}
+
+/** Decode one canonical posting or resolve one folded alias to canonical postings. */
+async function resolveExactPostingRecordBounded(
+  store,
+  record,
+  targetReadLimit = Number.MAX_SAFE_INTEGER,
+) {
+  if (!isPostingLocator(record?.payload)) {
+    return Object.freeze({
+      postings: Object.freeze([validatePosting(record)]),
+      targetReads: 0,
+      truncated: false,
+    });
+  }
+  const locator = decodePostingLocator(
+    record.payload,
+    POSTING_LOCATOR_KIND.EXACT_FOLDED,
+  );
+  const postings = [];
+  let targetReads = 0;
+  for (const target of locator.targets) {
+    if (targetReads >= targetReadLimit) {
+      return Object.freeze({
+        postings: Object.freeze(postings),
+        targetReads,
+        truncated: true,
+      });
+    }
+    targetReads += 1;
+    const payload = await store.get(target);
+    if (payload === undefined) continue;
+    const posting = validatePosting({ payload, key: record.key });
+    if (posting.caseMode !== "exact") {
+      throw new ExactIndexError("A folded exact locator targets a non-canonical posting.", {
+        key: record.key,
+      });
+    }
+    postings.push(posting);
+  }
+  return Object.freeze({
+    postings: Object.freeze(postings),
+    targetReads,
+    truncated: false,
+  });
+}
+
+/** Decode one canonical posting or resolve one folded alias to canonical postings. */
+export async function resolveExactPostingRecord(store, record) {
+  return (await resolveExactPostingRecordBounded(store, record)).postings;
 }
 
 function postingVisible(posting, options) {
@@ -851,15 +960,29 @@ export function exactSnippet(
   return `${prefix}${bytes.subarray(start, end).toString("utf8")}${suffix}`;
 }
 
-async function materializeResult(store, candidate, plan, options, expiredRetentionClasses) {
+async function materializeResult(
+  store,
+  candidate,
+  plan,
+  options,
+  expiredRetentionClasses,
+  derivedViewAuthoritative,
+) {
   const posting = candidate.posting;
-  // Same bounded scan the prior existence check already performed; reading
-  // its payload adds no extra I/O, only a status inspection.
-  const marker = store.scan([
-    KEYSPACE.SUPERSESSION,
-    posting.documentId,
-    posting.documentVersion,
-  ], { limit: 1 })[0]?.payload;
+  const ordinal = await documentOrdinalLiveness(store, {
+    project: posting.project,
+    documentId: posting.documentId,
+    version: posting.documentVersion,
+    authoritative: derivedViewAuthoritative,
+  });
+  const marker = ordinal === undefined
+    || (!ordinal.authoritative && ordinal.tombstone === undefined)
+    ? store.scan([
+        KEYSPACE.SUPERSESSION,
+        posting.documentId,
+        posting.documentVersion,
+      ], { limit: 1 })[0]?.payload
+    : ordinal.tombstone;
   if (marker !== undefined) {
     // A tombstone with no live replacement is the silent-amnesia case; a
     // version-bump marker always carries "superseded" and must not inflate
@@ -957,36 +1080,114 @@ async function materializeResult(store, candidate, plan, options, expiredRetenti
   };
 }
 
-async function scanCaseMode(store, plan, options, caseMode, candidates, work) {
+async function exactPostingRetirement(store, posting, derivedViewAuthoritative, cache) {
+  const identity = `${posting.documentId}\0${posting.documentVersion}`;
+  if (cache.has(identity)) return cache.get(identity);
+  const ordinal = await documentOrdinalLiveness(store, {
+    project: posting.project,
+    documentId: posting.documentId,
+    version: posting.documentVersion,
+    authoritative: derivedViewAuthoritative,
+  });
+  const marker = ordinal === undefined
+    || (!ordinal.authoritative && ordinal.tombstone === undefined)
+    ? store.scan([
+        KEYSPACE.SUPERSESSION,
+        posting.documentId,
+        posting.documentVersion,
+      ], { limit: 1 })[0]?.payload
+    : ordinal.tombstone;
+  cache.set(identity, marker ?? null);
+  return marker;
+}
+
+async function noteExpiredExactMatch(store, posting, marker, expiredRetentionClasses) {
+  if (marker?.status !== "expired" || expiredRetentionClasses.has(posting.documentId)) return;
+  const manifest = await store.get(manifestKeys.document(
+    posting.documentId,
+    posting.documentVersion,
+  ));
+  expiredRetentionClasses.set(
+    posting.documentId,
+    manifest?.retentionClass ?? fallbackRetentionClass(posting.documentKind),
+  );
+}
+
+async function scanCaseMode(
+  store,
+  plan,
+  options,
+  caseMode,
+  candidates,
+  work,
+  expiredRetentionClasses,
+) {
   for (const anchor of plan.anchors) {
     const term = caseMode === "exact" ? anchor.normalized : anchor.folded;
     if (caseMode === "folded" && !anchor.caseSensitive) continue;
-    const remaining = options.workLimit - work.postingsRead;
-    if (remaining <= 0) {
+    if (work.postingsRead >= options.workLimit
+      || work.physicalRecordsRead >= MAX_SCAN_LIMIT) {
       work.truncated = true;
       break;
     }
-    const records = store.scan(exactKeys.termPrefix(options.project, caseMode, term), {
-      reverse: true,
-      limit: Math.min(MAX_SCAN_LIMIT, remaining + 1),
-    });
-    const usable = records.slice(0, remaining);
-    if (records.length > usable.length) work.truncated = true;
-    for (const record of usable) {
-      work.postingsRead += 1;
-      const posting = validatePosting(record);
-      if (posting.bucket < options.minBucket) break;
-      if (posting.bucket > options.maxBucket) continue;
-      if (!work.bucketSet.has(posting.bucket)) {
-        if (work.bucketSet.size >= options.bucketLimit) {
-          work.truncated = true;
-          break;
+    const prefix = exactKeys.termPrefix(options.project, caseMode, term);
+    let before;
+    while (work.postingsRead < options.workLimit
+      && work.physicalRecordsRead < MAX_SCAN_LIMIT) {
+      const pageLimit = Math.min(
+        SEARCH_SCAN_PAGE,
+        MAX_SCAN_LIMIT - work.physicalRecordsRead,
+      );
+      const records = store.scan(prefix, {
+        reverse: true,
+        limit: pageLimit,
+        ...(before === undefined ? {} : { before }),
+      });
+      for (const record of records) {
+        work.physicalRecordsRead += 1;
+        const resolved = await resolveExactPostingRecordBounded(
+          store,
+          record,
+          MAX_SCAN_LIMIT - work.physicalRecordsRead,
+        );
+        work.physicalRecordsRead += resolved.targetReads;
+        work.canonicalPostingsRead += resolved.targetReads;
+        if (resolved.truncated) work.truncated = true;
+        for (const posting of resolved.postings) {
+          if (posting.bucket < options.minBucket) break;
+          if (posting.bucket > options.maxBucket || !postingVisible(posting, options)) continue;
+          const marker = await exactPostingRetirement(
+            store,
+            posting,
+            work.derivedViewAuthoritative,
+            work.retirement,
+          );
+          if (marker) {
+            await noteExpiredExactMatch(store, posting, marker, expiredRetentionClasses);
+            continue;
+          }
+          if (work.postingsRead >= options.workLimit) {
+            work.truncated = true;
+            break;
+          }
+          work.postingsRead += 1;
+          if (!work.bucketSet.has(posting.bucket)) {
+            if (work.bucketSet.size >= options.bucketLimit) {
+              work.truncated = true;
+              break;
+            }
+            work.bucketSet.add(posting.bucket);
+          }
+          addPostingCandidate(candidates, posting, anchor, caseMode);
         }
-        work.bucketSet.add(posting.bucket);
+        if (work.postingsRead >= options.workLimit
+          || work.physicalRecordsRead >= MAX_SCAN_LIMIT) break;
       }
-      if (!postingVisible(posting, options)) continue;
-      addPostingCandidate(candidates, posting, anchor, caseMode);
+      if (records.length < pageLimit || records.at(-1)?.keyBytes === undefined) break;
+      before = records.at(-1).keyBytes;
     }
+    if (work.postingsRead >= options.workLimit
+      || work.physicalRecordsRead >= MAX_SCAN_LIMIT) work.truncated = true;
   }
 }
 
@@ -1017,20 +1218,31 @@ export async function lookupExact(store, request) {
   });
   const plan = planExactQuery(options.query);
   const candidates = new Map();
-  const work = { postingsRead: 0, bucketSet: new Set(), truncated: false };
-  if (plan.anchors.length > 0) {
-    await scanCaseMode(store, plan, options, "exact", candidates, work);
-    if (candidates.size === 0 && options.allowCaseFold && work.postingsRead < options.workLimit) {
-      await scanCaseMode(store, plan, options, "folded", candidates, work);
-    }
-  }
-
-  // A caller composing exact and lexical lookups for one request (see
-  // collectCandidates in retrieval/search.js) may supply a shared map so the
-  // same tombstoned document is never double-counted across both indexes.
   const expiredRetentionClasses = request?.expiredRetentionClasses instanceof Map
     ? request.expiredRetentionClasses
     : new Map();
+  const derivedViewAuthoritative = isDerivedViewQueryCutover(
+    await store.get(derivedViewKeys.queryCutover()),
+  );
+  const work = {
+    postingsRead: 0,
+    physicalRecordsRead: 0,
+    canonicalPostingsRead: 0,
+    bucketSet: new Set(),
+    derivedViewAuthoritative,
+    retirement: new Map(),
+    truncated: false,
+  };
+  if (plan.anchors.length > 0) {
+    await scanCaseMode(
+      store, plan, options, "exact", candidates, work, expiredRetentionClasses,
+    );
+    if (candidates.size === 0 && options.allowCaseFold && work.postingsRead < options.workLimit) {
+      await scanCaseMode(
+        store, plan, options, "folded", candidates, work, expiredRetentionClasses,
+      );
+    }
+  }
 
   const ranked = [...candidates.values()].sort((left, right) =>
     candidateScore(right, plan.anchors.length) - candidateScore(left, plan.anchors.length)
@@ -1040,7 +1252,14 @@ export async function lookupExact(store, request) {
       || compareText(left.posting.documentId, right.posting.documentId));
   const results = [];
   for (const candidate of ranked) {
-    const result = await materializeResult(store, candidate, plan, options, expiredRetentionClasses);
+    const result = await materializeResult(
+      store,
+      candidate,
+      plan,
+      options,
+      expiredRetentionClasses,
+      derivedViewAuthoritative,
+    );
     if (result !== undefined) results.push(result);
     if (results.length === options.limit) break;
   }
@@ -1060,6 +1279,8 @@ export async function lookupExact(store, request) {
     plan,
     work: Object.freeze({
       postingsRead: work.postingsRead,
+      physicalRecordsRead: work.physicalRecordsRead,
+      canonicalPostingsRead: work.canonicalPostingsRead,
       bucketsVisited: work.bucketSet.size,
       truncated: work.truncated,
       workLimit: options.workLimit,
@@ -1078,32 +1299,66 @@ export async function lookupExact(store, request) {
 
 // Shared by lookupExactAnchorDocuments' two-pass scan below, mirroring
 // scanCaseMode's own per-anchor work-budget accounting above.
-function scanAnchorCaseMode(store, options, anchors, caseMode, matchesByDocument, work) {
+async function scanAnchorCaseMode(store, options, anchors, caseMode, matchesByDocument, work) {
   for (const anchor of anchors) {
     if (caseMode === "folded" && !anchor.caseSensitive) continue;
-    const remaining = options.workLimit - work.postingsRead;
-    if (remaining <= 0) {
+    if (work.postingsRead >= options.workLimit
+      || work.physicalRecordsRead >= MAX_SCAN_LIMIT) {
       work.truncated = true;
       break;
     }
     const term = caseMode === "exact" ? anchor.normalized : anchor.folded;
-    const records = store.scan(exactKeys.termPrefix(options.project, caseMode, term), {
-      reverse: true,
-      limit: Math.min(MAX_SCAN_LIMIT, remaining + 1),
-    });
-    const usable = records.slice(0, remaining);
-    if (records.length > usable.length) work.truncated = true;
-    for (const record of usable) {
-      work.postingsRead += 1;
-      const posting = validatePosting(record);
-      if (!postingVisible(posting, options)) continue;
-      let values = matchesByDocument.get(posting.documentId);
-      if (!values) {
-        values = new Set();
-        matchesByDocument.set(posting.documentId, values);
+    const prefix = exactKeys.termPrefix(options.project, caseMode, term);
+    let before;
+    while (work.postingsRead < options.workLimit
+      && work.physicalRecordsRead < MAX_SCAN_LIMIT) {
+      const pageLimit = Math.min(
+        SEARCH_SCAN_PAGE,
+        MAX_SCAN_LIMIT - work.physicalRecordsRead,
+      );
+      const records = store.scan(prefix, {
+        reverse: true,
+        limit: pageLimit,
+        ...(before === undefined ? {} : { before }),
+      });
+      for (const record of records) {
+        work.physicalRecordsRead += 1;
+        const resolved = await resolveExactPostingRecordBounded(
+          store,
+          record,
+          MAX_SCAN_LIMIT - work.physicalRecordsRead,
+        );
+        work.physicalRecordsRead += resolved.targetReads;
+        if (resolved.truncated) work.truncated = true;
+        for (const posting of resolved.postings) {
+          if (!postingVisible(posting, options)) continue;
+          const marker = await exactPostingRetirement(
+            store,
+            posting,
+            work.derivedViewAuthoritative,
+            work.retirement,
+          );
+          if (marker) continue;
+          if (work.postingsRead >= options.workLimit) {
+            work.truncated = true;
+            break;
+          }
+          work.postingsRead += 1;
+          let values = matchesByDocument.get(posting.documentId);
+          if (!values) {
+            values = new Set();
+            matchesByDocument.set(posting.documentId, values);
+          }
+          values.add(anchor.value);
+        }
+        if (work.postingsRead >= options.workLimit
+          || work.physicalRecordsRead >= MAX_SCAN_LIMIT) break;
       }
-      values.add(anchor.value);
+      if (records.length < pageLimit || records.at(-1)?.keyBytes === undefined) break;
+      before = records.at(-1).keyBytes;
     }
+    if (work.postingsRead >= options.workLimit
+      || work.physicalRecordsRead >= MAX_SCAN_LIMIT) work.truncated = true;
   }
 }
 
@@ -1123,7 +1378,7 @@ export async function lookupExactAnchorDocuments(store, request) {
   if (store && typeof store.snapshot === "function") {
     return store.snapshot((snapshot) => lookupExactAnchorDocuments(snapshot, request));
   }
-  if (!store || typeof store.scan !== "function") {
+  if (!store || typeof store.scan !== "function" || typeof store.get !== "function") {
     throw new TypeError("Exact anchor lookup requires a RocksStore-compatible store.");
   }
   const anchors = Array.isArray(request?.anchors) ? request.anchors : [];
@@ -1151,10 +1406,18 @@ export async function lookupExactAnchorDocuments(store, request) {
   // budget on a keyspace it usually never needs, and would let a
   // case-mismatched match fire the boost even when an exact-case posting
   // for the same anchor exists elsewhere in the result set.
-  const work = { postingsRead: 0, truncated: false };
-  scanAnchorCaseMode(store, options, anchors, "exact", matchesByDocument, work);
+  const work = {
+    postingsRead: 0,
+    physicalRecordsRead: 0,
+    derivedViewAuthoritative: isDerivedViewQueryCutover(
+      await store.get(derivedViewKeys.queryCutover()),
+    ),
+    retirement: new Map(),
+    truncated: false,
+  };
+  await scanAnchorCaseMode(store, options, anchors, "exact", matchesByDocument, work);
   if (matchesByDocument.size === 0 && options.allowCaseFold && work.postingsRead < options.workLimit) {
-    scanAnchorCaseMode(store, options, anchors, "folded", matchesByDocument, work);
+    await scanAnchorCaseMode(store, options, anchors, "folded", matchesByDocument, work);
   }
   return Object.freeze({ matchesByDocument, truncated: work.truncated });
 }

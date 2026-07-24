@@ -22,6 +22,15 @@ import {
   normalizeExactValue,
   planExactQuery,
 } from "../src/rocksdb/index/exact.js";
+import {
+  decodePostingLocator,
+  isPostingLocator,
+  POSTING_LOCATOR_KIND,
+} from "../src/rocksdb/index/posting-locator.js";
+import {
+  decodeExactPostingBlock,
+  isPostingBlock,
+} from "../src/rocksdb/index/posting-block.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
@@ -217,10 +226,19 @@ test("handler emits deterministic, source-linked window postings without source 
   assert.equal(first.metadata.anchorCount, 2);
   assert.equal(first.metadata.bucket, 1);
   assert.ok(first.mutations.length >= 2);
-  assert.ok(first.mutations.every(({ key, payload }) => key[0] === KEYSPACE.EXACT
-    && payload.documentId === "doc"
-    && payload.sourceVersion === 1
-    && payload.matches.length >= 1));
+  assert.ok(first.mutations.every(({ key, payload }) => {
+    if (key[0] !== KEYSPACE.EXACT) return false;
+    if (isPostingLocator(payload)) {
+      return decodePostingLocator(
+        payload,
+        POSTING_LOCATOR_KIND.EXACT_FOLDED,
+      ).targets.length >= 1;
+    }
+    const posting = isPostingBlock(payload) ? decodeExactPostingBlock(payload) : payload;
+    return posting.documentId === "doc"
+      && posting.sourceVersion === 1
+      && posting.matches.length >= 1;
+  }));
   assert.equal(JSON.stringify(first).includes(text), false);
 });
 
@@ -436,6 +454,80 @@ test("lookupExactAnchorDocuments falls back to the folded keyspace only when the
     generation,
   });
   assert.deepEqual([...withExactHit.matchesByDocument.keys()], ["exact-hit"]);
+});
+
+test("folded locator reads retain a physical cap without consuming the live-posting budget", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-locator-budget"));
+  t.after(() => store.close());
+  await admit(store, document("locator", "warm-harbor is the selected value."));
+  await indexPending(store);
+
+  const bounded = await lookupExact(store, {
+    query: "WARM-HARBOR",
+    project: "/workspace/exact",
+    scope: "project",
+    workLimit: 1,
+  });
+  assert.deepEqual(bounded.results.map(({ documentId }) => documentId), ["locator"]);
+  assert.equal(bounded.work.postingsRead, 1);
+  assert.equal(bounded.work.physicalRecordsRead, 2);
+  assert.equal(bounded.work.canonicalPostingsRead, 1);
+  assert.equal(bounded.work.truncated, true);
+
+  const resolved = await lookupExact(store, {
+    query: "WARM-HARBOR",
+    project: "/workspace/exact",
+    scope: "project",
+    workLimit: 2,
+  });
+  assert.deepEqual(resolved.results.map(({ documentId }) => documentId), ["locator"]);
+  assert.equal(resolved.work.postingsRead, 1);
+  assert.equal(resolved.work.physicalRecordsRead, 2);
+  assert.equal(resolved.work.canonicalPostingsRead, 1);
+
+  const anchors = classifyWorkingSetAnchors(["WARM-HARBOR"]);
+  const anchorBounded = await lookupExactAnchorDocuments(store, {
+    anchors,
+    project: "/workspace/exact",
+    scope: "project",
+    generation: 1,
+    workLimit: 1,
+  });
+  assert.equal(anchorBounded.matchesByDocument.size, 1);
+  assert.equal(anchorBounded.truncated, true);
+});
+
+test("retired exact postings do not consume the live work budget", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "exact-retired-budget"));
+  t.after(() => store.close());
+  await admit(store, document("live-old", "RETIRED_BUDGET_ANCHOR remains valid.", {
+    createdAt: 100,
+  }));
+  await admit(store, document("dead-middle", "RETIRED_BUDGET_ANCHOR obsolete.", {
+    createdAt: 86_400_100,
+  }));
+  await admit(store, document("dead-new", "RETIRED_BUDGET_ANCHOR obsolete.", {
+    createdAt: 172_800_100,
+  }));
+  await indexPending(store);
+  for (const documentId of ["dead-middle", "dead-new"]) {
+    await store.put([KEYSPACE.SUPERSESSION, documentId, 1], {
+      status: "expired",
+      reason: "test",
+      recordedAt: 400,
+    });
+  }
+
+  const result = await lookupExact(store, {
+    query: "RETIRED_BUDGET_ANCHOR",
+    project: "/workspace/exact",
+    scope: "project",
+    workLimit: 1,
+  });
+
+  assert.deepEqual(result.results.map(({ documentId }) => documentId), ["live-old"]);
+  assert.equal(result.work.postingsRead, 1);
+  assert.ok(result.work.physicalRecordsRead >= 3);
 });
 
 test("exact lookup counts a tombstoned document with no live replacement as expired without exposing its content", async (t) => {

@@ -43,6 +43,11 @@ test("implicit recurring concepts return a marker made only from current-message
   assert.match(marker, /compaction/u);
   assert.doesNotMatch(marker, /coldNeighborTerm/u);
   assert.doesNotMatch(marker, /candidate-document-id|candidate-only-locator|private\/archive/u);
+  assert.match(marker, /context_window_search scope="session"/u);
+  assert.match(
+    renderContinuityMarker(message, decision.anchors, { scope: "project" }),
+    /context_window_search scope="project"/u,
+  );
   assert.ok(decision.anchors.every((anchor) => message.includes(anchor)));
 });
 
@@ -206,6 +211,10 @@ test("marker rendering rejects archive-only or duplicate dynamic material", () =
   assert.throws(
     () => renderContinuityMarker(message, ["tablets", "tablets"]),
     /unique exact span/u,
+  );
+  assert.throws(
+    () => renderContinuityMarker(message, ["tablets", "compaction"], { scope: "invalid" }),
+    /search scope/u,
   );
 });
 

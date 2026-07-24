@@ -29,6 +29,8 @@ The local transport admits at most 16 active connections. Its default Unix socke
 - Physical chunks are non-overlapping and content-addressed.
 - Logical search windows may overlap without duplicating physical payload bytes.
 - Every derived record identifies its source version.
+- Every admitted document identity has one stable, never-reused uint32 ordinal.
+- Project/session membership is immutable; retirement is an additive tombstone overlay.
 - Superseded evidence remains auditable until retention expires it, but normal search excludes it immediately.
 - The daemon acknowledges a write only after the canonical source and durable indexing outbox entry commit atomically.
 - Indexes may lag canonical writes; canonical writes may never lag indexes.
@@ -64,6 +66,11 @@ expiry/<time-bucket>/<retention-class>/<document>/<version>
 supersession/<document>/<version>
 lease/<expires-at>/<document>/<version>/<owner>
 outbox/<sequence>
+meta/derived-view/document/<project>/<document>/<version>
+meta/derived-view/ordinal/<ordinal>
+meta/derived-view/scope/{project|session}/.../<ordinal>
+meta/derived-view/tombstone/<project>/<ordinal>
+meta/derived-view/active/<project>
 meta/<name>
 ```
 
@@ -83,16 +90,22 @@ Index preparation reads source in fixed 256 KiB segments and never requests more
 
 1. Assign a monotonic session sequence and deterministic source key.
 2. Split large payloads into immutable physical chunks.
-3. Commit events, manifests, chunk references, and an outbox entry in one transaction.
+3. Commit events, manifests, chunk references, a stable document ordinal, immutable project/session memberships, and an outbox entry in one transaction.
 4. Return success to the client.
 5. Let the background indexer page canonical windows and prepare each handler under explicit source, token, posting, mutation, and byte limits.
 6. Apply tablets in transactions capped by mutation count and encoded bytes. Generation-addressed postings keep the last published generation readable while a future generation is incomplete.
 7. Atomically publish only after every tablet has a durable applied marker. Publish handler completeness as `complete`, `partial`, or `skipped`; replay replaces pre-header orphan tablets and resumes completed tablets.
-8. Remove superseded derived values and tablet metadata after publication. RocksDB reclaims their physical bytes through normal LSM compaction.
+8. Leave generation-addressed postings immutable. Current pointers and ordinal tombstones hide replaced or retired versions; storage maintenance consolidates legacy layouts and RocksDB reclaims deleted physical bytes through normal LSM compaction.
 
 The canonical WAL commit is always the acknowledgement boundary. The daemon gives documents up to 64 KiB a bounded best-effort foreground publication opportunity for immediate search consistency; a publication fault is recorded without converting the committed admission into an error. Larger documents skip synchronous startup/put indexing and remain at the ordered outbox head for background publication. Explicitly retryable background failures use exponential backoff from 50 milliseconds to 5 seconds, new activity may accelerate the retry, and shutdown cancels the timer. Internal faults remain recorded without a hot retry loop, while restart recovery can replay every pending entry.
 
 Stores created before per-document turn/tool ownership references are upgraded once at writable open. The upgrade processes one document manifest per transaction, atomically writes deterministic owner references with a durable cursor, and resumes after interruption before the daemon becomes ready. The one-manifest transaction boundary keeps memory bounded for maximum-size manifests. Fresh stores record the owner index as complete in O(1). Retention can then delete shared metadata only after its final current or backfilled owner reference is removed.
+
+Stores created before ordinal views are likewise upgraded once at writable open. The resumable scan assigns dense global ordinals from the same counter used by current admissions, writes project/session membership, reconstructs retirement tombstones, and advances a versioned per-project active-view manifest. An ordinal names a document version globally; project-local queries obtain their set from the project membership view. Reindexing the same immutable document identity reuses its ordinal. The upgrade records canonical and retirement outbox high-watermarks; if an older daemon later writes without maintaining the view, the next current daemon detects the drift and reconciles surviving manifests, supersession markers, durable retired-version ranges, and existing ordinals before serving. A fully cleaned legacy version whose canonical manifest no longer preserves its session receives a `retiredOnly` ordinal with project membership and an immediate tombstone, but no fabricated session membership.
+
+The ordinal view begins as a backward-compatible shadow substrate. `verifyDerivedView` compares canonical manifests, forward/reverse ordinal mappings, scope memberships, and retirement state before publishing a query-cutover marker. Exact, BM25, structural, and semantic retrieval then treat ordinal tombstones as authoritative while continuing to read mixed legacy and compact posting values. Generation-addressed postings remain immutable; current pointers and BM25 statistic deltas represent the live view.
+
+Background storage maintenance is bounded and crash-resumable. It deletes only versioned index namespaces excluded by the current reader manifest, replaces duplicated session and folded-case values with compact locators, rewrites canonical postings as schema-specific binary blocks, and verifies the ordinal view in resumable pages fenced by a stable outbox high watermark. It then waits through a 24-hour query-cutover rollback grace before removing the cleanup-only document-to-derived reverse map. That grace protects the current reader's query transition; it is not a binary-format downgrade guarantee. Canonical derived targets remain auditable and are hidden through current/tombstone overlays. Legacy folded postings whose canonical partner was already removed remain self-contained and readable rather than losing evidence.
 
 **Read lifecycle**
 

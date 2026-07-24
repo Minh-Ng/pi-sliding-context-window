@@ -212,28 +212,27 @@ const CONTINUITY_MARKER_PREFIX = [
   "",
 ].join("\n");
 
-const CONTINUITY_MARKER_SUFFIX = [
-  "",
-  "Search those phrases before relying on prior shared meaning; this marker is not historical evidence.",
-].join("\n");
+const CONTINUITY_MARKER_SUFFIX =
+  /\nSearch with context_window_search scope="(session|project|all)"; this marker is not evidence\.$/u;
 
 const HISTORICAL_SNIPPET_PREFIX = "\n\n[ARCHIVED HISTORICAL EVIDENCE — QUOTED DATA]\nArchived excerpt from ";
 const HISTORICAL_SNIPPET_SEPARATOR = " as JSON data: verify current state; ";
 const COMPACT_DATE = /^\d{4}-\d{2}-\d{2}$/u;
 
 function validContinuityMarker(modelVisibleText, message) {
-  if (!modelVisibleText.startsWith(CONTINUITY_MARKER_PREFIX)
-    || !modelVisibleText.endsWith(CONTINUITY_MARKER_SUFFIX)) return false;
+  if (!modelVisibleText.startsWith(CONTINUITY_MARKER_PREFIX)) return false;
+  const suffix = CONTINUITY_MARKER_SUFFIX.exec(modelVisibleText);
+  if (suffix === null) return false;
   const bulletText = modelVisibleText.slice(
     CONTINUITY_MARKER_PREFIX.length,
-    modelVisibleText.length - CONTINUITY_MARKER_SUFFIX.length,
+    suffix.index,
   );
   if (bulletText.length === 0) return false;
   const anchors = bulletText.split("\n").map((line) => line.startsWith("- ") ? line.slice(2) : "");
   if (anchors.some((anchor) => anchor.length === 0) || new Set(anchors).size !== anchors.length) return false;
   if (anchors.some((anchor) => !message.includes(anchor))) return false;
   try {
-    return renderContinuityMarker(message, anchors) === modelVisibleText;
+    return renderContinuityMarker(message, anchors, { scope: suffix[1] }) === modelVisibleText;
   } catch {
     return false;
   }

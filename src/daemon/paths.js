@@ -94,6 +94,38 @@ export function ensureSecureStoreDirectory(storePath) {
   return canonicalDirectory;
 }
 
+/**
+ * Validate an existing store trust boundary without creating or chmodding it.
+ * Offline report-only maintenance uses this path so inspection has no
+ * filesystem side effects.
+ */
+export function inspectSecureStoreDirectory(storePath) {
+  const directory = resolveStorePath(storePath);
+  const canonicalDirectory = realpathSync.native(directory);
+  const stat = lstatSync(canonicalDirectory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new UnsafeStorePathError(
+      `RocksDB store ${canonicalDirectory} must be a real directory, not a symlink or file.`,
+      { directory: canonicalDirectory },
+    );
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new UnsafeStorePathError(
+      `RocksDB store ${canonicalDirectory} is owned by uid ${stat.uid}, not the current uid ${uid}.`,
+      { directory: canonicalDirectory, ownerUid: stat.uid, expectedUid: uid },
+    );
+  }
+  const mode = stat.mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new UnsafeStorePathError(
+      `RocksDB store ${canonicalDirectory} must not grant group or other access.`,
+      { directory: canonicalDirectory, mode },
+    );
+  }
+  return canonicalDirectory;
+}
+
 function socketNamespace() {
   const identity = `${process.getuid?.() ?? "nouid"}:${homedir()}`;
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 12);

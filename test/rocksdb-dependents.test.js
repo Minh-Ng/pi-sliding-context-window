@@ -6,11 +6,17 @@ import test from "node:test";
 import { createBm25IndexHandler } from "../src/rocksdb/index/bm25.js";
 import { createExactIndexHandler } from "../src/rocksdb/index/exact.js";
 import {
+  DERIVED_VIEW_FORMAT_VERSION,
+  DERIVED_VIEW_LAYOUT,
+  derivedViewKeys,
+} from "../src/rocksdb/derived-view.js";
+import {
   findDependentDocuments,
   MAX_DEPENDENT_CANDIDATES,
   MAX_DEPENDENT_DOCUMENT_IDS,
 } from "../src/rocksdb/dependents.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
+import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument, manifestKeys } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 
@@ -147,6 +153,31 @@ test("findDependentDocuments never surfaces documents admitted before the target
   await worker.drain({ limit: 10, maxDurationMs: 30_000, throwOnError: true });
 
   const target = await targetFor(store, "decision-beta");
+  const dependents = await store.snapshot((view) => findDependentDocuments(view, target));
+
+  assert.equal(dependents.count, 0);
+  assert.deepEqual(dependents.documentIds, []);
+});
+
+test("findDependentDocuments rejects a tombstoned exact hit after manifest cleanup at cutover", async (t) => {
+  const { store, worker } = await fixture(t, "retired-exact-hit");
+  await admit(store, "decision-retired", "Use the new deploy pipeline.", { createdAt: 100 });
+  await admit(store, "retired-citation", "Per decision-retired, the rollout starts Monday.", {
+    createdAt: 200,
+  });
+  await worker.drain({ limit: 10, maxDurationMs: 30_000, throwOnError: true });
+  await admit(store, "replacement-note", "This note replaces obsolete rollout guidance.", {
+    createdAt: 300,
+    supersedes: { documentId: "retired-citation", version: 1 },
+  });
+  await store.put(derivedViewKeys.queryCutover(), {
+    formatVersion: DERIVED_VIEW_FORMAT_VERSION,
+    layout: DERIVED_VIEW_LAYOUT,
+  }, { kind: "derived-view-query-cutover" });
+  await store.remove(manifestKeys.document("retired-citation", 1));
+  await store.remove([KEYSPACE.SUPERSESSION, "retired-citation", 1]);
+
+  const target = await targetFor(store, "decision-retired");
   const dependents = await store.snapshot((view) => findDependentDocuments(view, target));
 
   assert.equal(dependents.count, 0);

@@ -211,8 +211,11 @@ export function decideContinuityDisclosure({
 }
 
 /** Render fixed guidance whose only variable material is current-message text. */
-export function renderContinuityMarker(message, anchors) {
+export function renderContinuityMarker(message, anchors, { scope = "session" } = {}) {
   requireMessage(message);
+  if (!["session", "project", "all"].includes(scope)) {
+    throw new TypeError("A continuity marker search scope must be session, project, or all.");
+  }
   if (!Array.isArray(anchors) || anchors.length === 0) {
     throw new TypeError("A continuity marker requires at least one current-message anchor.");
   }
@@ -226,6 +229,6 @@ export function renderContinuityMarker(message, anchors) {
     "[PRIOR SHARED CONTEXT MARKER]",
     "Archived discussion may exist for these exact phrases from the current user message:",
     ...checked.map((anchor) => `- ${anchor}`),
-    "Search those phrases before relying on prior shared meaning; this marker is not historical evidence.",
+    `Search with context_window_search scope="${scope}"; this marker is not evidence.`,
   ].join("\n");
 }

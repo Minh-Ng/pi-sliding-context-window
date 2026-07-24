@@ -799,6 +799,19 @@ function prepareDocumentAdmissionCore(request, options = {}, semanticState = {})
         admittedAt: document.createdAt,
       },
     },
+    derivedView: {
+      project: document.project,
+      sessionId: document.sessionId,
+      documentId: document.documentId,
+      documentVersion: document.version,
+      admittedAt: document.createdAt,
+      retiredDocuments: [
+        ...(options.supersession === undefined ? [] : [options.supersession]),
+        ...(semanticState.semanticSupersession === undefined
+          ? []
+          : [semanticState.semanticSupersession]),
+      ],
+    },
     manifest,
     sourceMessages,
     turnManifest,

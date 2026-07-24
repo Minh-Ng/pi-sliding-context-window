@@ -12,6 +12,12 @@ import {
   INDEX_WORKER_BOUNDARIES,
   MAX_INDEX_SOURCE_RANGE_BYTES,
 } from "../src/rocksdb/indexer.js";
+import { derivedKeys } from "../src/rocksdb/derived.js";
+import {
+  DERIVED_VIEW_FORMAT_VERSION,
+  DERIVED_VIEW_LAYOUT,
+  derivedViewKeys,
+} from "../src/rocksdb/derived-view.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument, readCanonicalDocument } from "../src/rocksdb/manifests.js";
 import {
@@ -238,6 +244,25 @@ test("worker drains bounded batches and publishes complete generations in order"
   assert.equal(await store.get(outboxKeys.generation(1)), undefined);
   assert.notEqual(await store.get(outboxKeys.entry(2)), undefined);
   assert.notEqual(await store.get(outboxKeys.generation(2)), undefined);
+});
+
+test("verified query cutover stops creating cleanup-only reverse references", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "indexer-no-reverse-references"));
+  t.after(() => store.close());
+  await store.put(derivedViewKeys.queryCutover(), {
+    formatVersion: DERIVED_VIEW_FORMAT_VERSION,
+    layout: DERIVED_VIEW_LAYOUT,
+    verifiedAt: 1,
+    rollbackGraceUntil: 2,
+  }, { kind: "posting-query-cutover" });
+  await admit(store, 1);
+  const worker = new IndexWorker(store, {
+    workerId: "worker:no-reverse-references",
+    handlers: [exactHandler()],
+  });
+  assert.equal((await worker.drain({ throwOnError: true })).processed, 1);
+  assert.equal(store.scan(derivedKeys.prefix("document-1", 1)).length, 0);
+  assert.equal(store.scan([KEYSPACE.EXACT]).length, 2);
 });
 
 test("a claim left by process termination is replayed on restart", async (t) => {

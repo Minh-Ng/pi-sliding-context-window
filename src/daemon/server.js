@@ -1189,7 +1189,18 @@ export class StoreDaemon {
       ].slice(-100),
       slowRequests: [...this.slowRequests],
     };
-    for (const field of ["counts", "outbox", "index", "memory", "semantic", "retention", "rocksdb", "filesystem", "migration"]) {
+    for (const field of [
+      "counts",
+      "outbox",
+      "index",
+      "derivedView",
+      "memory",
+      "semantic",
+      "retention",
+      "rocksdb",
+      "filesystem",
+      "migration",
+    ]) {
       if (runtimeStatus[field] !== undefined) result[field] = runtimeStatus[field];
       else if (storeStatus[field] !== undefined) result[field] = storeStatus[field];
     }

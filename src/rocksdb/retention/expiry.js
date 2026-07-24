@@ -9,6 +9,12 @@ import {
   retiredDocumentStatus,
 } from "../manifests.js";
 import { KEYSPACE } from "../keys.js";
+import {
+  advanceDerivedViewOutbox,
+  derivedViewKeys,
+  recordDerivedViewTombstone,
+  resolveDocumentOrdinal,
+} from "../derived-view.js";
 import { isDocumentProtected } from "./protection.js";
 import {
   DEFAULT_ACCESS_BUCKET_MS,
@@ -138,6 +144,13 @@ async function enqueueDeleteOutbox(transaction, candidate, now) {
     admittedAt: now,
     sequence,
   }, { kind: "outbox" });
+  const stateKey = derivedViewKeys.upgradeState();
+  const state = await transaction.get(stateKey);
+  await transaction.put(
+    stateKey,
+    advanceDerivedViewOutbox(state, sequence),
+    { kind: "derived-view-upgrade-state" },
+  );
   return sequence;
 }
 
@@ -149,10 +162,26 @@ export async function beginExpiry(store, candidate, now, options = {}) {
   await store.get(manifestKeys.document(candidate.documentId, candidate.version));
   await store.get([KEYSPACE.SUPERSESSION, candidate.documentId, candidate.version]);
   await store.get(retentionKeys.cleanup(candidate.documentId, candidate.version));
+  await store.get(derivedViewKeys.upgradeState());
   const initialManifest = await store.get(manifestKeys.document(candidate.documentId, candidate.version));
   const initialCleanupManifest = await store.get(
     retentionKeys.cleanupManifest(candidate.documentId, candidate.version),
   );
+  const ordinalManifest = initialManifest ?? initialCleanupManifest;
+  const ordinalAssignment = ordinalManifest === undefined
+    ? undefined
+    : await resolveDocumentOrdinal(store, {
+        project: ordinalManifest.project,
+        documentId: candidate.documentId,
+        version: candidate.version,
+      });
+  if (ordinalAssignment !== undefined) {
+    await store.get(derivedViewKeys.tombstone(
+      ordinalAssignment.project,
+      ordinalAssignment.ordinal,
+    ));
+    await store.get(derivedViewKeys.active(ordinalAssignment.project));
+  }
   if (typeof initialManifest?.subjectKey === "string" && initialManifest.subjectKey.length > 0) {
     await store.get(manifestKeys.subjectLive(initialManifest.project, initialManifest.subjectKey));
   }
@@ -169,6 +198,7 @@ export async function beginExpiry(store, candidate, now, options = {}) {
       candidate.version,
     ], { limit: 1 })[0]?.payload;
     if (existing !== undefined) {
+      await recordDerivedViewTombstone(transaction, ordinalAssignment, existing);
       const cleanup = await transaction.get(retentionKeys.cleanup(candidate.documentId, candidate.version));
       if (cleanup?.deleteOutboxSequence !== undefined) {
         return Object.freeze({
@@ -240,6 +270,7 @@ export async function beginExpiry(store, candidate, now, options = {}) {
       tombstone,
       { kind: "supersession" },
     );
+    await recordDerivedViewTombstone(transaction, ordinalAssignment, tombstone);
     if (typeof manifest.subjectKey === "string" && manifest.subjectKey.length > 0) {
       const subjectKey = manifestKeys.subjectLive(manifest.project, manifest.subjectKey);
       const live = await transaction.get(subjectKey);

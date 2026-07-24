@@ -12,6 +12,12 @@ import {
 } from "../src/rocksdb/index/structural.js";
 import { DECISION_KEYSPACE, lookupDecisionEvidence } from "../src/rocksdb/index/decisions.js";
 import { readDocumentRange } from "../src/rocksdb/document-range.js";
+import {
+  DERIVED_VIEW_FORMAT_VERSION,
+  DERIVED_VIEW_LAYOUT,
+  derivedViewKeys,
+  resolveDocumentOrdinal,
+} from "../src/rocksdb/derived-view.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
@@ -200,6 +206,106 @@ test("decision evidence is a verbatim excerpt linked to its source turn", async 
   assert.equal(result.results[0].snippet, excerpt);
   assert.equal(result.results[0].structural.sourceTurnId, "turn-source");
   assert.equal(result.results[0].structural.verbatim, true);
+});
+
+test("decision evidence remains hidden by the ordinal tombstone after audit metadata expires", async (t) => {
+  const { store, worker } = await fixture(t);
+  await admitDocument(store, request({
+    id: "retired-decision",
+    kind: "decision-candidate",
+    text: "Keep the immutable episode log.",
+    createdAt: 5,
+    metadata: { sourceTurnId: "turn-source" },
+  }));
+  await worker.drain();
+  const assignment = await resolveDocumentOrdinal(store, {
+    project: "/project",
+    documentId: "retired-decision",
+    version: 1,
+  });
+  await store.put(derivedViewKeys.tombstone("/project", assignment.ordinal), {
+    status: "expired",
+    recordedAt: 10,
+  }, { kind: "derived-view-tombstone" });
+  await store.put(derivedViewKeys.queryCutover(), {
+    formatVersion: DERIVED_VIEW_FORMAT_VERSION,
+    layout: DERIVED_VIEW_LAYOUT,
+  }, { kind: "posting-query-cutover" });
+  await store.remove([KEYSPACE.SUPERSESSION, "retired-decision", 1]);
+
+  assert.equal(lookupStructural(store, {
+    relation: "latest-decision",
+    sessionId: "session-current",
+    project: "/project",
+  }).status, "not-found");
+});
+
+test("retired structural and decision postings do not consume live scan limits", async (t) => {
+  const { store, worker } = await fixture(t);
+  for (const [index, id] of ["live-question", "dead-question-1", "dead-question-2"].entries()) {
+    await admitDocument(store, request({
+      id,
+      text: "Where is durable evidence?",
+      createdAt: 100 + index,
+      structuralMessages: [{
+        messageKey: `${id}-user`,
+        messageIndex: 0,
+        role: "user",
+        createdAt: 100 + index,
+        text: "Where is durable evidence?",
+        questionScore: 100,
+        requestScore: 10,
+        correctionScore: 0,
+        answerScore: 0,
+      }],
+    }));
+  }
+  for (const [index, id] of ["live-decision", "dead-decision-1", "dead-decision-2"].entries()) {
+    await admitDocument(store, request({
+      id,
+      kind: "decision-candidate",
+      text: "Keep durable evidence.",
+      createdAt: 200 + index,
+      metadata: { sourceTurnId: `${id}-source` },
+    }));
+  }
+  await worker.drain();
+  for (const documentId of [
+    "dead-question-1",
+    "dead-question-2",
+    "dead-decision-1",
+    "dead-decision-2",
+  ]) {
+    const assignment = await resolveDocumentOrdinal(store, {
+      project: "/project",
+      documentId,
+      version: 1,
+    });
+    await store.put(derivedViewKeys.tombstone("/project", assignment.ordinal), {
+      status: "expired",
+      recordedAt: 300,
+    }, { kind: "derived-view-tombstone" });
+  }
+  await store.put(derivedViewKeys.queryCutover(), {
+    formatVersion: DERIVED_VIEW_FORMAT_VERSION,
+    layout: DERIVED_VIEW_LAYOUT,
+  }, { kind: "posting-query-cutover" });
+
+  const structural = lookupStructural(store, {
+    relation: "latest-question",
+    query: "durable",
+    sessionId: "session-current",
+    project: "/project",
+    scanLimit: 1,
+  });
+  assert.equal(structural.results[0].id, "live-question");
+  const decisions = lookupDecisionEvidence(store, {
+    query: "durable",
+    sessionId: "session-current",
+    project: "/project",
+    scanLimit: 1,
+  });
+  assert.equal(decisions[0].documentId, "live-decision");
 });
 
 test("scope work is authorized before capping and missing lineage fails closed", async (t) => {

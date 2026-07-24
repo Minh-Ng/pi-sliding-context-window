@@ -2,7 +2,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { RocksDatabase, versions as bindingVersions } from "@harperfast/rocksdb-js";
-import { ensureSecureStoreDirectory } from "../daemon/paths.js";
+import {
+  ensureSecureStoreDirectory,
+  inspectSecureStoreDirectory,
+} from "../daemon/paths.js";
 import {
   decodeKey,
   encodeKey,
@@ -13,6 +16,17 @@ import {
   prefixSuccessor,
 } from "./keys.js";
 import { ensureAuxiliaryOwnershipIndex } from "./auxiliary-ownership.js";
+import { ensureIndexNamespaceManifest } from "./index-namespace-maintenance.js";
+import {
+  advanceDerivedViewOutbox,
+  advanceDerivedViewManifest,
+  createDerivedViewTombstone,
+  createDocumentOrdinal,
+  derivedViewKeys,
+  documentViewAdmission,
+  ensureDerivedView,
+  MAX_DOCUMENT_ORDINAL,
+} from "./derived-view.js";
 import {
   assertSchemaCompatible,
   CURRENT_SCHEMA,
@@ -20,6 +34,7 @@ import {
   encodeRecord,
   schemaMetadata,
   SchemaCompatibilityError,
+  stableJson,
   STORE_SCHEMA_VERSION,
 } from "./schema.js";
 
@@ -219,6 +234,18 @@ function assertNativeScanBounds(start, end) {
   }
 }
 
+function reverseInclusiveLowerBound(value, maximumBytes) {
+  const bytes = Buffer.from(value);
+  for (let index = bytes.length - 1; index >= 0; index -= 1) {
+    if (bytes[index] === 0) continue;
+    const lower = Buffer.alloc(maximumBytes, 0xff);
+    bytes.copy(lower, 0, 0, index + 1);
+    lower[index] -= 1;
+    return lower;
+  }
+  return Buffer.alloc(0);
+}
+
 function scanLimit(value) {
   if (value === undefined) return DEFAULT_SCAN_LIMIT;
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_SCAN_LIMIT) {
@@ -385,8 +412,20 @@ class StoreView {
     if (limit === 0) return;
     const bounds = nativePrefixBounds(prefix, "scan prefix");
     let { start, end } = bounds;
+    let before;
+    if (options.before !== undefined) {
+      if (options.reverse !== true) throw new TypeError("scan.before is only supported for reverse scans.");
+      before = keyBytes(options.before);
+      if (Buffer.compare(before, bounds.start) < 0 || Buffer.compare(before, bounds.end) >= 0) {
+        throw new RangeError("scan.before must identify a key inside the requested prefix.");
+      }
+      end = before;
+    }
     if (options.after !== undefined) {
       if (options.reverse === true) throw new TypeError("scan.after is only supported for forward scans.");
+      if (options.before !== undefined) {
+        throw new TypeError("scan.after and scan.before cannot be combined.");
+      }
       const after = keyBytes(options.after);
       if (Buffer.compare(after, bounds.start) < 0 || Buffer.compare(after, bounds.end) >= 0) {
         throw new RangeError("scan.after must identify a key inside the requested prefix.");
@@ -403,15 +442,24 @@ class StoreView {
     // rocksdb-js expresses reverse ranges from the upper bound down to the
     // lower bound, unlike its forward lower-to-upper convention.
     const rangeStart = options.reverse === true ? end : start;
-    const rangeEnd = options.reverse === true ? start : end;
+    const rangeEnd = options.reverse === true
+      ? reverseInclusiveLowerBound(start, MAX_ROCKSDB_SCAN_BOUND_BYTES - end.length)
+      : end;
+    let emitted = 0;
     for (const { key, value } of this.dbi.getRange({
       start: rangeStart,
       end: rangeEnd,
       reverse: options.reverse === true,
-      limit,
+      // The native reverse iterator includes its start key. Read one extra
+      // record so `before` can remain an exclusive cursor.
+      limit: before === undefined ? limit : limit + 1,
       fillCache: options.fillCache === true,
     })) {
-      yield recordResult(Buffer.from(key), Buffer.from(value));
+      const recordKey = Buffer.from(key);
+      if (before !== undefined && recordKey.equals(before)) continue;
+      yield recordResult(recordKey, Buffer.from(value));
+      emitted += 1;
+      if (emitted >= limit) break;
     }
   }
 
@@ -483,6 +531,38 @@ function normalizeOutboxPayload(candidate, requestId, recordKeys) {
   return payload;
 }
 
+function assertDerivedViewRecords(admission, preparedRecords) {
+  if (admission === undefined) return;
+  const findPayload = (key) => {
+    const encoded = assertPersistableKey(key, "derived-view source key");
+    const record = preparedRecords.find(({ key: candidate }) => candidate.equals(encoded));
+    return record === undefined ? undefined : decodeRecord(record.value).payload;
+  };
+  const manifest = findPayload([
+    KEYSPACE.DOCUMENT,
+    admission.documentId,
+    admission.documentVersion,
+  ]);
+  if (manifest === undefined
+    || manifest.project !== admission.project
+    || manifest.sessionId !== admission.sessionId
+    || manifest.documentId !== admission.documentId
+    || manifest.version !== admission.documentVersion
+    || manifest.createdAt !== admission.admittedAt) {
+    throw new TypeError("derivedView must match its canonical document manifest.");
+  }
+  for (const marker of admission.retiredDocuments) {
+    const canonical = findPayload([
+      KEYSPACE.SUPERSESSION,
+      marker.documentId,
+      marker.documentVersion,
+    ]);
+    if (canonical === undefined || stableJson(canonical) !== stableJson(marker)) {
+      throw new TypeError("derivedView retirement must match its canonical supersession record.");
+    }
+  }
+}
+
 function hashLength(hash, length) {
   const bytes = Buffer.allocUnsafe(4);
   bytes.writeUInt32BE(length);
@@ -507,7 +587,12 @@ function comparePrepared(left, right) {
 export class RocksStore {
   static async open(path, options = {}) {
     if (typeof path !== "string" || path.length === 0) throw new TypeError("RocksDB path must be a non-empty string.");
-    const absolutePath = ensureSecureStoreDirectory(path);
+    if (options.inspectionOnly === true && options.readOnly !== true) {
+      throw new TypeError("inspectionOnly requires readOnly.");
+    }
+    const absolutePath = options.inspectionOnly === true
+      ? inspectSecureStoreDirectory(path)
+      : ensureSecureStoreDirectory(path);
     const database = RocksDatabase.open(absolutePath, {
       encoding: "binary",
       keyEncoding: "binary",
@@ -523,7 +608,15 @@ export class RocksStore {
     const store = new RocksStore(absolutePath, database, options);
     try {
       const fresh = await store.initializeSchema();
-      await ensureAuxiliaryOwnershipIndex(store, { fresh });
+      // Offline inventory must be able to inspect a pre-upgrade store without
+      // mutating it or requiring unrelated derived views to have been built.
+      // The returned store remains read-only; this narrow mode only skips
+      // startup maintenance and is not suitable for canonical query paths.
+      if (!store.inspectionOnly) {
+        await ensureAuxiliaryOwnershipIndex(store, { fresh });
+        await ensureDerivedView(store, { fresh });
+        if (!store.readOnly) await ensureIndexNamespaceManifest(store);
+      }
       return store;
     } catch (error) {
       store.close();
@@ -535,6 +628,7 @@ export class RocksStore {
     this.path = path;
     this.database = database;
     this.readOnly = options.readOnly === true;
+    this.inspectionOnly = options.inspectionOnly === true;
     this.schema = undefined;
     this.view = new StoreView(this, database);
     this.writeBarrier = new WriteBarrier();
@@ -734,6 +828,7 @@ export class RocksStore {
     mustBeAbsent = [],
     mustMatch = [],
     transitions = [],
+    derivedView,
   } = {}) {
     if (this.readOnly) throw new TypeError("The RocksDB store is read-only.");
     if (typeof requestId !== "string" || requestId.length === 0) {
@@ -770,6 +865,8 @@ export class RocksStore {
       .sort(comparePrepared);
     const recordKeys = preparedRecords.map(({ key }) => key.toString("base64url"));
     const outboxPayload = normalizeOutboxPayload(outbox, requestId, recordKeys);
+    const viewAdmission = documentViewAdmission(derivedView);
+    assertDerivedViewRecords(viewAdmission, preparedRecords);
     const fingerprintOutbox = normalizeCanonicalRecord({
       key: [KEYSPACE.OUTBOX, 0],
       kind: "outbox",
@@ -794,6 +891,12 @@ export class RocksStore {
 
     const encodedMarkerKey = assertPersistableKey(markerKey, "canonical idempotency key");
     const encodedCounterKey = keyBytes(keyFor.counter("outbox"));
+    const encodedOrdinalCounterKey = viewAdmission === undefined
+      ? undefined
+      : keyBytes(keyFor.counter("document-ordinal"));
+    const encodedDerivedViewStateKey = viewAdmission === undefined
+      ? undefined
+      : assertPersistableKey(derivedViewKeys.upgradeState());
     return this.transaction((transaction) => {
       const marker = payloadFromBytes(rawGetSync(transaction.dbi, encodedMarkerKey));
       if (marker !== undefined) {
@@ -805,6 +908,9 @@ export class RocksStore {
           recordKeys: marker.recordKeys,
           outboxKey: marker.outboxKey,
           outboxSequence: marker.outboxSequence,
+          ...(marker.documentOrdinal === undefined
+            ? {}
+            : { documentOrdinal: marker.documentOrdinal }),
         };
       }
       for (const key of absentKeys) {
@@ -859,6 +965,123 @@ export class RocksStore {
       }, "outbox");
       immutablePutSync(transaction.dbi, preparedOutbox.key, preparedOutbox.value);
       const outboxKey = preparedOutbox.key.toString("base64url");
+      let documentOrdinal;
+      if (viewAdmission !== undefined) {
+        const identityKey = assertPersistableKey(derivedViewKeys.document(
+          viewAdmission.project,
+          viewAdmission.documentId,
+          viewAdmission.documentVersion,
+        ));
+        const existingAssignment = payloadFromBytes(
+          rawGetSync(transaction.dbi, identityKey),
+        );
+        let assignment;
+        let admittedOrdinals;
+        if (existingAssignment !== undefined) {
+          assignment = createDocumentOrdinal(viewAdmission, existingAssignment.ordinal);
+          if (stableJson(assignment) !== stableJson(existingAssignment)) {
+            throw new SchemaCompatibilityError(
+              `Document ordinal ${existingAssignment.ordinal} conflicts with its canonical identity.`,
+            );
+          }
+          documentOrdinal = existingAssignment.ordinal;
+          admittedOrdinals = [];
+        } else {
+          const currentOrdinal = payloadFromBytes(
+            rawGetSync(transaction.dbi, encodedOrdinalCounterKey),
+          );
+          documentOrdinal = (currentOrdinal ?? 0) + 1;
+          if (!Number.isSafeInteger(documentOrdinal)
+            || documentOrdinal <= 0
+            || documentOrdinal > MAX_DOCUMENT_ORDINAL) {
+            throw new RangeError("Document ordinal counter exceeded the uint32 range.");
+          }
+          transaction.dbi.putSync(
+            encodedOrdinalCounterKey,
+            writeBytes(encodedOrdinalCounterKey, documentOrdinal, { kind: "counter" }),
+          );
+          assignment = createDocumentOrdinal(viewAdmission, documentOrdinal);
+          admittedOrdinals = [documentOrdinal];
+          for (const [key, kind] of [
+            [
+              derivedViewKeys.document(
+                assignment.project,
+                assignment.documentId,
+                assignment.documentVersion,
+              ),
+              "document-ordinal",
+            ],
+            [derivedViewKeys.ordinal(documentOrdinal), "document-ordinal"],
+            [
+              derivedViewKeys.projectDocument(assignment.project, documentOrdinal),
+              "derived-view-project-member",
+            ],
+            [
+              derivedViewKeys.sessionDocument(
+                assignment.project,
+                assignment.sessionId,
+                documentOrdinal,
+              ),
+              "derived-view-session-member",
+            ],
+          ]) {
+            const encoded = assertPersistableKey(key);
+            immutablePutSync(
+              transaction.dbi,
+              encoded,
+              writeBytes(encoded, assignment, { kind }),
+            );
+          }
+        }
+
+        const tombstonedOrdinals = [];
+        for (const retired of viewAdmission.retiredDocuments) {
+          const targetKey = assertPersistableKey(derivedViewKeys.document(
+            viewAdmission.project,
+            retired.documentId,
+            retired.documentVersion,
+          ));
+          const target = payloadFromBytes(rawGetSync(transaction.dbi, targetKey));
+          if (target === undefined) {
+            throw new SchemaCompatibilityError(
+              `Retired document ${retired.documentId}@${retired.documentVersion} has no ordinal.`,
+            );
+          }
+          const tombstoneKey = assertPersistableKey(
+            derivedViewKeys.tombstone(target.project, target.ordinal),
+          );
+          const tombstone = createDerivedViewTombstone(target, retired);
+          const status = immutablePutSync(
+            transaction.dbi,
+            tombstoneKey,
+            writeBytes(tombstoneKey, tombstone, { kind: "derived-view-tombstone" }),
+          );
+          if (status === "inserted") tombstonedOrdinals.push(target.ordinal);
+        }
+        const activeKey = assertPersistableKey(derivedViewKeys.active(assignment.project));
+        const active = payloadFromBytes(rawGetSync(transaction.dbi, activeKey));
+        transaction.dbi.putSync(activeKey, writeBytes(
+          activeKey,
+          advanceDerivedViewManifest(active, {
+            project: assignment.project,
+            admittedOrdinals,
+            tombstonedOrdinals,
+            updatedAt: committedAt,
+          }),
+          { kind: "derived-view-manifest" },
+        ));
+        const upgrade = payloadFromBytes(
+          rawGetSync(transaction.dbi, encodedDerivedViewStateKey),
+        );
+        transaction.dbi.putSync(
+          encodedDerivedViewStateKey,
+          writeBytes(
+            encodedDerivedViewStateKey,
+            advanceDerivedViewOutbox(upgrade, outboxSequence),
+            { kind: "derived-view-upgrade-state" },
+          ),
+        );
+      }
       immutablePutSync(transaction.dbi, encodedMarkerKey, writeBytes(encodedMarkerKey, {
         requestId,
         fingerprint,
@@ -866,6 +1089,7 @@ export class RocksStore {
         outboxKey,
         outboxSequence,
         committedAt,
+        ...(documentOrdinal === undefined ? {} : { documentOrdinal }),
       }, { kind: "idempotency" }));
       return {
         requestId,
@@ -874,6 +1098,7 @@ export class RocksStore {
         recordKeys,
         outboxKey,
         outboxSequence,
+        ...(documentOrdinal === undefined ? {} : { documentOrdinal }),
       };
     });
   }

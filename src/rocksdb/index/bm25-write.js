@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
+import { encodeKey } from "../keys.js";
 import {
   MAX_BM25_ANALYZED_TOKENS_PER_DOCUMENT,
   MAX_BM25_TERM_WINDOWS_PER_DOCUMENT,
@@ -24,6 +25,11 @@ import {
   positiveInteger,
   requireView,
 } from "./bm25-keys.js";
+import {
+  encodePostingLocator,
+  POSTING_LOCATOR_KIND,
+} from "./posting-locator.js";
+import { encodeBm25PostingBlock } from "./posting-block.js";
 
 // Subtoken splitting indexes each camelCase/snake_case identifier under both
 // its compound term and its pieces, roughly doubling unique terms for
@@ -618,35 +624,6 @@ async function prepareDelete(context, project) {
   const mutations = [];
   const changedDf = new Map();
   for (const { term, documentFrequency: contribution, windowOrdinals } of metadata.terms) {
-    for (const windowOrdinal of windowOrdinals) {
-      mutations.push({
-        type: "remove",
-        key: bm25Keys.posting(
-          project,
-          term,
-          metadata.bucket,
-          metadata.createdAt,
-          metadata.documentId,
-          metadata.documentVersion,
-          metadata.generation,
-          windowOrdinal,
-        ),
-      });
-      mutations.push({
-        type: "remove",
-        key: bm25Keys.sessionPosting(
-          project,
-          metadata.sessionId,
-          term,
-          metadata.bucket,
-          metadata.createdAt,
-          metadata.documentId,
-          metadata.documentVersion,
-          metadata.generation,
-          windowOrdinal,
-        ),
-      });
-    }
     const priorTermStatistics = await termStatisticsBefore(
       context.view,
       project,
@@ -666,41 +643,31 @@ async function prepareDelete(context, project) {
       generation: context.generation,
       documentFrequency,
     };
-    if (priorTermStatistics !== undefined) {
-      mutations.push({
-        type: "remove",
-        key: bm25Keys.termStatistics(project, term, priorTermStatistics.generation),
-      });
-    }
-    if (documentFrequency === 0) {
-      mutations.push({
-        type: "put",
-        immutable: false,
-        key: bm25Keys.termStatisticsCurrent(project, term),
-        kind: "bm25-current-term-statistics",
-        payload,
-      });
-      mutations.push({
-        type: "remove",
-        stagePhase: "cleanup",
-        key: bm25Keys.termStatisticsCurrent(project, term),
-      });
-    } else {
-      mutations.push({
-        type: "put",
-        immutable: false,
-        key: bm25Keys.termStatistics(project, term, context.generation),
-        kind: "bm25-term-statistics",
-        payload,
-      });
-      mutations.push({
-        type: "put",
-        immutable: false,
-        key: bm25Keys.termStatisticsCurrent(project, term),
-        kind: "bm25-current-term-statistics",
-        payload,
-      });
-    }
+    mutations.push({
+      type: "put",
+      key: bm25Keys.termStatistics(project, term, context.generation),
+      kind: "bm25-term-statistics",
+      payload,
+    });
+    mutations.push({
+      type: "put",
+      immutable: false,
+      key: bm25Keys.termStatisticsCurrent(project, term),
+      kind: "bm25-current-term-statistics",
+      payload,
+    });
+    mutations.push({
+      type: "put",
+      key: bm25Keys.termDelta(project, term, context.generation),
+      kind: "bm25-term-statistics-delta",
+      payload: {
+        bm25StatisticsVersion: BM25_INDEX_VERSION,
+        project,
+        term,
+        generation: context.generation,
+        documentFrequencyDelta: -contribution,
+      },
+    });
   }
   mutations.push(
     {
@@ -708,14 +675,8 @@ async function prepareDelete(context, project) {
       key: bm25Keys.current(project, metadata.documentId),
       stagePhase: "publish",
     },
-    { type: "remove", key: bm25Keys.document(project, metadata.documentId, metadata.documentVersion) },
-    ...(metadata.shardKeys ?? []).map((key) => ({ type: "remove", key })),
-    { type: "remove", key: bm25Keys.identity(metadata.documentId) },
-    { type: "remove", key: bm25Keys.corpus(project, priorCorpus.generation) },
-    { type: "remove", key: bm25Keys.generation(priorCorpus.generation, project) },
     {
       type: "put",
-      immutable: false,
       key: bm25Keys.corpus(project, context.generation),
       kind: "bm25-corpus-statistics",
       payload: corpus,
@@ -729,7 +690,19 @@ async function prepareDelete(context, project) {
     },
     {
       type: "put",
-      immutable: false,
+      key: bm25Keys.corpusDelta(project, context.generation),
+      kind: "bm25-corpus-statistics-delta",
+      payload: {
+        bm25StatisticsVersion: BM25_INDEX_VERSION,
+        project,
+        generation: context.generation,
+        documentCountDelta: -metadata.windowCount,
+        totalDocumentLengthDelta: -metadata.totalLength,
+        totalWeightedDocumentLengthDelta: -metadata.totalWeightedLength,
+      },
+    },
+    {
+      type: "put",
       key: bm25Keys.generation(context.generation, project),
       kind: "bm25-generation",
       payload: {
@@ -847,41 +820,9 @@ export function createBm25IndexHandler(options = {}) {
       });
       const mutations = [];
       const changedDf = new Map();
+      const termDeltas = new Map();
 
       if (!sameVersion) {
-        if (previousMetadata) {
-          for (const { term, windowOrdinals } of previousMetadata.terms) {
-            for (const windowOrdinal of windowOrdinals) {
-              mutations.push({
-                type: "remove",
-                key: bm25Keys.posting(
-                  project,
-                  term,
-                  previousMetadata.bucket,
-                  previousMetadata.createdAt,
-                  manifest.documentId,
-                  previousMetadata.documentVersion,
-                  previousMetadata.generation,
-                  windowOrdinal,
-                ),
-              });
-              mutations.push({
-                type: "remove",
-                key: bm25Keys.sessionPosting(
-                  project,
-                  previousMetadata.sessionId,
-                  term,
-                  previousMetadata.bucket,
-                  previousMetadata.createdAt,
-                  manifest.documentId,
-                  previousMetadata.documentVersion,
-                  previousMetadata.generation,
-                  windowOrdinal,
-                ),
-              });
-            }
-          }
-        }
         const allTerms = new Set([...previousTerms.keys(), ...newTermFrequencies.keys()]);
         for (const term of [...allTerms].sort()) {
           const priorTermStatistics = await termStatisticsBefore(
@@ -898,6 +839,10 @@ export function createBm25IndexHandler(options = {}) {
             throw new Error(`BM25 document frequency for ${term} is inconsistent with the corpus.`);
           }
           changedDf.set(term, documentFrequency);
+          termDeltas.set(
+            term,
+            (newTermFrequencies.get(term) ?? 0) - (previousTerms.get(term) ?? 0),
+          );
           const payload = {
             bm25StatisticsVersion: BM25_INDEX_VERSION,
             project,
@@ -905,41 +850,31 @@ export function createBm25IndexHandler(options = {}) {
             generation: context.generation,
             documentFrequency,
           };
-          if (priorTermStatistics !== undefined) {
-            mutations.push({
-              type: "remove",
-              key: bm25Keys.termStatistics(project, term, priorTermStatistics.generation),
-            });
-          }
-          if (documentFrequency === 0) {
-            mutations.push({
-              type: "put",
-              immutable: false,
-              key: bm25Keys.termStatisticsCurrent(project, term),
-              kind: "bm25-current-term-statistics",
-              payload,
-            });
-            mutations.push({
-              type: "remove",
-              stagePhase: "cleanup",
-              key: bm25Keys.termStatisticsCurrent(project, term),
-            });
-          } else {
-            mutations.push({
-              type: "put",
-              immutable: false,
-              key: bm25Keys.termStatistics(project, term, context.generation),
-              kind: "bm25-term-statistics",
-              payload,
-            });
-            mutations.push({
-              type: "put",
-              immutable: false,
-              key: bm25Keys.termStatisticsCurrent(project, term),
-              kind: "bm25-current-term-statistics",
-              payload,
-            });
-          }
+          mutations.push({
+            type: "put",
+            key: bm25Keys.termStatistics(project, term, context.generation),
+            kind: "bm25-term-statistics",
+            payload,
+          });
+          mutations.push({
+            type: "put",
+            immutable: false,
+            key: bm25Keys.termStatisticsCurrent(project, term),
+            kind: "bm25-current-term-statistics",
+            payload,
+          });
+          mutations.push({
+            type: "put",
+            key: bm25Keys.termDelta(project, term, context.generation),
+            kind: "bm25-term-statistics-delta",
+            payload: {
+              bm25StatisticsVersion: BM25_INDEX_VERSION,
+              project,
+              term,
+              generation: context.generation,
+              documentFrequencyDelta: termDeltas.get(term),
+            },
+          });
         }
       }
 
@@ -976,25 +911,24 @@ export function createBm25IndexHandler(options = {}) {
             ...source,
             window: storedPostingWindow(window),
           };
+          const canonicalKey = bm25Keys.posting(
+            project,
+            term,
+            metadata.bucket,
+            manifest.createdAt,
+            manifest.documentId,
+            manifest.version,
+            context.generation,
+            window.ordinal,
+          );
           mutations.push({
             type: "put",
-            immutable: false,
-            key: bm25Keys.posting(
-              project,
-              term,
-              metadata.bucket,
-              manifest.createdAt,
-              manifest.documentId,
-              manifest.version,
-              context.generation,
-              window.ordinal,
-            ),
+            key: canonicalKey,
             kind: "bm25-posting",
-            payload,
+            payload: encodeBm25PostingBlock(payload),
           });
           mutations.push({
             type: "put",
-            immutable: false,
             key: bm25Keys.sessionPosting(
               project,
               manifest.sessionId,
@@ -1006,8 +940,11 @@ export function createBm25IndexHandler(options = {}) {
               context.generation,
               window.ordinal,
             ),
-            kind: "bm25-session-posting",
-            payload,
+            kind: "bm25-session-posting-locator",
+            payload: encodePostingLocator(
+              POSTING_LOCATOR_KIND.BM25_SESSION,
+              [encodeKey(canonicalKey)],
+            ),
           });
         }
       }
@@ -1023,16 +960,6 @@ export function createBm25IndexHandler(options = {}) {
           project,
         },
       });
-      if (priorCorpus.generation > 0) {
-        mutations.push({
-          type: "remove",
-          key: bm25Keys.corpus(project, priorCorpus.generation),
-        });
-        mutations.push({
-          type: "remove",
-          key: bm25Keys.generation(priorCorpus.generation, project),
-        });
-      }
       mutations.push({
         type: "put",
         immutable: false,
@@ -1050,7 +977,6 @@ export function createBm25IndexHandler(options = {}) {
       });
       mutations.push({
         type: "put",
-        immutable: false,
         key: bm25Keys.corpus(project, context.generation),
         kind: "bm25-corpus-statistics",
         payload: corpus,
@@ -1064,7 +990,19 @@ export function createBm25IndexHandler(options = {}) {
       });
       mutations.push({
         type: "put",
-        immutable: false,
+        key: bm25Keys.corpusDelta(project, context.generation),
+        kind: "bm25-corpus-statistics-delta",
+        payload: {
+          bm25StatisticsVersion: BM25_INDEX_VERSION,
+          project,
+          generation: context.generation,
+          documentCountDelta: addedWindowCount - removedWindowCount,
+          totalDocumentLengthDelta: addedLength - removedLength,
+          totalWeightedDocumentLengthDelta: addedWeightedLength - removedWeightedLength,
+        },
+      });
+      mutations.push({
+        type: "put",
         key: bm25Keys.generation(context.generation, project),
         kind: "bm25-generation",
         payload: {

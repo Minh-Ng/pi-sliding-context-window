@@ -178,6 +178,7 @@ test("natural deployment wording triggers continuity for an archived decision ca
     {
       kind: "decision-candidate",
       sourceKey: "assistant:canary-color-decision",
+      sessionId: "source-session",
       createdAt: 300,
     },
   );
@@ -186,7 +187,12 @@ test("natural deployment wording triggers continuity for an archived decision ca
   const response = await preflightArchive(store, request(
     "user:natural-decision",
     "What deployment color are used for canary deploys",
-    { includeDiagnostics: true },
+    {
+      scope: "project",
+      sessionId: "cold-session",
+      sessionIds: ["cold-session"],
+      includeDiagnostics: true,
+    },
   ), { now: 1_000 });
 
   assert.equal(response.hints.length, 1);
@@ -194,6 +200,7 @@ test("natural deployment wording triggers continuity for an archived decision ca
   assert.match(response.modelVisibleText, /used/u);
   assert.match(response.modelVisibleText, /canary/u);
   assert.match(response.modelVisibleText, /deploys/u);
+  assert.match(response.modelVisibleText, /context_window_search scope="project"/u);
   assert.doesNotMatch(response.modelVisibleText, /RECALL_PROBE_7F3A|cobalt/u);
   assert.deepEqual(response.diagnostics, {
     outcome: "continuity-marker",
@@ -227,6 +234,19 @@ test("explicit recall can retrieve a decision from an earlier session in the sam
     },
   );
   await worker.drain();
+
+  const sessionOnly = await searchArchive(store, {
+    query: "Recall: What color is used for canary deploys?",
+    relation: null,
+    scope: "session",
+    sessionId: "cold-session",
+    sessionIds: ["cold-session"],
+    project: "/fixture/project",
+    limit: 5,
+    excludeVisibleSourceKeys: [],
+    hintBudgetTokens: 160,
+  }, { now: 1_000, ownerId: "cold-session-isolation-test" });
+  assert.equal(sessionOnly.results.length, 0);
 
   const response = await preflightArchive(store, request(
     "user:cold-project-recall",

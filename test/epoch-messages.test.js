@@ -309,7 +309,28 @@ test("automatic retrieval diagnostics preserve the last sanitized preflight deci
       margin: 0.5,
     },
     messageKey: messageKey(prompt),
+    scope: "project",
   });
+});
+
+test("automatic preflight honors configured recall scope modes", () => {
+  for (const scope of ["session", "project", "all"]) {
+    const archive = memoryArchive();
+    const requests = [];
+    archive.preflight = (request) => {
+      requests.push(request);
+      return { modelVisibleText: "", hints: [] };
+    };
+    const session = new EpochWindowSession({
+      archive,
+      config: { ...config, automaticRetrieval: true, recallScope: scope },
+      sessionId: `scope-${scope}`,
+      project: "/project",
+    });
+    session.process([user(`recall within ${scope}`, 1)]);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].scope, scope);
+  }
 });
 
 test("rotation sends retained user keys under one unchanged active hint budget", () => {

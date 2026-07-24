@@ -27,6 +27,7 @@ import {
   TOC_TOKEN_BUDGET,
   turnTopic,
 } from "./window.js";
+import { automaticRecallScope } from "../retrieval/recall-scope.js";
 import { deriveSessionContextTerms } from "./session-context.js";
 import {
   measureToolResultTokens,
@@ -113,6 +114,7 @@ export class EpochWindowSession {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
     this.activeMessages = undefined;
+    this.activeVisibleSourceKeys = Object.freeze([]);
     this.toolResultBudget = undefined;
     this.rotations = 0;
     this.forceRotation = false;
@@ -170,6 +172,7 @@ export class EpochWindowSession {
     this.observedActiveUserKeys = new Set();
     this.pendingHintRemovalKeys = new Set();
     this.hintReconciledBoundaryKey = undefined;
+    this.activeVisibleSourceKeys = Object.freeze([]);
     // Search lineage is authoritative only when supplied from verified session headers.
     this.sessionIds = new Set([this.sessionId, ...this.initialSessionIds]);
     if (!Array.isArray(entries)) {
@@ -440,6 +443,11 @@ export class EpochWindowSession {
       suppressedHintMessageKeys,
     );
     this.activeTurns = this.countUserTurns(active);
+    // Completed turns are durably archived on agent_settled even while their
+    // original messages remain in this provider window. Keep the pre-transform
+    // identities so explicit archive tools can mask that visible source instead
+    // of retrieving the model's own current context as historical evidence.
+    this.activeVisibleSourceKeys = Object.freeze([...new Set(visibleSourceKeys)]);
     this.activeMessages = marker ? [marker, ...active] : active;
     this.activeTokens = estimateTokens(this.activeMessages);
     // Measure over the final retained slice: this recomputes the same counter
@@ -485,6 +493,7 @@ export class EpochWindowSession {
       "retainTurns",
       "toolResultBudgetRatio",
       "toolResultBudgetFloorTokens",
+      "recallScope",
       "models",
       "environmentOverrides",
     ]) {
@@ -748,6 +757,7 @@ export class EpochWindowSession {
     this.activeTokens = undefined;
     this.activeTurns = undefined;
     this.activeMessages = undefined;
+    this.activeVisibleSourceKeys = Object.freeze([]);
     this.toolResultBudget = undefined;
   }
 
@@ -770,6 +780,12 @@ export class EpochWindowSession {
 
   searchDetailed(query, options = {}) {
     const sessionContext = options.sessionContext ?? this.sessionContextDigest();
+    const excludeVisibleSourceKeys = [...new Set([
+      ...this.activeVisibleSourceKeys,
+      ...(Array.isArray(options.excludeVisibleSourceKeys)
+        ? options.excludeVisibleSourceKeys
+        : []),
+    ])];
     const searchOptions = {
       sessionId: this.sessionId,
       sessionIds: [...this.sessionIds],
@@ -779,6 +795,7 @@ export class EpochWindowSession {
       relation: options.relation,
       expansionTerms: options.expansionTerms,
       workingSet: options.workingSet,
+      excludeVisibleSourceKeys,
       ...(sessionContext.length > 0 ? { sessionContext } : {}),
       ...(Number.isSafeInteger(options.hintBudgetTokens) ? { hintBudgetTokens: options.hintBudgetTokens } : {}),
     };
@@ -797,6 +814,12 @@ export class EpochWindowSession {
 
   gatherDetailed(query, options = {}) {
     const sessionContext = options.sessionContext ?? this.sessionContextDigest();
+    const excludeVisibleSourceKeys = [...new Set([
+      ...this.activeVisibleSourceKeys,
+      ...(Array.isArray(options.excludeVisibleSourceKeys)
+        ? options.excludeVisibleSourceKeys
+        : []),
+    ])];
     const gatherOptions = {
       sessionId: this.sessionId,
       sessionIds: [...this.sessionIds],
@@ -812,7 +835,7 @@ export class EpochWindowSession {
       neighborhoodAnchors: options.neighborhoodAnchors,
       maxEvidence: options.maxEvidence,
       maxTokens: options.maxTokens ?? this.config.searchResultTokens * 4,
-      excludeVisibleSourceKeys: options.excludeVisibleSourceKeys,
+      excludeVisibleSourceKeys,
     };
     if (typeof this.archive.gatherDetailed === "function") {
       return this.archive.gatherDetailed(query, gatherOptions);
@@ -1013,15 +1036,14 @@ export class EpochWindowSession {
         hintStateChanged = true;
       }
       try {
+        // Auto continuity is project-scoped so a cold session can discover
+        // eligible discussion from earlier sessions. An explicit setting may
+        // narrow or widen this request; daemon authorization still caps `all`.
+        const preflightScope = automaticRecallScope(this.config.recallScope);
         const response = this.archive.preflight({
           messageKey: targetKey,
           message,
-          // Automatic continuity is project-scoped so a cold session can
-          // discover eligible discussion from earlier sessions in the same
-          // authorized project. Disclosure policy still limits implicit
-          // matches to a marker and requires explicit history intent before
-          // archived source text is surfaced.
-          scope: "project",
+          scope: preflightScope,
           sessionId: this.sessionId,
           sessionIds: [...this.sessionIds],
           project: this.project,
@@ -1047,6 +1069,7 @@ export class EpochWindowSession {
           this.lastAutomaticRetrieval = Object.freeze({
             ...structuredClone(response.diagnostics),
             messageKey: targetKey,
+            scope: preflightScope,
           });
         }
         if (modelVisibleText) {

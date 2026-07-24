@@ -20,6 +20,7 @@ import { createNearDuplicateIndexHandler } from "../rocksdb/index/simhash.js";
 import { IndexWorker } from "../rocksdb/indexer.js";
 import { outboxKeys, outboxMetrics } from "../rocksdb/outbox.js";
 import { scanStatusPrefix } from "../rocksdb/status-scan.js";
+import { derivedViewStatus } from "../rocksdb/derived-view.js";
 import {
   migrationRetentionGate,
   prepareMigrationAdmission,
@@ -1446,9 +1447,10 @@ export class DaemonOperations {
   }
 
   async status(project) {
-    const [retention, outbox] = await Promise.all([
+    const [retention, outbox, derivedView] = await Promise.all([
       retentionStatus(this.store, project === undefined ? {} : { project }),
       outboxMetrics(this.store),
+      derivedViewStatus(this.store, project === undefined ? {} : { project }),
     ]);
     let eventCount = 0;
     const eventScan = await scanStatusPrefix(this.store, [KEYSPACE.EVENT], ({ payload }) => {
@@ -1502,6 +1504,7 @@ export class DaemonOperations {
           : { oldestPendingAgeMs: outbox.oldestPendingAgeMs }),
       },
       index: { generation: publication?.generation ?? 0 },
+      derivedView,
       memory: processMemoryStatus(),
       semantic: this.semantic.status(),
       reranker: this.reranker.status(),

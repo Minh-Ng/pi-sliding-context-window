@@ -830,6 +830,39 @@ test("gatherDetailed forwards the same automatically-computed sessionContext dig
   assert.ok(gatherOptions.sessionContext.length > 0);
 });
 
+test("explicit search and gather mask every source message still visible in the active window", () => {
+  const archive = memoryArchive();
+  let searchOptions;
+  let gatherOptions;
+  archive.searchDetailed = (_query, options) => {
+    searchOptions = options;
+    return { mode: "lexical", status: "not-found", results: [] };
+  };
+  archive.gatherDetailed = (_query, options) => {
+    gatherOptions = options;
+    return { status: "not-found", mode: "lexical", intent: "auto", anchorCount: 0, candidateCount: 0, returnedTokens: 0, truncated: false, hasMore: false, evidence: [] };
+  };
+  const session = new EpochWindowSession({
+    archive,
+    config,
+    sessionId: "session-1",
+    project: "/project",
+  });
+  const messages = contextRichMessages();
+  session.process(messages, { contextWindow: 200_000 });
+  const expected = [...messages.map(messageKey), "caller-visible-source"];
+
+  session.searchDetailed("some query", {
+    excludeVisibleSourceKeys: ["caller-visible-source", messageKey(messages[0])],
+  });
+  session.gatherDetailed("some query", {
+    excludeVisibleSourceKeys: ["caller-visible-source", messageKey(messages[0])],
+  });
+
+  assert.deepEqual(searchOptions.excludeVisibleSourceKeys, expected);
+  assert.deepEqual(gatherOptions.excludeVisibleSourceKeys, expected);
+});
+
 test("an explicit sessionContext option overrides the automatic digest", () => {
   const archive = memoryArchive();
   let searchOptions;

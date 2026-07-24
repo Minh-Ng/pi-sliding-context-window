@@ -1,9 +1,14 @@
-import { KEYSPACE } from "../keys.js";
+import { encodeKey, KEYSPACE } from "../keys.js";
 import { manifestKeys, retiredDocumentStatus } from "../manifests.js";
 import { readDocumentRange } from "../document-range.js";
 import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
 import { assertVisibleSourceKeys } from "../../store/store-contract.js";
 import { DEFAULT_RETENTION_CLASS_BY_KIND } from "../../daemon/retention-policy.js";
+import {
+  derivedViewKeys,
+  documentOrdinalLiveness,
+  isDerivedViewQueryCutover,
+} from "../derived-view.js";
 import { tokenizeBm25Query } from "./tokenizer.js";
 import {
   bm25Keys,
@@ -16,11 +21,21 @@ import {
   requireView,
   resolveGeneration,
 } from "./bm25-keys.js";
+import {
+  decodePostingLocator,
+  isPostingLocator,
+  POSTING_LOCATOR_KIND,
+} from "./posting-locator.js";
+import {
+  decodeBm25PostingBlock,
+  isPostingBlock,
+} from "./posting-block.js";
 
 export const DEFAULT_BM25_PARAMETERS = Object.freeze({ k1: 1.2, b: 0.75 });
 export const DEFAULT_BM25_SEARCH_LIMITS = Object.freeze({
   maxQueryTerms: 20,
   maxPostingRecords: 10_000,
+  maxPhysicalPostingRecords: MAX_SCAN_LIMIT,
   maxWindowCandidates: 4_000,
   maxSnippetCharacters: 280,
   maxLineageSessions: 64,
@@ -178,6 +193,12 @@ function normalizeSearchOptions(options = {}) {
       "maxPostingRecords",
       MAX_SCAN_LIMIT,
     ),
+    maxPhysicalPostingRecords: bounded(
+      options.maxPhysicalPostingRecords,
+      DEFAULT_BM25_SEARCH_LIMITS.maxPhysicalPostingRecords,
+      "maxPhysicalPostingRecords",
+      MAX_SCAN_LIMIT,
+    ),
     maxWindowCandidates: bounded(
       options.maxWindowCandidates,
       DEFAULT_BM25_SEARCH_LIMITS.maxWindowCandidates,
@@ -250,12 +271,75 @@ function visibleSource(posting, excluded) {
 }
 
 function comparePostingRecency(left, right) {
-  return right.payload.bucket - left.payload.bucket
-    || right.payload.createdAt - left.payload.createdAt
+  const leftBucket = left.payload?.bucket ?? left.key[8];
+  const rightBucket = right.payload?.bucket ?? right.key[8];
+  const leftCreatedAt = left.payload?.createdAt ?? left.key[9];
+  const rightCreatedAt = right.payload?.createdAt ?? right.key[9];
+  return rightBucket - leftBucket
+    || rightCreatedAt - leftCreatedAt
     || Buffer.compare(right.keyBytes, left.keyBytes);
 }
 
-function scanTermPostings(view, project, term, request, limit) {
+async function resolveSessionPostingLocators(view, records) {
+  const resolved = [];
+  let canonicalPostingsRead = 0;
+  for (const record of records) {
+    if (!isPostingLocator(record.payload)) {
+      resolved.push(record);
+      continue;
+    }
+    const locator = decodePostingLocator(
+      record.payload,
+      POSTING_LOCATOR_KIND.BM25_SESSION,
+    );
+    if (locator.targets.length !== 1) {
+      throw new Error("BM25 session posting locator must have exactly one canonical target.");
+    }
+    const [
+      ,
+      ,
+      ,
+      ,
+      ,
+      project,
+      sessionId,
+      term,
+      bucket,
+      createdAt,
+      documentId,
+      version,
+      generation,
+      windowOrdinal,
+    ] = record.key;
+    const expected = encodeKey(bm25Keys.posting(
+      project,
+      term,
+      bucket,
+      createdAt,
+      documentId,
+      version,
+      generation,
+      windowOrdinal,
+    ));
+    if (!locator.targets[0].equals(expected)) {
+      throw new Error("BM25 session posting locator does not match its canonical key.");
+    }
+    const stored = await view.get(locator.targets[0]);
+    canonicalPostingsRead += 1;
+    if (stored === undefined) continue;
+    const payload = isPostingBlock(stored) ? decodeBm25PostingBlock(stored) : stored;
+    if (payload.sessionId !== sessionId) {
+      throw new Error("BM25 session posting locator crosses session scope.");
+    }
+    resolved.push(Object.freeze({ ...record, payload }));
+  }
+  return Object.freeze({
+    records: Object.freeze(resolved),
+    canonicalPostingsRead,
+  });
+}
+
+async function scanTermPostings(view, project, term, request, limit) {
   if (request.scope !== "session") {
     const records = view.scan(bm25Keys.postingPrefix(project, term), {
       reverse: true,
@@ -264,33 +348,45 @@ function scanTermPostings(view, project, term, request, limit) {
     return Object.freeze({
       records,
       recordsScanned: records.length,
+      canonicalPostingsRead: 0,
       truncated: records.length === limit,
     });
   }
   const states = request.sessionIds.map((sessionId) => ({
     prefix: bm25Keys.sessionPostingPrefix(project, sessionId, term),
-    requested: 0,
     records: [],
     consumed: 0,
+    before: undefined,
     exhausted: false,
   }));
   const records = [];
   let recordsScanned = 0;
+  // Session records may be compact locators that require one canonical point
+  // read. Reserve half the physical budget for that worst case so the whole
+  // term remains bounded even when every selected record is a locator.
+  const recordLimit = Math.max(1, Math.floor(limit / 2));
+  let scanBudgetExhausted = false;
   const available = (state) => {
     if (state.consumed < state.records.length) return true;
     if (state.exhausted) return false;
-    const nextLimit = state.requested === 0 ? 1 : Math.min(limit, state.requested * 2);
-    if (nextLimit === state.requested) {
-      state.exhausted = true;
+    if (recordsScanned >= recordLimit) {
+      scanBudgetExhausted = true;
       return false;
     }
-    state.records = view.scan(state.prefix, { reverse: true, limit: nextLimit });
-    state.requested = nextLimit;
-    state.exhausted = state.records.length < nextLimit;
+    state.records = view.scan(state.prefix, {
+      reverse: true,
+      limit: 1,
+      ...(state.before === undefined ? {} : { before: state.before }),
+    });
+    state.consumed = 0;
+    state.exhausted = state.records.length === 0;
     recordsScanned += state.records.length;
+    if (state.records.at(-1)?.keyBytes !== undefined) {
+      state.before = state.records.at(-1).keyBytes;
+    }
     return state.consumed < state.records.length;
   };
-  while (records.length < limit) {
+  while (records.length < recordLimit) {
     let newest;
     for (const state of states) {
       if (!available(state)) continue;
@@ -303,9 +399,15 @@ function scanTermPostings(view, project, term, request, limit) {
     records.push(newest.record);
     newest.state.consumed += 1;
   }
-  const truncated = records.length === limit && states.some((state) =>
-    state.consumed < state.records.length || !state.exhausted);
-  return Object.freeze({ records, recordsScanned, truncated });
+  const truncated = scanBudgetExhausted || (records.length === recordLimit && states.some((state) =>
+    state.consumed < state.records.length || !state.exhausted));
+  const hydrated = await resolveSessionPostingLocators(view, records);
+  return Object.freeze({
+    records: hydrated.records,
+    recordsScanned,
+    canonicalPostingsRead: hydrated.canonicalPostingsRead,
+    truncated,
+  });
 }
 
 function snippetForCandidate(sourceText, candidate, maxCharacters, sourceRange) {
@@ -461,6 +563,7 @@ export async function searchBm25(view, request = {}, options = {}) {
     return Object.freeze({ generation: publishedGeneration, results: Object.freeze([]), work: Object.freeze({
       postingRecordsRead: 0,
       postingRecordsScanned: 0,
+      canonicalPostingsRead: 0,
       windowCandidates: 0,
       supersessionChecks: 0,
       truncated: false,
@@ -477,6 +580,7 @@ export async function searchBm25(view, request = {}, options = {}) {
     return Object.freeze({ generation: statistics.generation, results: Object.freeze([]), work: Object.freeze({
       postingRecordsRead: 0,
       postingRecordsScanned: 0,
+      canonicalPostingsRead: 0,
       windowCandidates: 0,
       supersessionChecks: 0,
       truncated: false,
@@ -494,9 +598,13 @@ export async function searchBm25(view, request = {}, options = {}) {
   const excluded = new Set(searchRequest.excludeVisibleSourceKeys);
   let postingRecordsRead = 0;
   let postingRecordsScanned = 0;
+  let canonicalPostingsRead = 0;
   let supersessionChecks = 0;
   let truncated = false;
   const supersession = new Map();
+  const derivedViewAuthoritative = isDerivedViewQueryCutover(
+    await view.get(derivedViewKeys.queryCutover()),
+  );
   // expiredRetentionClasses (declared above, possibly shared with a sibling
   // exact lookup) is keyed by documentId so the same expired document is
   // never double-counted across its stale windows/terms or a later
@@ -508,21 +616,32 @@ export async function searchBm25(view, request = {}, options = {}) {
       truncated = true;
       break;
     }
+    const physicalRemaining = normalized.maxPhysicalPostingRecords
+      - postingRecordsScanned
+      - canonicalPostingsRead;
+    if (physicalRemaining <= 0) {
+      truncated = true;
+      break;
+    }
     const {
       records: postings,
       recordsScanned,
+      canonicalPostingsRead: termCanonicalPostingsRead,
       truncated: termTruncated,
-    } = scanTermPostings(
+    } = await scanTermPostings(
       view,
       project,
       term,
       searchRequest,
-      remaining,
+      physicalRemaining,
     );
-    postingRecordsRead += postings.length;
     postingRecordsScanned += recordsScanned;
+    canonicalPostingsRead += termCanonicalPostingsRead;
     if (termTruncated) truncated = true;
-    for (const { payload: posting } of postings) {
+    for (const record of postings) {
+      const posting = isPostingBlock(record.payload)
+        ? decodeBm25PostingBlock(record.payload)
+        : record.payload;
       if (!Number.isSafeInteger(posting.generation)
         || posting.generation <= 0
         || posting.generation > statistics.generation) continue;
@@ -536,11 +655,20 @@ export async function searchBm25(view, request = {}, options = {}) {
       const versionIdentity = `${posting.documentId}\0${posting.documentVersion}`;
       let isSuperseded = supersession.get(versionIdentity);
       if (isSuperseded === undefined) {
-        const marker = view.scan([
-          KEYSPACE.SUPERSESSION,
-          posting.documentId,
-          posting.documentVersion,
-        ], { limit: 1 })[0]?.payload;
+        const ordinal = await documentOrdinalLiveness(view, {
+          project,
+          documentId: posting.documentId,
+          version: posting.documentVersion,
+          authoritative: derivedViewAuthoritative,
+        });
+        const marker = ordinal === undefined
+          || (!ordinal.authoritative && ordinal.tombstone === undefined)
+          ? view.scan([
+              KEYSPACE.SUPERSESSION,
+              posting.documentId,
+              posting.documentVersion,
+            ], { limit: 1 })[0]?.payload
+          : ordinal.tombstone;
         isSuperseded = marker !== undefined;
         supersession.set(versionIdentity, isSuperseded);
         supersessionChecks += 1;
@@ -556,6 +684,14 @@ export async function searchBm25(view, request = {}, options = {}) {
         }
       }
       if (isSuperseded) continue;
+      if (postingRecordsRead >= normalized.maxPostingRecords) {
+        truncated = true;
+        break;
+      }
+      // The user-visible work budget counts live postings. Retired immutable
+      // records remain bounded by MAX_SCAN_LIMIT and are consolidated later,
+      // but cannot crowd a live result out of a smaller logical budget.
+      postingRecordsRead += 1;
       const { window } = posting;
       const candidateKey = `${posting.documentId}\0${posting.documentVersion}\0${window.ordinal}`;
       let candidate = candidates.get(candidateKey);
@@ -708,6 +844,7 @@ export async function searchBm25(view, request = {}, options = {}) {
     work: Object.freeze({
       postingRecordsRead,
       postingRecordsScanned,
+      canonicalPostingsRead,
       windowCandidates: candidates.size,
       supersessionChecks,
       truncated,

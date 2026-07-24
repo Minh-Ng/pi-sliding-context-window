@@ -120,6 +120,7 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(defaults.rocksdbMigrationSourcePath, defaults.dbPath);
     assert.equal(defaults.socketPath, defaultSocketPath(defaults.rocksdbPath));
     assert.equal(defaults.automaticRetrieval, true);
+    assert.equal(defaults.recallScope, "auto");
     assert.equal(defaults.sessionContextRanking, true);
     assert.equal(defaults.hintBudgetTokens, 160);
     assert.equal(defaults.activeHintBudgetTokens, 640);
@@ -171,6 +172,7 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
         CONTEXT_WINDOW_ROCKSDB: "~/rocks/custom",
         CONTEXT_WINDOW_SOCKET: "~/run/context-window.sock",
         CONTEXT_WINDOW_AUTOMATIC_RETRIEVAL: "false",
+        CONTEXT_WINDOW_RECALL_SCOPE: "project",
         CONTEXT_WINDOW_SESSION_CONTEXT_RANKING: "false",
         CONTEXT_WINDOW_HINT_BUDGET_TOKENS: "80",
         CONTEXT_WINDOW_ACTIVE_HINT_BUDGET_TOKENS: "300",
@@ -202,6 +204,7 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.rocksdbPath, join(directory, "rocks", "custom"));
     assert.equal(overridden.socketPath, join(directory, "run", "context-window.sock"));
     assert.equal(overridden.automaticRetrieval, false);
+    assert.equal(overridden.recallScope, "project");
     assert.equal(overridden.sessionContextRanking, false);
     assert.equal(overridden.hintBudgetTokens, 80);
     assert.equal(overridden.activeHintBudgetTokens, 300);

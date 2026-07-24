@@ -1,4 +1,9 @@
 import { KEYSPACE } from "../keys.js";
+import {
+  derivedViewKeys,
+  isDerivedViewQueryCutover,
+  scanDocumentOrdinalLiveness,
+} from "../derived-view.js";
 import { isArchiveEchoDocument } from "./echo.js";
 import { MAX_SESSION_LINEAGE_IDS } from "../../store/store-contract.js";
 import {
@@ -437,13 +442,28 @@ export function createStructuralIndexHandler() {
   });
 }
 
-function scoped(posting, { project, lineage, scope, generation, store }) {
+function scoped(posting, {
+  project,
+  lineage,
+  scope,
+  generation,
+  store,
+  derivedViewAuthoritative,
+}) {
   if (posting.generation > generation) return false;
-  if (store.scan([
-    KEYSPACE.SUPERSESSION,
-    posting.documentId,
-    posting.documentVersion,
-  ], { limit: 1 }).length > 0) return false;
+  const ordinal = scanDocumentOrdinalLiveness(store, {
+    project: posting.project,
+    documentId: posting.documentId,
+    version: posting.documentVersion,
+    authoritative: derivedViewAuthoritative,
+  });
+  if (ordinal === undefined || (!ordinal.authoritative && ordinal.tombstone === undefined)
+    ? store.scan([
+        KEYSPACE.SUPERSESSION,
+        posting.documentId,
+        posting.documentVersion,
+      ], { limit: 1 }).length > 0
+    : !ordinal.live) return false;
   if (scope === "all") return true;
   if (project && posting.project !== project) return false;
   if (scope === "session" && !lineage.includes(posting.sessionId)) return false;
@@ -711,37 +731,51 @@ function structuralEligible(store, context) {
   } = context;
   const terms = queryTerms(query);
   const boundedScan = Math.min(100_000, Math.max(boundedLimit, Number(scanLimit) || 10_000));
-  const postings = structuralRecords(store, {
-    relation,
-    project,
-    lineage,
-    scope,
-    scanLimit: boundedScan,
-  });
+  const derivedViewAuthoritative = isDerivedViewQueryCutover(
+    store.scan(derivedViewKeys.queryCutover(), { limit: 1 })[0]?.payload,
+  );
   const eligible = [];
-  for (const { payload } of postings) {
-    if (!payload || !scoped(payload, {
-      project,
-      lineage,
-      scope,
-      generation: resolvedGeneration,
-      store,
-    })) continue;
-    const matching = postingTextSegments(store, payload)
-      .find(({ text }) => matchesQuery(text, terms));
-    if (matching === undefined) continue;
-    const located = Number.isSafeInteger(payload.startByte)
-      && Number.isSafeInteger(payload.endByte);
-    eligible.push(Object.freeze({
-      ...payload,
-      text: matching.text,
-      ...(located
-        ? {
-            snippetStartByte: payload.startByte + matching.startByte,
-            snippetEndByte: payload.startByte + matching.endByte,
-          }
-        : {}),
-    }));
+  for (const prefix of structuralPrefixes({ relation, project, lineage, scope })) {
+    let liveRemaining = boundedScan;
+    let physicalRemaining = 100_000;
+    let after;
+    while (liveRemaining > 0 && physicalRemaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, physicalRemaining);
+      const page = store.scan(prefix, {
+        limit: pageLimit,
+        ...(after === undefined ? {} : { after }),
+      });
+      physicalRemaining -= page.length;
+      for (const { payload } of page) {
+        if (!payload || !scoped(payload, {
+          project,
+          lineage,
+          scope,
+          generation: resolvedGeneration,
+          store,
+          derivedViewAuthoritative,
+        })) continue;
+        liveRemaining -= 1;
+        const matching = postingTextSegments(store, payload)
+          .find(({ text }) => matchesQuery(text, terms));
+        if (matching === undefined) continue;
+        const located = Number.isSafeInteger(payload.startByte)
+          && Number.isSafeInteger(payload.endByte);
+        eligible.push(Object.freeze({
+          ...payload,
+          text: matching.text,
+          ...(located
+            ? {
+                snippetStartByte: payload.startByte + matching.startByte,
+                snippetEndByte: payload.startByte + matching.endByte,
+              }
+            : {}),
+        }));
+      }
+      if (liveRemaining <= 0 || page.length < pageLimit
+        || page.at(-1)?.keyBytes === undefined) break;
+      after = page.at(-1).keyBytes;
+    }
   }
   return eligible;
 }
@@ -794,18 +828,23 @@ export async function lookupStructuralAsync(store, request = {}, {
     lineage: context.lineage,
     scope: context.scope,
   });
+  const derivedViewAuthoritative = isDerivedViewQueryCutover(
+    store.scan(derivedViewKeys.queryCutover(), { limit: 1 })[0]?.payload,
+  );
   const eligible = [];
   let recordsSinceYield = 0;
   let charactersSinceYield = 0;
   for (const prefix of prefixes) {
-    let remaining = boundedScan;
+    let liveRemaining = boundedScan;
+    let physicalRemaining = 100_000;
     let after;
-    while (remaining > 0) {
-      const pageLimit = Math.min(SEARCH_SCAN_PAGE, remaining);
+    while (liveRemaining > 0 && physicalRemaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, physicalRemaining);
       const page = store.scan(prefix, {
         limit: pageLimit,
         ...(after === undefined ? {} : { after }),
       });
+      physicalRemaining -= page.length;
       for (const { payload } of page) {
         recordsSinceYield += 1;
         if (payload && scoped(payload, {
@@ -814,7 +853,9 @@ export async function lookupStructuralAsync(store, request = {}, {
           scope: context.scope,
           generation: context.resolvedGeneration,
           store,
+          derivedViewAuthoritative,
         })) {
+          liveRemaining -= 1;
           const segments = postingTextSegments(store, payload);
           charactersSinceYield += segments.reduce(
             (total, segment) => total + String(segment.text ?? "").length,
@@ -843,8 +884,8 @@ export async function lookupStructuralAsync(store, request = {}, {
           await yieldControl();
         }
       }
-      remaining -= page.length;
-      if (page.length < pageLimit || page.at(-1)?.keyBytes === undefined) break;
+      if (liveRemaining <= 0 || page.length < pageLimit
+        || page.at(-1)?.keyBytes === undefined) break;
       after = page.at(-1).keyBytes;
       await yieldControl();
     }

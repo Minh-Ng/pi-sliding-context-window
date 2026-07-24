@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -11,7 +12,19 @@ import { join } from "node:path";
 import { KEYSPACE } from "../rocksdb/keys.js";
 import { manifestKeys } from "../rocksdb/manifests.js";
 import { readDocumentRange } from "../rocksdb/document-range.js";
+import {
+  derivedViewKeys,
+  documentOrdinalLiveness,
+  isDerivedViewQueryCutover,
+} from "../rocksdb/derived-view.js";
 import { LocalEmbedder } from "./embedder-client.js";
+import {
+  decodeSemanticMetadata,
+  encodeSemanticMetadata,
+  LEGACY_SEMANTIC_METADATA_FILENAME,
+  normalizeLegacySemanticMetadata,
+  SEMANTIC_METADATA_FILENAME,
+} from "./metadata.js";
 import { semanticModelProfile } from "./model-catalog.js";
 import { createSemanticSpans } from "./spans.js";
 
@@ -19,7 +32,6 @@ const require = createRequire(import.meta.url);
 // usearch 2.26's ESM wrapper recurses while resolving its native build. Its
 // documented CommonJS entry loads the same packaged native binding correctly.
 const usearch = require("usearch");
-const FORMAT_VERSION = 1;
 const DEFAULT_BATCH_SIZE = 16;
 const DEFAULT_CANDIDATES = 40;
 const DEFAULT_MINIMUM_SCORE = 0.35;
@@ -46,6 +58,10 @@ function documentIdentity(documentId, version) {
   return `${documentId}\0${version}`;
 }
 
+function vectorIdentity(project, documentId, version, startByte, endByte) {
+  return `${project}\0${documentIdentity(documentId, version)}\0${startByte}\0${endByte}`;
+}
+
 function vectorLabel(identity, salt = 0) {
   const bytes = createHash("sha256").update(`${identity}\0${salt}`).digest();
   const label = bytes.readBigUInt64BE(0);
@@ -64,11 +80,11 @@ function newIndex(dimensions) {
   });
 }
 
-function eligible(entry, request) {
-  if (request.effectiveScope === "session" && !request.sessionIds.includes(entry.sessionId)) {
+function eligible(manifest, request) {
+  if (request.effectiveScope === "session" && !request.sessionIds.includes(manifest.sessionId)) {
     return false;
   }
-  return !entry.sourceMessageKeys.some((key) => request.excludeVisibleSourceKeys.includes(key));
+  return !manifest.sourceMessageKeys.some((key) => request.excludeVisibleSourceKeys.includes(key));
 }
 
 export class LocalSemanticIndex {
@@ -180,14 +196,28 @@ export class LocalSemanticIndex {
         dirty: false,
       };
       try {
-        const metadataPath = join(directory, "metadata.json");
+        const metadataPath = join(directory, SEMANTIC_METADATA_FILENAME);
+        const legacyMetadataPath = join(directory, LEGACY_SEMANTIC_METADATA_FILENAME);
         const indexPath = join(directory, "index.usearch");
-        const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
-        if (metadata.formatVersion !== FORMAT_VERSION
-          || metadata.fingerprint !== this.fingerprint
-          || metadata.project !== project
-          || metadata.dimensions !== this.dimensions
-          || !Array.isArray(metadata.entries)) return state;
+        let metadata;
+        let legacy = false;
+        try {
+          metadata = decodeSemanticMetadata(await readFile(metadataPath), {
+            fingerprint: this.fingerprint,
+            project,
+            dimensions: this.dimensions,
+          });
+        } catch {
+          metadata = normalizeLegacySemanticMetadata(
+            JSON.parse(await readFile(legacyMetadataPath, "utf8")),
+            {
+              fingerprint: this.fingerprint,
+              project,
+              dimensions: this.dimensions,
+            },
+          );
+          legacy = true;
+        }
         state.index = newIndex(this.dimensions);
         state.index.load(indexPath);
         for (const entry of metadata.entries) {
@@ -199,6 +229,26 @@ export class LocalSemanticIndex {
             (state.entryCountByDocumentIdentity.get(identity) ?? 0) + 1,
           );
         }
+        if (state.index.size() !== state.entries.size) {
+          throw new Error("Semantic vector and metadata entry counts differ.");
+        }
+        if (legacy) {
+          const temporaryMetadata = join(
+            directory,
+            `${SEMANTIC_METADATA_FILENAME}.${process.pid}-${Date.now()}.tmp`,
+          );
+          await writeFile(temporaryMetadata, encodeSemanticMetadata({
+            fingerprint: this.fingerprint,
+            project,
+            dimensions: this.dimensions,
+            entries: [...state.entries.values()],
+          }), { mode: 0o600 });
+          await rename(temporaryMetadata, metadataPath);
+        }
+        // A crash can occur after publishing metadata.bin but before removing
+        // metadata.json. Once the binary snapshot and ANN index validate
+        // together, the legacy duplicate is always obsolete.
+        await rm(legacyMetadataPath, { force: true });
         [state.metadataBytes, state.indexBytes] = await Promise.all([
           fileSize(metadataPath),
           fileSize(indexPath),
@@ -210,6 +260,13 @@ export class LocalSemanticIndex {
       } catch {
         // A missing, partial, or incompatible derived snapshot is rebuilt from
         // canonical RocksDB records. It never makes lexical retrieval fail.
+        state.index = undefined;
+        state.entries.clear();
+        state.documents.clear();
+        state.entryCountByDocumentIdentity.clear();
+        state.metadataBytes = 0;
+        state.indexBytes = 0;
+        state.dirty = false;
       }
       return state;
     })();
@@ -222,20 +279,22 @@ export class LocalSemanticIndex {
     await mkdir(state.directory, { recursive: true, mode: 0o700 });
     const suffix = `${process.pid}-${Date.now()}`;
     const temporaryIndex = join(state.directory, `index.${suffix}.tmp`);
-    const temporaryMetadata = join(state.directory, `metadata.${suffix}.tmp`);
+    const temporaryMetadata = join(
+      state.directory,
+      `${SEMANTIC_METADATA_FILENAME}.${suffix}.tmp`,
+    );
     state.index.save(temporaryIndex);
-    await writeFile(temporaryMetadata, JSON.stringify({
-      formatVersion: FORMAT_VERSION,
+    await writeFile(temporaryMetadata, encodeSemanticMetadata({
       fingerprint: this.fingerprint,
       project: state.project,
       dimensions: this.dimensions,
       entries: [...state.entries.values()],
-      documents: [...state.documents],
     }), { mode: 0o600 });
     const indexPath = join(state.directory, "index.usearch");
-    const metadataPath = join(state.directory, "metadata.json");
+    const metadataPath = join(state.directory, SEMANTIC_METADATA_FILENAME);
     await rename(temporaryIndex, indexPath);
     await rename(temporaryMetadata, metadataPath);
+    await rm(join(state.directory, LEGACY_SEMANTIC_METADATA_FILENAME), { force: true });
     const [metadataBytes, indexBytes] = await Promise.all([
       fileSize(metadataPath),
       fileSize(indexPath),
@@ -291,12 +350,26 @@ export class LocalSemanticIndex {
       const labels = new BigUint64Array(batch.length);
       for (let index = 0; index < batch.length; index += 1) {
         const span = batch[index];
-        const identity = `${manifest.project}\0${documentIdentity}\0${span.startByte}\0${span.endByte}`;
+        const identity = vectorIdentity(
+          manifest.project,
+          documentId,
+          version,
+          span.startByte,
+          span.endByte,
+        );
         let salt = 0;
         let label = vectorLabel(identity, salt);
-        while (state.entries.has(label.toString())
-          && state.entries.get(label.toString()).identity !== identity) {
+        let existing = state.entries.get(label.toString());
+        while (existing
+          && vectorIdentity(
+            manifest.project,
+            existing.documentId,
+            existing.version,
+            existing.startByte,
+            existing.endByte,
+          ) !== identity) {
           label = vectorLabel(identity, ++salt);
+          existing = state.entries.get(label.toString());
         }
         labels[index] = label;
         this.entryCount += 1;
@@ -306,17 +379,11 @@ export class LocalSemanticIndex {
         );
         state.entries.set(label.toString(), Object.freeze({
           label: label.toString(),
-          identity,
           documentId,
           version,
-          kind: manifest.kind,
-          createdAt: manifest.createdAt,
-          sessionId: manifest.sessionId,
-          sourceMessageKeys: manifest.sourceMessageKeys,
           windowOrdinal: span.windowOrdinal,
           startByte: span.startByte,
           endByte: span.endByte,
-          text: span.text,
         }));
       }
       state.index.add(labels, embedded.vectors, 1);
@@ -366,19 +433,66 @@ export class LocalSemanticIndex {
           Math.min(state.index.size(), this.candidates),
           1,
         );
+        const target = request.limit * 3 - results.length;
+        const resolvedMatches = await this.store.snapshot(async (view) => {
+          const resolved = [];
+          let accepted = 0;
+          const derivedViewAuthoritative = isDerivedViewQueryCutover(
+            await view.get(derivedViewKeys.queryCutover()),
+          );
+          for (let index = 0; index < matches.keys.length; index += 1) {
+            const label = matches.keys[index];
+            const entry = state.entries.get(label.toString());
+            if (!entry) continue;
+            const manifest = await view.get(manifestKeys.document(entry.documentId, entry.version));
+            const ordinal = await documentOrdinalLiveness(view, {
+              project: request.project,
+              documentId: entry.documentId,
+              version: entry.version,
+              authoritative: derivedViewAuthoritative,
+            });
+            const retired = ordinal === undefined
+              || (!ordinal.authoritative && ordinal.tombstone === undefined)
+              ? view.scan(
+                  [KEYSPACE.SUPERSESSION, entry.documentId, entry.version],
+                  { limit: 1 },
+                ).length > 0
+              : !ordinal.live;
+            if (!manifest || manifest.project !== request.project || retired) {
+              resolved.push(Object.freeze({ entry, retired: true }));
+              continue;
+            }
+            if (!eligible(manifest, request)) continue;
+            const score = Math.max(0, Math.min(1, 1 - matches.distances[index]));
+            if (score < this.minimumScore) continue;
+            if (returned.has(entry.label)) continue;
+            const selected = await readDocumentRange(
+              view,
+              manifest,
+              entry.startByte,
+              entry.endByte,
+              { adjustUtf8: true },
+            );
+            if (selected.startByte !== entry.startByte || selected.endByte !== entry.endByte) {
+              throw new Error("Semantic metadata range does not match canonical UTF-8 boundaries.");
+            }
+            resolved.push(Object.freeze({
+              entry,
+              manifest,
+              score,
+              text: selected.text,
+            }));
+            accepted += 1;
+            if (accepted >= target) break;
+          }
+          return resolved;
+        });
         let removed = 0;
-        for (let index = 0; index < matches.keys.length; index += 1) {
-          const label = matches.keys[index];
-          const entry = state.entries.get(label.toString());
-          if (!entry) continue;
-          const manifest = await this.store.get(manifestKeys.document(entry.documentId, entry.version));
-          const retired = this.store.scan(
-            [KEYSPACE.SUPERSESSION, entry.documentId, entry.version],
-            { limit: 1 },
-          ).length > 0;
-          if (!manifest || manifest.project !== request.project || retired) {
-            state.index.remove(label);
-            state.entries.delete(label.toString());
+        for (const resolved of resolvedMatches) {
+          const { entry } = resolved;
+          if (resolved.retired === true) {
+            state.index.remove(BigInt(entry.label));
+            state.entries.delete(entry.label);
             this.entryCount -= 1;
             const identityForDocument = documentIdentity(entry.documentId, entry.version);
             const remainingEntries = (state.entryCountByDocumentIdentity.get(identityForDocument) ?? 1) - 1;
@@ -392,12 +506,18 @@ export class LocalSemanticIndex {
             removed += 1;
             continue;
           }
-          if (!eligible(entry, request)) continue;
           if (returned.has(entry.label)) continue;
-          const score = Math.max(0, Math.min(1, 1 - matches.distances[index]));
-          if (score < this.minimumScore) continue;
           returned.add(entry.label);
-          results.push({ ...entry, project: request.project, score });
+          results.push({
+            ...entry,
+            kind: resolved.manifest.kind,
+            createdAt: resolved.manifest.createdAt,
+            sessionId: resolved.manifest.sessionId,
+            sourceMessageKeys: resolved.manifest.sourceMessageKeys,
+            text: resolved.text,
+            project: request.project,
+            score: resolved.score,
+          });
           if (results.length >= request.limit * 3) break;
         }
         if (removed === 0) break;

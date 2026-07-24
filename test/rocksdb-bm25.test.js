@@ -25,6 +25,10 @@ import {
   tokenizeBm25,
   tokenizeBm25Query,
 } from "../src/rocksdb/index/tokenizer.js";
+import {
+  decodeBm25PostingBlock,
+  isPostingBlock,
+} from "../src/rocksdb/index/posting-block.js";
 import { IndexWorker } from "../src/rocksdb/indexer.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
 import { admitDocument } from "../src/rocksdb/manifests.js";
@@ -308,7 +312,9 @@ test("IndexWorker publishes complete BM25 generations with recomputable scores",
     project: "/fixture/project",
     terms: ["cach"],
   })).corpus.documentCount, 2);
-  assert.equal(store.scan(bm25Keys.postingPrefix("/fixture/project", "cach")).length, 0);
+  // Generation-addressed postings are immutable. The old posting survives
+  // physically and is excluded by the current-version/tombstone overlays.
+  assert.equal(store.scan(bm25Keys.postingPrefix("/fixture/project", "cach")).length, 1);
 
   await store.put([KEYSPACE.SUPERSESSION, "doc-tools", 1], { status: "superseded" });
   const superseded = await searchBm25(store, {
@@ -321,7 +327,7 @@ test("IndexWorker publishes complete BM25 generations with recomputable scores",
 
 function windowPayload(store, project, documentId, version, term) {
   return store.scan(bm25Keys.postingPrefix(project, term))
-    .map(({ payload }) => payload)
+    .map(({ payload }) => isPostingBlock(payload) ? decodeBm25PostingBlock(payload) : payload)
     .find((posting) => posting.documentId === documentId && posting.documentVersion === version)
     ?.window;
 }
@@ -723,6 +729,77 @@ test("posting work is bounded and visible in search diagnostics", async (t) => {
   assert.equal(response.work.truncated, true);
 });
 
+test("retired BM25 postings do not consume the live posting budget", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "retired-budget"));
+  t.after(() => store.close());
+  await admit(store, "live-old", "durable lexical budget evidence", { createdAt: 100 });
+  await admit(store, "dead-middle", "durable lexical budget evidence", { createdAt: 200 });
+  await admit(store, "dead-new", "durable lexical budget evidence", { createdAt: 300 });
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:retired-budget",
+    handlers: [createBm25IndexHandler()],
+  });
+  await worker.drain();
+  for (const documentId of ["dead-middle", "dead-new"]) {
+    await store.put([KEYSPACE.SUPERSESSION, documentId, 1], {
+      status: "expired",
+      reason: "test",
+      recordedAt: 400,
+    });
+  }
+
+  const response = await searchBm25(store, {
+    query: "durable lexical budget evidence",
+    project: "/fixture/project",
+    scope: "project",
+  }, { maxPostingRecords: 1 });
+
+  assert.deepEqual(response.results.map(({ documentId }) => documentId), ["live-old"]);
+  assert.equal(response.work.postingRecordsRead, 1);
+  assert.ok(response.work.postingRecordsScanned >= 3);
+});
+
+test("BM25 physical posting work is capped across query terms and locator reads", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "physical-query-budget"));
+  t.after(() => store.close());
+  for (const [documentId, text, createdAt] of [
+    ["physical-alpha", "alpha", 100],
+    ["physical-beta", "beta", 200],
+    ["physical-gamma", "gamma", 300],
+  ]) {
+    await admit(store, documentId, text, { createdAt });
+  }
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:physical-query-budget",
+    handlers: [createBm25IndexHandler()],
+  });
+  await worker.drain();
+
+  const project = await searchBm25(store, {
+    query: "alpha beta gamma",
+    project: "/fixture/project",
+    scope: "project",
+  }, {
+    maxPhysicalPostingRecords: 2,
+  });
+  assert.equal(project.work.postingRecordsScanned, 2);
+  assert.equal(project.work.canonicalPostingsRead, 0);
+  assert.equal(project.work.truncated, true);
+
+  const session = await searchBm25(store, {
+    query: "alpha beta gamma",
+    project: "/fixture/project",
+    scope: "session",
+    sessionIds: ["session-main"],
+  }, {
+    maxPhysicalPostingRecords: 2,
+  });
+  assert.ok(
+    session.work.postingRecordsScanned + session.work.canonicalPostingsRead <= 2,
+  );
+  assert.equal(session.work.truncated, true);
+});
+
 test("BM25 snippets never materialize an unbounded logical window", async (t) => {
   const store = await RocksStore.open(temporaryStorePath(t, "bounded-snippet-source"));
   t.after(() => store.close());
@@ -814,7 +891,7 @@ test("session-scoped caps cannot be consumed by newer unauthorized sessions", as
   }, { maxPostingRecords: 1 });
   assert.equal(newestAcrossLineage.results[0].documentId, "adoc-newest");
   assert.equal(newestAcrossLineage.work.postingRecordsRead, 1);
-  assert.equal(newestAcrossLineage.work.postingRecordsScanned, 2);
+  assert.equal(newestAcrossLineage.work.postingRecordsScanned, 3);
 });
 
 test("frozen lexical quality is no worse than the SQLite FTS5 baseline", async (t) => {
@@ -906,6 +983,36 @@ test("current statistics resolve through O(1) pointers without history scans", a
   assert.equal(scans, 0);
 });
 
+test("a zero-frequency transition remains authoritative for historical generations", async (t) => {
+  const store = await RocksStore.open(temporaryStorePath(t, "statistics-zero-history"));
+  t.after(() => store.close());
+  const worker = new IndexWorker(store, {
+    workerId: "bm25:test:statistics-zero-history",
+    handlers: [createBm25IndexHandler()],
+  });
+  await admit(store, "history", "historicalterm evidence", { version: 1 });
+  await worker.drain({ throwOnError: true });
+  await admit(store, "history", "replacement evidence", { version: 2 });
+  await worker.drain({ throwOnError: true });
+  await admit(store, "other", "historicalterm later evidence");
+  await worker.drain({ throwOnError: true });
+
+  const generationTwo = await readBm25Statistics(store, {
+    project: "/fixture/project",
+    terms: ["historicalterm"],
+    generation: 2,
+  });
+  assert.equal(generationTwo.terms.historicalterm, undefined);
+  assert.equal(
+    (await store.get(bm25Keys.termStatistics(
+      "/fixture/project",
+      "historicalterm",
+      2,
+    ))).documentFrequency,
+    0,
+  );
+});
+
 test("expiring an old version preserves the newer BM25 pointer and final expiry clears statistics", async (t) => {
   const store = await RocksStore.open(temporaryStorePath(t, "versioned-retention"));
   t.after(() => store.close());
@@ -925,6 +1032,25 @@ test("expiring an old version preserves the newer BM25 pointer and final expiry 
     expiresAt: 1_000,
   });
   await worker.drain();
+  assert.equal(
+    (await store.get(bm25Keys.corpusDelta("/fixture/project", 1))).documentCountDelta,
+    1,
+  );
+  assert.equal(
+    (await store.get(bm25Keys.corpusDelta("/fixture/project", 2))).documentCountDelta,
+    0,
+  );
+  assert.equal(
+    (await store.get(bm25Keys.termDelta("/fixture/project", "oldterm", 2)))
+      .documentFrequencyDelta,
+    -1,
+  );
+  assert.equal(
+    (await store.get(bm25Keys.termDelta("/fixture/project", "newterm", 2)))
+      .documentFrequencyDelta,
+    1,
+  );
+  assert.ok(store.scan(bm25Keys.postingPrefix("/fixture/project", "oldterm")).length > 0);
 
   await runRetention(store, { now: 200, force: false, batchSize: 10 });
   const current = await store.get(bm25Keys.current("/fixture/project", "versioned"));
@@ -941,6 +1067,7 @@ test("expiring an old version preserves the newer BM25 pointer and final expiry 
   assert.equal(statistics.corpus.documentCount, 1);
   assert.equal(statistics.terms.oldterm, undefined);
   assert.equal(statistics.terms.newterm.documentFrequency, 1);
+  assert.ok(store.scan(bm25Keys.postingPrefix("/fixture/project", "oldterm")).length > 0);
 
   await runRetention(store, { now: 2_000, force: false, batchSize: 10 });
   statistics = await readBm25Statistics(store, {
@@ -949,6 +1076,25 @@ test("expiring an old version preserves the newer BM25 pointer and final expiry 
   });
   assert.equal(statistics.corpus.documentCount, 0);
   assert.equal(statistics.terms.newterm, undefined);
+  assert.equal(await store.get(bm25Keys.current("/fixture/project", "versioned")), undefined);
+
+  await admit(store, "versioned", "rebornterm restored evidence", {
+    version: 3,
+    createdAt: 3_000,
+    expiresAt: 10_000,
+  });
+  assert.equal((await worker.drain({ throwOnError: true })).processed, 1);
+  statistics = await readBm25Statistics(store, {
+    project: "/fixture/project",
+    terms: ["rebornterm"],
+  });
+  assert.equal(statistics.corpus.documentCount, 1);
+  assert.equal(statistics.terms.rebornterm.documentFrequency, 1);
+  assert.equal((await searchBm25(store, {
+    query: "rebornterm",
+    project: "/fixture/project",
+    scope: "project",
+  })).results[0].version, 3);
 });
 
 test("BM25F weighted corpus statistics survive many expiries in a different order than admission", async (t) => {

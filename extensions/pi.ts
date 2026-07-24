@@ -37,6 +37,7 @@ import {
 } from "../src/presentation.js";
 import { archiveDocumentProvenance } from "../src/identity/provenance.js";
 import { canonicalProjectId, projectIdentityAlias } from "../src/identity/project-identity.js";
+import { explicitRecallScope, RECALL_SCOPE_VALUES } from "../src/retrieval/recall-scope.js";
 import { ancestorSessionIds, stableSessionId } from "../src/session/session-id.js";
 import { STRUCTURAL_RELATIONS } from "../src/structural-annotations.js";
 import { Type } from "typebox";
@@ -595,6 +596,13 @@ export function createContextEpochWindow({
             description: `Rotate at this estimated message-token cap. Adaptive uses ${Math.round(active.config.rotationContextRatio * 100)}% of the selected model's input budget after Pi's compaction reserve; current effective cap is ${formatTokenCap(status.rotationTokens)}.`,
           },
           {
+            id: "recall-scope",
+            label: "Recall scope",
+            currentValue: active.config.recallScope ?? "auto",
+            values: [...RECALL_SCOPE_VALUES],
+            description: "Default archive boundary. auto keeps ordinary recall session-local and follows project-scoped continuity markers; explicit tool scope still overrides.",
+          },
+          {
             id: "read-scope",
             label: "Read scope ceiling",
             currentValue: readScopeValue,
@@ -608,6 +616,32 @@ export function createContextEpochWindow({
           items.length + 2,
           getSettingsListTheme(),
           (id, newValue) => {
+            if (id === "recall-scope") {
+              const previous = active.config.recallScope ?? "auto";
+              if (!RECALL_SCOPE_VALUES.includes(newValue)) {
+                settingsList.updateValue(id, previous);
+                ctx.ui.notify("Recall scope must be auto, session, project, or all.", "error");
+                return;
+              }
+              try {
+                // Auto is the product default, so avoid pinning a redundant key.
+                persistConfig({ recallScope: newValue === "auto" ? undefined : newValue });
+                const refreshed = configLoader({
+                  cwd: ctx.cwd,
+                  projectTrusted: ctx.isProjectTrusted?.() === true,
+                });
+                active.updateWindowPolicy(refreshed, ctx.model);
+                settingsList.updateValue(id, active.config.recallScope ?? "auto");
+                ctx.ui.notify(
+                  `Context window recall scope: ${active.config.recallScope ?? "auto"} · saved globally · survives reload`,
+                  "info",
+                );
+              } catch (error) {
+                settingsList.updateValue(id, previous);
+                ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+              }
+              return;
+            }
             if (id === "read-scope") {
               const previous = readScopeValue;
               if (newValue !== "project" && newValue !== "all") {
@@ -1003,10 +1037,11 @@ export function createContextEpochWindow({
           description: "Files/symbols/identifiers you are currently acting on, for a ranking boost only",
         })),
         scope: Type.Optional(Type.Union([
+          Type.Literal("auto"),
           Type.Literal("session"),
           Type.Literal("project"),
           Type.Literal("all"),
-        ], { default: "session", description: SEARCH_SCOPE_DESCRIPTION })),
+        ], { default: "auto", description: SEARCH_SCOPE_DESCRIPTION })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
         searchEffort: Type.Optional(Type.Union([
           Type.Literal("normal"),
@@ -1019,7 +1054,11 @@ export function createContextEpochWindow({
         const totalBudget = active.config.searchResultTokens * 4;
         const gather = exposeGatherHandles(active.gatherDetailed(params.query.trim(), {
           intent: params.intent ?? "auto",
-          scope: params.scope ?? "session",
+          scope: explicitRecallScope({
+            configuredScope: active.config.recallScope,
+            requestedScope: params.scope,
+            automaticRetrieval: active.automaticRetrievalDiagnostics(),
+          }),
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
           workingSet: params.workingSet,
@@ -1064,11 +1103,12 @@ export function createContextEpochWindow({
           { description: "Structural archived-message relation for anchorless references" },
         )),
         scope: Type.Optional(Type.Union([
+          Type.Literal("auto"),
           Type.Literal("session"),
           Type.Literal("project"),
           Type.Literal("all"),
         ], {
-          default: "session",
+          default: "auto",
           description: SEARCH_SCOPE_DESCRIPTION,
         })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
@@ -1086,7 +1126,11 @@ export function createContextEpochWindow({
         }
         const search = active.searchDetailed(query, {
           relation: params.relation,
-          scope: params.scope ?? "session",
+          scope: explicitRecallScope({
+            configuredScope: active.config.recallScope,
+            requestedScope: params.scope,
+            automaticRetrieval: active.automaticRetrievalDiagnostics(),
+          }),
           limit: params.limit ?? active.config.searchResults,
           expansionTerms: params.expansionTerms,
           workingSet: params.workingSet,
@@ -1122,10 +1166,11 @@ export function createContextEpochWindow({
         id: Type.String({ description: "Short anchor id from search or a prior traversal page" }),
         direction: Type.Union([Type.Literal("before"), Type.Literal("after")]),
         scope: Type.Optional(Type.Union([
+          Type.Literal("auto"),
           Type.Literal("session"),
           Type.Literal("project"),
           Type.Literal("all"),
-        ], { default: "session", description: SEARCH_SCOPE_DESCRIPTION })),
+        ], { default: "auto", description: SEARCH_SCOPE_DESCRIPTION })),
       }, { additionalProperties: false }),
       async execute(_toolCallId, params): Promise<ContextToolResult> {
         const active = requireSession();
@@ -1136,7 +1181,11 @@ export function createContextEpochWindow({
         pendingTraversal = undefined;
         const traversal = active.traverseDetailed(resolveRecallHandle(params.id), {
           direction: params.direction,
-          scope: params.scope ?? "session",
+          scope: explicitRecallScope({
+            configuredScope: active.config.recallScope,
+            requestedScope: params.scope,
+            automaticRetrieval: active.automaticRetrievalDiagnostics(),
+          }),
           // A fixed bounded page prevents the model from accidentally choosing
           // a page too short to satisfy unknown-distance temporal relations.
           limit: 128,

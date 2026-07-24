@@ -1,4 +1,8 @@
 import { KEYSPACE } from "../keys.js";
+import {
+  derivedViewKeys,
+  isDerivedViewQueryCutover,
+} from "../derived-view.js";
 import { MAX_SESSION_LINEAGE_IDS } from "../../store/store-contract.js";
 import { semanticIdentifier } from "../../identity/semantic-identifiers.js";
 
@@ -108,10 +112,30 @@ export function decisionMutation(evidence, reverseSequence) {
   }));
 }
 
-function allowedScope(evidence, { project, sessionIds, scope, generation, store }) {
+function allowedScope(
+  evidence,
+  {
+    project,
+    sessionIds,
+    scope,
+    generation,
+    store,
+    derivedViewAuthoritative,
+  },
+) {
   if (evidence.generation > generation) return false;
-  if (store.scan([
-    "supersession",
+  if (derivedViewAuthoritative) {
+    const assignment = store.scan(derivedViewKeys.document(
+      evidence.project,
+      evidence.documentId,
+      evidence.documentVersion,
+    ), { limit: 1 })[0]?.payload;
+    if (assignment === undefined || store.scan(
+      derivedViewKeys.tombstone(evidence.project, assignment.ordinal),
+      { limit: 1 },
+    ).length > 0) return false;
+  } else if (store.scan([
+    KEYSPACE.SUPERSESSION,
     evidence.documentId,
     evidence.documentVersion,
   ], { limit: 1 }).length > 0) return false;
@@ -180,6 +204,9 @@ function decisionLookupContext(store, {
     throw new TypeError("Scoped decision lookup requires project.");
   }
   const resolvedGeneration = resolvePublishedGeneration(store, generation);
+  const derivedViewAuthoritative = isDerivedViewQueryCutover(
+    store.scan(derivedViewKeys.queryCutover(), { limit: 1 })[0]?.payload,
+  );
   const terms = new Set(String(query).toLocaleLowerCase().match(/[\p{L}\p{N}_-]{2,}/gu) ?? []);
   const boundedScan = Math.min(100_000, Math.max(boundedLimit, Number(scanLimit) || 10_000));
   return {
@@ -190,6 +217,7 @@ function decisionLookupContext(store, {
     terms,
     boundedLimit,
     boundedScan,
+    derivedViewAuthoritative,
   };
 }
 
@@ -215,38 +243,53 @@ function* decisionLookupWork(store, request) {
     boundedLimit,
     boundedScan,
   } = context;
-  const records = decisionRecords(store, {
-    project,
-    sessionIds: lineage,
-    scope,
-    scanLimit: boundedScan,
-  });
   const results = [];
   const seen = new Set();
   let recordsSinceYield = 0;
   let charactersSinceYield = 0;
-  for (const { payload } of records) {
-    recordsSinceYield += 1;
-    charactersSinceYield += typeof payload?.excerpt === "string" ? payload.excerpt.length : 0;
-    if (payload?.verbatim && allowedScope(payload, {
-      project,
-      sessionIds: lineage,
-      scope,
-      generation: resolvedGeneration,
-      store,
-    }) && containsDecisionTerm(payload.excerpt, terms)) {
-      const identity = `${payload.documentId}\0${payload.documentVersion}`;
-      if (!seen.has(identity)) {
-        seen.add(identity);
-        results.push(decisionResult(payload, lineage));
-        if (results.length >= boundedLimit) break;
+  for (const prefix of decisionPrefixes({ project, sessionIds: lineage, scope })) {
+    let liveRemaining = boundedScan;
+    let physicalRemaining = 100_000;
+    let after;
+    while (liveRemaining > 0 && physicalRemaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, physicalRemaining);
+      const page = store.scan(prefix, {
+        limit: pageLimit,
+        ...(after === undefined ? {} : { after }),
+      });
+      physicalRemaining -= page.length;
+      for (const { payload } of page) {
+        recordsSinceYield += 1;
+        charactersSinceYield += typeof payload?.excerpt === "string" ? payload.excerpt.length : 0;
+        const allowed = payload?.verbatim && allowedScope(payload, {
+          project,
+          sessionIds: lineage,
+          scope,
+          generation: resolvedGeneration,
+          store,
+          derivedViewAuthoritative: context.derivedViewAuthoritative,
+        });
+        if (allowed) {
+          liveRemaining -= 1;
+          if (containsDecisionTerm(payload.excerpt, terms)) {
+            const identity = `${payload.documentId}\0${payload.documentVersion}`;
+            if (!seen.has(identity)) {
+              seen.add(identity);
+              results.push(decisionResult(payload, lineage));
+              if (results.length >= boundedLimit) return Object.freeze(results);
+            }
+          }
+        }
+        if (recordsSinceYield >= SEARCH_YIELD_RECORDS
+          || charactersSinceYield >= SEARCH_YIELD_CHARACTERS) {
+          recordsSinceYield = 0;
+          charactersSinceYield = 0;
+          yield;
+        }
       }
-    }
-    if (recordsSinceYield >= SEARCH_YIELD_RECORDS
-      || charactersSinceYield >= SEARCH_YIELD_CHARACTERS) {
-      recordsSinceYield = 0;
-      charactersSinceYield = 0;
-      yield;
+      if (liveRemaining <= 0 || page.length < pageLimit
+        || page.at(-1)?.keyBytes === undefined) break;
+      after = page.at(-1).keyBytes;
     }
   }
   return Object.freeze(results);
@@ -277,29 +320,36 @@ export async function lookupDecisionEvidenceAsync(store, request = {}, {
     sessionIds: context.lineage,
     scope: context.scope,
   })) {
-    let remaining = context.boundedScan;
+    let liveRemaining = context.boundedScan;
+    let physicalRemaining = 100_000;
     let after;
-    while (remaining > 0) {
-      const pageLimit = Math.min(SEARCH_SCAN_PAGE, remaining);
+    while (liveRemaining > 0 && physicalRemaining > 0) {
+      const pageLimit = Math.min(SEARCH_SCAN_PAGE, physicalRemaining);
       const page = store.scan(prefix, {
         limit: pageLimit,
         ...(after === undefined ? {} : { after }),
       });
+      physicalRemaining -= page.length;
       for (const { payload } of page) {
         recordsSinceYield += 1;
         charactersSinceYield += typeof payload?.excerpt === "string" ? payload.excerpt.length : 0;
-        if (payload?.verbatim && allowedScope(payload, {
+        const allowed = payload?.verbatim && allowedScope(payload, {
           project: context.project,
           sessionIds: context.lineage,
           scope: context.scope,
           generation: context.resolvedGeneration,
           store,
-        }) && containsDecisionTerm(payload.excerpt, context.terms)) {
-          const identity = `${payload.documentId}\0${payload.documentVersion}`;
-          if (!seen.has(identity)) {
-            seen.add(identity);
-            results.push(decisionResult(payload, context.lineage));
-            if (results.length >= context.boundedLimit) return Object.freeze(results);
+          derivedViewAuthoritative: context.derivedViewAuthoritative,
+        });
+        if (allowed) {
+          liveRemaining -= 1;
+          if (containsDecisionTerm(payload.excerpt, context.terms)) {
+            const identity = `${payload.documentId}\0${payload.documentVersion}`;
+            if (!seen.has(identity)) {
+              seen.add(identity);
+              results.push(decisionResult(payload, context.lineage));
+              if (results.length >= context.boundedLimit) return Object.freeze(results);
+            }
           }
         }
         if (recordsSinceYield >= SEARCH_YIELD_RECORDS
@@ -309,8 +359,8 @@ export async function lookupDecisionEvidenceAsync(store, request = {}, {
           await yieldControl();
         }
       }
-      remaining -= page.length;
-      if (page.length < pageLimit || page.at(-1)?.keyBytes === undefined) break;
+      if (liveRemaining <= 0 || page.length < pageLimit
+        || page.at(-1)?.keyBytes === undefined) break;
       after = page.at(-1).keyBytes;
       await yieldControl();
     }

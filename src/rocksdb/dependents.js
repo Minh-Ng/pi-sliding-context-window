@@ -8,7 +8,16 @@
 // re-ranks, or otherwise acts on what it finds -- the agent judges.
 import { KEYSPACE } from "./keys.js";
 import { manifestKeys } from "./manifests.js";
-import { exactKeys, normalizeExactValue } from "./index/exact.js";
+import {
+  derivedViewKeys,
+  documentOrdinalLiveness,
+  isDerivedViewQueryCutover,
+} from "./derived-view.js";
+import {
+  exactKeys,
+  normalizeExactValue,
+  resolveExactPostingRecord,
+} from "./index/exact.js";
 
 // Total distinct candidate documents this lookup will ever consider across
 // its three signals combined (source-message overlap, anchor citation of the
@@ -60,11 +69,15 @@ function sourceMessageOverlapCandidates(view, target, candidates, excludeIds) {
 
 /**
  * Signal 2: documents whose exact-anchor postings cite `term` -- the
- * target's own documentId or subjectKey, i.e. its identity. Exact postings
- * already carry the citing document's createdAt, so a hit here never needs a
- * follow-up manifest read.
+ * target's own documentId or subjectKey, i.e. its identity.
  */
-function anchorTermCandidates(view, term, project, candidates, excludeIds, createdAtByCandidate) {
+async function anchorTermCandidates(
+  view,
+  term,
+  project,
+  candidates,
+  excludeIds,
+) {
   if (typeof term !== "string" || term.length === 0) return;
   const terms = [
     ["exact", normalizeExactValue(term, { foldCase: false })],
@@ -76,11 +89,10 @@ function anchorTermCandidates(view, term, project, candidates, excludeIds, creat
       limit: MAX_ANCHOR_POSTINGS_SCANNED,
     });
     for (const posting of postings) {
-      const payload = posting.payload;
-      if (!payload || excludeIds.has(payload.documentId)) continue;
-      addCandidate(candidates, payload.documentId, payload.documentVersion, excludeIds);
-      if (Number.isSafeInteger(payload.createdAt)) {
-        createdAtByCandidate.set(payload.documentId, payload.createdAt);
+      const resolved = await resolveExactPostingRecord(view, posting);
+      for (const payload of resolved) {
+        if (!payload || excludeIds.has(payload.documentId)) continue;
+        addCandidate(candidates, payload.documentId, payload.documentVersion, excludeIds);
       }
     }
   }
@@ -97,7 +109,7 @@ function anchorTermCandidates(view, term, project, candidates, excludeIds, creat
  * ever reporting that direct replacement here even if hop bookkeeping alone
  * would have let it through.
  */
-function subjectLineageCandidates(view, target, candidates, createdAtByCandidate, excludeIds) {
+function subjectLineageCandidates(view, target, candidates, excludeIds) {
   if (typeof target.subjectKey !== "string" || target.subjectKey.length === 0) return;
   let cursor = { documentId: target.documentId, version: target.version };
   for (let hop = 0; hop < MAX_LINEAGE_HOPS && candidates.size < MAX_DEPENDENT_CANDIDATES; hop += 1) {
@@ -111,9 +123,6 @@ function subjectLineageCandidates(view, target, candidates, createdAtByCandidate
       : cursor.documentId;
     if (hop > 0) {
       addCandidate(candidates, nextDocumentId, marker.replacementVersion, excludeIds);
-      if (Number.isSafeInteger(marker.recordedAt)) {
-        createdAtByCandidate.set(nextDocumentId, marker.recordedAt);
-      }
     }
     cursor = { documentId: nextDocumentId, version: marker.replacementVersion };
   }
@@ -153,26 +162,36 @@ export async function findDependentDocuments(view, target, options = {}) {
     excludeIds.add(options.replacementDocumentId);
   }
   const candidates = new Map();
-  const createdAtByCandidate = new Map();
   sourceMessageOverlapCandidates(view, target, candidates, excludeIds);
-  anchorTermCandidates(
-    view, target.documentId, target.project, candidates, excludeIds, createdAtByCandidate,
+  await anchorTermCandidates(
+    view, target.documentId, target.project, candidates, excludeIds,
   );
   if (target.subjectKey) {
-    anchorTermCandidates(
-      view, target.subjectKey, target.project, candidates, excludeIds, createdAtByCandidate,
+    await anchorTermCandidates(
+      view, target.subjectKey, target.project, candidates, excludeIds,
     );
   }
-  subjectLineageCandidates(view, target, candidates, createdAtByCandidate, excludeIds);
+  subjectLineageCandidates(view, target, candidates, excludeIds);
 
+  const ordinalOverlayAuthoritative = isDerivedViewQueryCutover(
+    await view.get(derivedViewKeys.queryCutover()),
+  );
   const qualifying = [];
   for (const [documentId, info] of candidates) {
-    let createdAt = createdAtByCandidate.get(documentId);
-    if (createdAt === undefined) {
-      const manifest = await view.get(manifestKeys.document(documentId, info.version));
-      if (!manifest || manifest.project !== target.project) continue;
-      createdAt = manifest.createdAt;
+    const ordinal = await documentOrdinalLiveness(view, {
+      project: target.project,
+      documentId,
+      version: info.version,
+      authoritative: ordinalOverlayAuthoritative,
+    });
+    if (ordinalOverlayAuthoritative) {
+      if (ordinal === undefined || !ordinal.live) continue;
+    } else if (await view.get([KEYSPACE.SUPERSESSION, documentId, info.version])) {
+      continue;
     }
+    const manifest = await view.get(manifestKeys.document(documentId, info.version));
+    if (!manifest || manifest.project !== target.project) continue;
+    const createdAt = manifest.createdAt;
     if (!(Number.isSafeInteger(createdAt) && createdAt > target.createdAt)) continue;
     qualifying.push({ documentId, createdAt });
   }

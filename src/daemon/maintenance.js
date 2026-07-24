@@ -5,6 +5,10 @@ import {
 } from "../rocksdb/retention.js";
 import { cleanupAbandonedHints } from "../retrieval/hints.js";
 import { cleanupExpiredLeases } from "../retrieval/leases.js";
+import {
+  DEFAULT_POSTING_ROLLBACK_GRACE_MS,
+  runPostingStorageMaintenance,
+} from "../rocksdb/posting-storage-maintenance.js";
 
 export const DEFAULT_MAINTENANCE_OPTIONS = Object.freeze({
   intervalMs: 60_000,
@@ -13,6 +17,8 @@ export const DEFAULT_MAINTENANCE_OPTIONS = Object.freeze({
   protectionCleanupLimit: 1_000,
   leaseCleanupLimit: 1_000,
   hintCleanupLimit: 1_000,
+  postingStorageLimit: 10_000,
+  postingRollbackGraceMs: DEFAULT_POSTING_ROLLBACK_GRACE_MS,
   compactionDeletedKeys: 10_000,
   compactionReclaimableBytes: 256 * 1024 * 1024,
   criticalFreeBytes: 2 * 1024 * 1024 * 1024,
@@ -60,6 +66,9 @@ export class DaemonMaintenance {
     cleanupProtections = cleanupExpiredProtections,
     cleanupLeases = cleanupExpiredLeases,
     cleanupHints = cleanupAbandonedHints,
+    maintainPostingStorage = typeof store?.get === "function"
+      ? runPostingStorageMaintenance
+      : async () => ({ deletedKeys: 0 }),
     ...options
   } = {}) {
     if (!store || typeof store.properties !== "function" || typeof store.path !== "string") {
@@ -75,6 +84,7 @@ export class DaemonMaintenance {
       [cleanupProtections, "cleanupProtections"],
       [cleanupLeases, "cleanupLeases"],
       [cleanupHints, "cleanupHints"],
+      [maintainPostingStorage, "maintainPostingStorage"],
     ]) {
       if (typeof callback !== "function") throw new TypeError(`${label} must be a function.`);
     }
@@ -88,6 +98,7 @@ export class DaemonMaintenance {
     this.cleanupProtections = cleanupProtections;
     this.cleanupLeases = cleanupLeases;
     this.cleanupHints = cleanupHints;
+    this.maintainPostingStorage = maintainPostingStorage;
     this.intervalMs = positiveInteger(
       options.intervalMs,
       DEFAULT_MAINTENANCE_OPTIONS.intervalMs,
@@ -122,6 +133,17 @@ export class DaemonMaintenance {
       DEFAULT_MAINTENANCE_OPTIONS.hintCleanupLimit,
       "maintenance hintCleanupLimit",
       100_000,
+    );
+    this.postingStorageLimit = positiveInteger(
+      options.postingStorageLimit,
+      DEFAULT_MAINTENANCE_OPTIONS.postingStorageLimit,
+      "maintenance postingStorageLimit",
+      100_000,
+    );
+    this.postingRollbackGraceMs = nonNegativeInteger(
+      options.postingRollbackGraceMs,
+      DEFAULT_MAINTENANCE_OPTIONS.postingRollbackGraceMs,
+      "maintenance postingRollbackGraceMs",
     );
     this.compactionDeletedKeys = positiveInteger(
       options.compactionDeletedKeys,
@@ -255,7 +277,12 @@ export class DaemonMaintenance {
       now,
       limit: this.hintCleanupLimit,
     });
-    return Object.freeze({ protections, leases, hints });
+    const postingStorage = await this.maintainPostingStorage(this.store, {
+      now,
+      limit: this.postingStorageLimit,
+      rollbackGraceMs: this.postingRollbackGraceMs,
+    });
+    return Object.freeze({ protections, leases, hints, postingStorage });
   }
 
   async runOnce() {
@@ -265,7 +292,7 @@ export class DaemonMaintenance {
     const cleanup = await this.runAuxiliaryCleanup(now);
     let waves = 0;
     let tombstoned = 0;
-    let deletedKeys = 0;
+    let deletedKeys = cleanup.postingStorage?.deletedKeys ?? 0;
     let retentionStatus = "complete";
     for (; waves < this.maxRetentionWaves; waves += 1) {
       const result = await this.runRetention({

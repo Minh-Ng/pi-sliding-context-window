@@ -1398,7 +1398,6 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
     import { RocksStore } from ${JSON.stringify(storeUrl)};
     import { startMigration } from ${JSON.stringify(migrationUrl)};
     const store = await RocksStore.open(process.env.MIGRATION_STORE_PATH);
-    globalThis.gc();
     const baselineRss = process.memoryUsage.rss();
     const result = await startMigration(store, {
       sourcePath: process.env.MIGRATION_SOURCE_PATH,
@@ -1408,7 +1407,6 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
         ? {}
         : { maxBatches: Number(process.env.MIGRATION_MAX_BATCHES) }),
     });
-    globalThis.gc();
     const finalRss = process.memoryUsage.rss();
     const peakRss = process.resourceUsage().maxRSS * 1_024;
     store.close();
@@ -1423,7 +1421,9 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
   `;
   const initial = await runProcess(
     process.execPath,
-    ["--expose-gc", "--input-type=module", "-e", migrationSource],
+    // Exercise the production path: migration obtains a private collector for
+    // large rows without requiring callers to launch Node with --expose-gc.
+    ["--input-type=module", "-e", migrationSource],
     { env: { ...environment, MIGRATION_MAX_BATCHES: "1" } },
   );
   assert.equal(initial.status, 0, initial.stderr);
@@ -1447,13 +1447,11 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
     import { RocksStore } from ${JSON.stringify(storeUrl)};
     import { verifyMigration } from ${JSON.stringify(migrationUrl)};
     const store = await RocksStore.open(process.env.MIGRATION_STORE_PATH);
-    globalThis.gc();
     const baselineRss = process.memoryUsage.rss();
     const result = await verifyMigration(store, {
       sourcePath: process.env.MIGRATION_SOURCE_PATH,
       sampleLimit: 1,
     });
-    globalThis.gc();
     const finalRss = process.memoryUsage.rss();
     const peakRss = process.resourceUsage().maxRSS * 1_024;
     store.close();
@@ -1468,7 +1466,7 @@ test("near-cap migration start, resume, and verification stay below the 256 MiB 
   `;
   const verified = await runProcess(
     process.execPath,
-    ["--expose-gc", "--input-type=module", "-e", verificationSource],
+    ["--input-type=module", "-e", verificationSource],
     { env: environment },
   );
   assert.equal(verified.status, 0, verified.stderr);

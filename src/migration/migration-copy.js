@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { runInNewContext } from "node:vm";
+import { setFlagsFromString } from "node:v8";
 import { derivedKeys } from "../rocksdb/derived.js";
 import { encodeKey, KEYSPACE, keyFor } from "../rocksdb/keys.js";
 import { prepareDocumentAdmission, readCanonicalDocument } from "../rocksdb/manifests.js";
@@ -28,6 +30,38 @@ import {
 
 // Copy phase: snapshot read of a quiesced SQLite archive in idempotent
 // checkpointed batches.
+
+// A migrated document is encoded both as canonical records and as exact SQLite
+// provenance. Bound the transient encoder and RocksDB memtable footprint for
+// unusually large source rows without forcing a flush for ordinary documents.
+const MIGRATION_FLUSH_SOURCE_BYTES = 1 * 1_024 * 1_024;
+let migrationGarbageCollector;
+
+function migrationSourceBytes(source) {
+  let bytes = Buffer.byteLength(source.text, "utf8")
+    + Buffer.byteLength(source.metadataJson, "utf8");
+  for (const message of source.structuralMessages) {
+    bytes += Buffer.byteLength(message.text, "utf8");
+  }
+  return bytes;
+}
+
+function collectMigrationGarbage() {
+  if (migrationGarbageCollector === undefined) {
+    if (typeof globalThis.gc === "function") migrationGarbageCollector = globalThis.gc;
+    else {
+      // Node does not expose a direct low-memory notification API. Create one
+      // private collector without leaving `gc` on the application global.
+      setFlagsFromString("--expose-gc");
+      try {
+        migrationGarbageCollector = runInNewContext("gc");
+      } finally {
+        setFlagsFromString("--no-expose-gc");
+      }
+    }
+  }
+  migrationGarbageCollector();
+}
 
 function initialCheckpoint(info, store) {
   const startedAt = Date.now();
@@ -327,6 +361,10 @@ async function startOfflineMigration(store, {
           });
           await warmAdmission(store, prepared.admission);
           await store.commitCanonical(prepared.admission);
+          if (migrationSourceBytes(row) >= MIGRATION_FLUSH_SOURCE_BYTES) {
+            await store.flush();
+            collectMigrationGarbage();
+          }
         } catch (error) {
           await blockOnFailure(store, checkpoint, existingStatus, row, error);
         }

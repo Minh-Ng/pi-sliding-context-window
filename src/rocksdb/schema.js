@@ -77,27 +77,39 @@ export function encodeRecord({ kind, payload, recordVersion = 1, schemaVersion =
   uint16(schemaVersion, "Schema version");
 
   const binary = Buffer.isBuffer(payload) || payload instanceof Uint8Array;
-  const payloadBytes = binary
-    ? Buffer.from(payload)
-    : Buffer.from(stableJson(payload), "utf8");
-  if (payloadBytes.length > 0xffff_ffff) throw new TypeError("Record payload exceeds 4 GiB.");
+  const serialized = binary ? undefined : stableJson(payload);
+  const sourceBytes = binary
+    ? Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
+    : undefined;
+  const payloadLength = binary
+    ? sourceBytes.length
+    : Buffer.byteLength(serialized, "utf8");
+  if (payloadLength > 0xffff_ffff) throw new TypeError("Record payload exceeds 4 GiB.");
 
-  const header = Buffer.allocUnsafe(FIXED_HEADER_BYTES);
-  VALUE_MAGIC.copy(header, 0);
+  const contentLength = FIXED_HEADER_BYTES + kindBytes.length + payloadLength;
+  const output = Buffer.allocUnsafe(contentLength + CHECKSUM_BYTES);
+  VALUE_MAGIC.copy(output, 0);
   let offset = VALUE_MAGIC.length;
-  header.writeUInt16BE(schemaVersion, offset);
+  output.writeUInt16BE(schemaVersion, offset);
   offset += 2;
-  header.writeUInt16BE(recordVersion, offset);
+  output.writeUInt16BE(recordVersion, offset);
   offset += 2;
-  header.writeUInt16BE(kindBytes.length, offset);
+  output.writeUInt16BE(kindBytes.length, offset);
   offset += 2;
-  header[offset] = binary ? ENCODING_BYTES : ENCODING_JSON;
+  output[offset] = binary ? ENCODING_BYTES : ENCODING_JSON;
   offset += 1;
-  header.writeUInt32BE(payloadBytes.length, offset);
+  output.writeUInt32BE(payloadLength, offset);
+  offset += 4;
+  kindBytes.copy(output, offset);
+  offset += kindBytes.length;
+  if (binary) sourceBytes.copy(output, offset);
+  else output.write(serialized, offset, payloadLength, "utf8");
 
-  const content = Buffer.concat([header, kindBytes, payloadBytes]);
-  const checksum = createHash("sha256").update(content).digest();
-  return Buffer.concat([content, checksum]);
+  const checksum = createHash("sha256")
+    .update(output.subarray(0, contentLength))
+    .digest();
+  checksum.copy(output, contentLength);
+  return output;
 }
 
 function corrupt(message) {

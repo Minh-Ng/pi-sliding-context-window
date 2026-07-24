@@ -217,12 +217,12 @@ function seededMessages(now) {
 function coldSessionSourceMessages(now) {
   return [
     { role: "user", content: [{ type: "text", text: "We decided cobalt is the deployment color for canary deployments." }], timestamp: now - 7 },
-    { role: "assistant", content: [{ type: "text", text: "Recorded that deployment decision." }], timestamp: now - 6 },
-    { role: "user", content: [{ type: "text", text: "Next, verify the staging checklist." }], timestamp: now - 5 },
-    { role: "assistant", content: [{ type: "text", text: "The staging checklist is verified." }], timestamp: now - 4 },
-    { role: "user", content: [{ type: "text", text: "Now summarize the release notes." }], timestamp: now - 3 },
-    { role: "assistant", content: [{ type: "text", text: "The release notes are summarized." }], timestamp: now - 2 },
-    { role: "user", content: [{ type: "text", text: "Prepare the final handoff." }], timestamp: now - 1 },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Recorded that deployment decision." }],
+      stopReason: "stop",
+      timestamp: now - 6,
+    },
   ];
 }
 
@@ -365,7 +365,7 @@ async function exerciseFlows(session, runWindow, { requireConflict }) {
   return observed;
 }
 
-test("a cold Pi session retrieves a decision rotated by an earlier real Pi session", {
+test("a cold Pi session retrieves a completed short session that never rotated", {
   timeout: 60_000,
 }, async () => {
   const booted = await bootSession({
@@ -374,8 +374,8 @@ test("a cold Pi session retrieves a decision rotated by an earlier real Pi sessi
   });
   try {
     const sourceMessages = coldSessionSourceMessages(Date.now());
-    const sourceVisible = await booted.session.extensionRunner.emitContext(sourceMessages);
-    assert.ok(sourceVisible.length < sourceMessages.length, "source session must rotate its decision out of active context");
+    for (const message of sourceMessages) booted.sessionManager.appendMessage(message);
+    await booted.session.extensionRunner.emit({ type: "agent_settled" });
 
     const search = toolDefinition(booted.session, "context_window_search");
     const indexed = await executeUntil(
@@ -383,7 +383,10 @@ test("a cold Pi session retrieves a decision rotated by an earlier real Pi sessi
       { query: "cobalt canary deployment color", scope: "project", limit: 5 },
       (result) => result.details.count >= 1 && /cobalt/u.test(result.content[0].text),
     );
-    assert.ok(indexed.details.count >= 1, "the source session decision must reach the persisted project index");
+    assert.ok(
+      indexed.details.count >= 1,
+      "the settled short session must reach the persisted project index without rotation",
+    );
 
     await booted.shutdownSession(booted.session);
     const cold = await booted.createSession();

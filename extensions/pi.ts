@@ -348,6 +348,15 @@ function startupContextMessages(sessionManager: ExtensionContext["sessionManager
   return entries.flatMap((entry: any) => sessionEntryToContextMessages(entry));
 }
 
+function archiveCompletedSession(
+  active: EpochWindowSessionType | undefined,
+  sessionManager: ExtensionContext["sessionManager"],
+) {
+  const archiveCompletedTurns = (active as any)?.archiveCompletedTurns;
+  if (typeof archiveCompletedTurns !== "function") return;
+  archiveCompletedTurns.call(active, startupContextMessages(sessionManager));
+}
+
 /**
  * Build the Pi adapter with replaceable configuration and archive providers.
  * The default export below is the normal packaged extension.
@@ -894,6 +903,7 @@ export function createContextEpochWindow({
     // The provider-context event may run without an active TUI context. Refresh
     // after each complete run so the footer reflects the latest measurement.
     pi.on("agent_settled", (_event, ctx) => {
+      archiveCompletedSession(session, ctx.sessionManager);
       session?.refreshArchiveProtection();
       updateStatus(ctx);
       maybeWarnDiskPressure(ctx);
@@ -963,6 +973,11 @@ export function createContextEpochWindow({
       recallHandleByTarget.clear();
       recallHandleByDocumentId.clear();
       pendingTraversal = undefined;
+      try {
+        archiveCompletedSession(closingSession, ctx.sessionManager);
+      } catch (error) {
+        cleanupFailure ??= { error };
+      }
       try { closingSession?.close(); } catch (error) { cleanupFailure ??= { error }; }
       if (cleanupFailure) throw cleanupFailure.error;
     });

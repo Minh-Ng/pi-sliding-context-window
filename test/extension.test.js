@@ -1046,6 +1046,66 @@ function compactionEvent(reason, preparation, branchEntries = []) {
   };
 }
 
+test("agent settlement checkpoints a short Pi session and shutdown does not duplicate it", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  let branch = [];
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ rotationTurns: 20 }),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: false,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "settled-short-session",
+      getBranch: () => branch,
+      buildContextEntries: () => branch,
+    },
+    ui: { setStatus() {} },
+  };
+
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  const messages = [
+    {
+      role: "user",
+      content: [{ type: "text", text: "Record the cobalt deployment procedure." }],
+      timestamp: 1,
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "The procedure uses the glacier queue." }],
+      stopReason: "stop",
+      timestamp: 2,
+    },
+  ];
+  branch = messages.map((message, index) => ({
+    type: "message",
+    id: `settled-entry-${index + 1}`,
+    parentId: index === 0 ? null : `settled-entry-${index}`,
+    timestamp: `2026-07-23T00:00:0${index}.000Z`,
+    message,
+  }));
+
+  handlers.get("agent_settled")({}, ctx);
+  assert.equal(archive.puts.filter(({ kind }) => kind === "turn").length, 1);
+  assert.match(
+    archive.puts.find(({ kind }) => kind === "turn").text,
+    /cobalt deployment procedure[\s\S]*glacier queue/u,
+  );
+
+  handlers.get("agent_settled")({}, ctx);
+  handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+  assert.equal(archive.puts.filter(({ kind }) => kind === "turn").length, 1);
+});
+
 test("session startup warms tool artifacts without running the mutating epoch state machine", async () => {
   const handlers = new Map();
   const timings = [];

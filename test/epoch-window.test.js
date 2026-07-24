@@ -82,6 +82,67 @@ test("session controller rotates, archives source turns, and emits durable state
   });
 });
 
+test("completed-turn checkpoints persist short sessions once and skip unfinished tails", () => {
+  const archive = memoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, rotationTurns: 2 },
+    sessionId: "short-session",
+    project: "/project",
+  });
+  const completed = [
+    user("Record the cobalt deployment procedure.", 1),
+    { ...assistant("The procedure uses the glacier queue.", 2), stopReason: "stop" },
+  ];
+
+  assert.deepEqual(session.archiveCompletedTurns(completed), {
+    turnCount: 1,
+    messageCount: 2,
+  });
+  assert.equal(archive.documents.size, 1);
+  assert.deepEqual(session.rotationState().toc, []);
+  assert.deepEqual(session.archiveCompletedTurns(completed), {
+    turnCount: 0,
+    messageCount: 0,
+  });
+  assert.equal(archive.documents.size, 1);
+
+  const secondCompleted = [
+    user("Confirm the release handoff.", 3),
+    { ...assistant("The handoff is confirmed.", 4), stopReason: "stop" },
+  ];
+  const rotated = session.process([...completed, ...secondCompleted], { contextWindow: 200_000 });
+  assert.match(rotated[0].content[0].text, /doc-1 "Record the cobalt deployment procedure."/u);
+  assert.equal(archive.documents.size, 1);
+
+  const unfinishedUser = [...completed, user("What comes next?", 5)];
+  assert.deepEqual(session.archiveCompletedTurns(unfinishedUser), {
+    turnCount: 0,
+    messageCount: 0,
+  });
+  const unfinishedTool = [
+    ...completed,
+    user("Run the check.", 6),
+    {
+      ...assistant("", 7),
+      content: [{ type: "toolCall", name: "read", arguments: {} }],
+      stopReason: "toolUse",
+    },
+    {
+      role: "toolResult",
+      toolName: "read",
+      toolCallId: "read-1",
+      content: [{ type: "text", text: "pending result" }],
+      timestamp: 8,
+    },
+  ];
+  assert.deepEqual(session.archiveCompletedTurns(unfinishedTool), {
+    turnCount: 0,
+    messageCount: 0,
+  });
+  assert.equal(archive.documents.size, 1);
+});
+
 test("rotation segments a message-heavy turn within archive provenance bounds", () => {
   const archive = memoryArchive();
   const put = archive.put.bind(archive);

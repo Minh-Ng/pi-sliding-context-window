@@ -73,6 +73,18 @@ const MAX_RECONSTRUCT_ONLY_HINT_KEYS = 1_000;
 
 export const ROTATION_STATE_ENTRY = "context-epoch-window:rotation";
 
+function archivedTurnKey(messages) {
+  return messages.map((message) => messageKey(message)).join("\u0000");
+}
+
+function isCompletedUserTurn(turn) {
+  if (!turn.hasUser) return false;
+  const terminal = turn.messages.findLast((message) =>
+    ["user", "assistant", "tool", "toolResult"].includes(String(message?.role)));
+  return terminal?.role === "assistant"
+    && !["error", "aborted", "toolUse"].includes(String(terminal.stopReason));
+}
+
 /**
  * Host-independent state machine for one active context-window session.
  *
@@ -118,6 +130,10 @@ export class EpochWindowSession {
     // request, so avoid repeating synchronous daemon writes for artifacts that
     // this live session has already stored successfully.
     this.storedArtifactIds = new Set();
+    // Rotation and lifecycle checkpoints can observe the same completed turn.
+    // Source-derived keys keep those writes idempotent within this process;
+    // archive document identities provide the durable retry boundary.
+    this.archivedTurnEntries = new Map();
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -145,6 +161,7 @@ export class EpochWindowSession {
     this.toc = [];
     this.activeArchiveIds = new Set();
     this.storedArtifactIds = new Set();
+    this.archivedTurnEntries = new Map();
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -1363,15 +1380,24 @@ export class EpochWindowSession {
     };
   }
 
-  archiveTurns(messages) {
+  archiveTurns(messages, { recordToc = true } = {}) {
     const stagedToc = [];
+    const stagedTurnEntries = new Map();
     const previousActiveArchiveIds = new Set(this.activeArchiveIds);
+    const previousArchivedTurnEntries = new Map(this.archivedTurnEntries);
     const configuredLimit = Number(this.config.maxInlineUserTokens);
     const maxInlineTokens = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
       ? configuredLimit
       : 16_000;
     try {
       for (const turn of groupCompleteTurns(messages)) {
+        const turnKey = archivedTurnKey(turn.messages);
+        const archivedEntries = this.archivedTurnEntries.get(turnKey);
+        if (archivedEntries !== undefined) {
+          if (recordToc) stagedToc.push(...archivedEntries);
+          continue;
+        }
+        const turnEntries = [];
         // One tool-heavy user turn can contain more source messages than the
         // archive wire contract permits on a single document. Segment it by
         // the same exact-provenance bounds used for compaction checkpoints.
@@ -1455,7 +1481,7 @@ export class EpochWindowSession {
             topic = turnTopic(turn.messages);
             terms = extractSalientTerms(text);
           }
-          stagedToc.push({
+          turnEntries.push({
             id,
             topic,
             terms,
@@ -1506,9 +1532,12 @@ export class EpochWindowSession {
             }, { deferPrune: true });
           }
         }
+        if (recordToc) stagedToc.push(...turnEntries);
+        stagedTurnEntries.set(turnKey, turnEntries);
       }
     } catch (error) {
       this.activeArchiveIds = previousActiveArchiveIds;
+      this.archivedTurnEntries = previousArchivedTurnEntries;
       this.refreshArchiveProtection();
       this.archive.prune?.();
       throw error;
@@ -1519,12 +1548,33 @@ export class EpochWindowSession {
     try {
       this.refreshArchiveProtection();
       this.archive.prune?.();
+      for (const [turnKey, entries] of stagedTurnEntries) {
+        this.archivedTurnEntries.set(turnKey, entries);
+      }
     } catch (error) {
       this.toc = previousToc;
       this.activeArchiveIds = previousActiveArchiveIds;
+      this.archivedTurnEntries = previousArchivedTurnEntries;
       try { this.refreshArchiveProtection(); } catch {}
       throw error;
     }
+  }
+
+  archiveCompletedTurns(messages) {
+    const complete = groupCompleteTurns(removeEmptyAssistantErrors(
+      Array.isArray(messages) ? messages : [],
+    )).filter(isCompletedUserTurn);
+    const pending = complete.filter((turn) =>
+      !this.archivedTurnEntries.has(archivedTurnKey(turn.messages)));
+    if (pending.length === 0) {
+      return Object.freeze({ turnCount: 0, messageCount: 0 });
+    }
+    const pendingMessages = pending.flatMap((turn) => turn.messages);
+    this.archiveTurns(pendingMessages, { recordToc: false });
+    return Object.freeze({
+      turnCount: pending.length,
+      messageCount: pendingMessages.length,
+    });
   }
 
   countUserTurns(messages) {

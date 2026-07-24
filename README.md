@@ -33,7 +33,7 @@ Programmatic Pi integrations can replace storage by calling `createContextEpochW
 
 No local or unreleased Pi patch is required. The adapter uses documented public extension APIs only: the `context`, `session_start`, `session_tree`, `session_before_compact`, `session_compact`, `agent_settled`, `model_select`, and `session_shutdown` events; `appendEntry`; `registerTool`; `registerCommand`; and `ctx.ui.setStatus`.
 
-The package declares `@earendil-works/pi-coding-agent >=0.80.6` as its compatibility floor. The integration is tested against Pi 0.81.1. Transparent rotation specifically requires the host's pre-provider `context` message-transform hook, and threshold-compaction suppression requires cancellable `session_before_compact`; hosts without equivalents can use the MCP archive but not the full window policy.
+The package declares `@earendil-works/pi-coding-agent >=0.80.6` as its compatibility floor. The integration is tested against Pi 0.82.0. Transparent rotation specifically requires the host's pre-provider `context` message-transform hook, and threshold-compaction suppression requires cancellable `session_before_compact`; hosts without equivalents can use the MCP archive but not the full window policy.
 
 ## Behavior
 

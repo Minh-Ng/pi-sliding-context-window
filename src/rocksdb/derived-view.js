@@ -89,7 +89,34 @@ export const derivedViewKeys = Object.freeze({
       positiveInteger(ordinal, "ordinal", MAX_DOCUMENT_ORDINAL),
     ];
   },
+  tombstonePrefix(project) {
+    return [...ROOT, "tombstone", identifier(project, "project")];
+  },
 });
+
+/**
+ * Every retirement recorded for a project, keyed by ordinal.
+ *
+ * A retrieval pass otherwise pays one tombstone point read per posting to
+ * discover an absence, and absence is the common case by construction --
+ * tombstones only exist for retired documents. Reading the whole retired set
+ * once turns that into a lookup. Returns `undefined` when the set is larger
+ * than `limit`, since a partial map would report retired documents as live;
+ * callers fall back to per-document reads in that case.
+ */
+export function projectTombstones(view, project, limit) {
+  const page = view.scan(derivedViewKeys.tombstonePrefix(project), {
+    limit: limit + 1,
+    fillCache: false,
+  });
+  if (page.length > limit) return undefined;
+  const byOrdinal = new Map();
+  for (const record of page) {
+    const ordinal = record.key?.at(-1);
+    if (Number.isSafeInteger(ordinal)) byOrdinal.set(ordinal, record.payload);
+  }
+  return byOrdinal;
+}
 
 export function documentViewAdmission(payload) {
   if (payload === undefined) return undefined;
@@ -238,6 +265,11 @@ export async function documentOrdinalLiveness(view, {
   documentId,
   version,
   authoritative,
+  // Optional pre-read retirement set (see projectTombstones). Supplying it
+  // answers liveness from memory instead of a point read per document, which
+  // is what a bulk retrieval pass wants; omitting it keeps the single-document
+  // behavior unchanged.
+  tombstones,
 } = {}) {
   if (typeof project !== "string" || project.length === 0
     || typeof documentId !== "string" || documentId.length === 0
@@ -247,7 +279,9 @@ export async function documentOrdinalLiveness(view, {
   const assignment = await resolveDocumentOrdinal(view, { project, documentId, version });
   if (assignment === undefined) return undefined;
   const [tombstone, cutover] = await Promise.all([
-    view.get(derivedViewKeys.tombstone(assignment.project, assignment.ordinal)),
+    tombstones === undefined
+      ? view.get(derivedViewKeys.tombstone(assignment.project, assignment.ordinal))
+      : tombstones.get(assignment.ordinal),
     authoritative === undefined
       ? view.get(derivedViewKeys.queryCutover())
       : undefined,

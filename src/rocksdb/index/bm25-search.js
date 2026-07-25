@@ -8,6 +8,7 @@ import {
   derivedViewKeys,
   documentOrdinalLiveness,
   isDerivedViewQueryCutover,
+  projectTombstones,
 } from "../derived-view.js";
 import { tokenizeBm25Query } from "./tokenizer.js";
 import {
@@ -339,6 +340,21 @@ async function resolveSessionPostingLocators(view, records) {
   });
 }
 
+// Records buffered per single-session posting iterator. Large enough to
+// amortize iterator construction across a term's postings; every refill is
+// still clamped to the term's remaining physical budget, so this never widens
+// how much a query is allowed to read.
+const SESSION_POSTING_PAGE = 256;
+
+// Ceiling on the retired set read up front per query. Past this the scan stops
+// paying for itself against the point reads it replaces, and the query reverts
+// to reading each document's tombstone on demand.
+const MAX_PREFETCHED_TOMBSTONES = 50_000;
+
+// Below this many expected postings a query resolves liveness with a few point
+// reads, which beats scanning the project's whole retired set to answer them.
+const MIN_POSTINGS_FOR_TOMBSTONE_PREFETCH = 64;
+
 async function scanTermPostings(view, project, term, request, limit) {
   if (request.scope !== "session") {
     const records = view.scan(bm25Keys.postingPrefix(project, term), {
@@ -365,6 +381,14 @@ async function scanTermPostings(view, project, term, request, limit) {
   // read. Reserve half the physical budget for that worst case so the whole
   // term remains bounded even when every selected record is a locator.
   const recordLimit = Math.max(1, Math.floor(limit / 2));
+  // A lineage merge has to pull one record at a time: the budget is shared,
+  // and which session yields the next record depends on that record being
+  // fetched lazily. Buffering pages there lets whichever session refills
+  // first spend the shared allowance and starve the others out of the merge,
+  // silently changing which postings are selected. A single session has no
+  // merge and no contention, so it can read a page per iterator instead of
+  // paying an iterator construction for every posting.
+  const refillSize = states.length === 1 ? SESSION_POSTING_PAGE : 1;
   let scanBudgetExhausted = false;
   const available = (state) => {
     if (state.consumed < state.records.length) return true;
@@ -375,7 +399,7 @@ async function scanTermPostings(view, project, term, request, limit) {
     }
     state.records = view.scan(state.prefix, {
       reverse: true,
-      limit: 1,
+      limit: Math.max(1, Math.min(refillSize, recordLimit - recordsScanned)),
       ...(state.before === undefined ? {} : { before: state.before }),
     });
     state.consumed = 0;
@@ -605,6 +629,20 @@ export async function searchBm25(view, request = {}, options = {}) {
   const derivedViewAuthoritative = isDerivedViewQueryCutover(
     await view.get(derivedViewKeys.queryCutover()),
   );
+  // Read the project's retired set once rather than asking per posting whether
+  // a tombstone exists. Worth it only when the query will visit enough
+  // documents to amortize the scan: a selective term touches a handful of
+  // postings and would otherwise pay for the whole retired set to answer one
+  // lookup. Document frequency is already known here, so the decision costs
+  // nothing. Over the cap projectTombstones returns undefined and each
+  // document falls back to its own read.
+  const expectedPostings = activeTerms.reduce(
+    (total, term) => total + (statistics.terms[term]?.documentFrequency ?? 0),
+    0,
+  );
+  const tombstones = expectedPostings >= MIN_POSTINGS_FOR_TOMBSTONE_PREFETCH
+    ? projectTombstones(view, project, MAX_PREFETCHED_TOMBSTONES)
+    : undefined;
   // expiredRetentionClasses (declared above, possibly shared with a sibling
   // exact lookup) is keyed by documentId so the same expired document is
   // never double-counted across its stale windows/terms or a later
@@ -660,6 +698,7 @@ export async function searchBm25(view, request = {}, options = {}) {
           documentId: posting.documentId,
           version: posting.documentVersion,
           authoritative: derivedViewAuthoritative,
+          ...(tombstones === undefined ? {} : { tombstones }),
         });
         const marker = ordinal === undefined
           || (!ordinal.authoritative && ordinal.tombstone === undefined)

@@ -16,6 +16,7 @@ import { semanticLaunchArguments } from "./semantic-launch-arguments.js";
 import { rerankerLaunchArguments } from "./reranker-launch-arguments.js";
 import {
   appendDaemonLog,
+  daemonCompileCachePath,
   defaultDaemonLaunchLogPath,
   defaultDaemonLogPath,
 } from "../daemon/log-file.js";
@@ -260,6 +261,10 @@ function launchDaemon() {
     detached: process.platform !== "win32",
     stdio: "ignore",
     windowsHide: true,
+    env: {
+      ...process.env,
+      NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE ?? daemonCompileCachePath(),
+    },
   });
   // The daemon is shared by every facade for this store and must outlive the
   // worker that happened to win startup. The store lock arbitrates concurrent

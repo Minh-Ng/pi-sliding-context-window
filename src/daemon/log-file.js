@@ -15,6 +15,7 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const MAX_DAEMON_LOG_BYTES = 4 * 1_024 * 1_024;
 export const MAX_DAEMON_LOG_RECORD_BYTES = 64 * 1_024;
@@ -29,6 +30,21 @@ export function defaultDaemonLogPath(storePath) {
 
 export function defaultDaemonLaunchLogPath(storePath) {
   return join(dirname(resolve(storePath)), "daemon-launch.log");
+}
+
+/**
+ * Where the daemon caches compiled module bytecode.
+ *
+ * Anchored to the installation that owns the code being cached, which is both
+ * stable across launches and outside caller control. The two obvious
+ * alternatives are wrong here: the store directory may be a caller-owned
+ * temporary the daemon would still be writing into as its owner removes it,
+ * and a HOME-relative path follows callers that redirect HOME for isolation
+ * into exactly the same trap. Node degrades to no caching if the install tree
+ * is read-only.
+ */
+export function daemonCompileCachePath() {
+  return join(fileURLToPath(new URL("../../", import.meta.url)), ".compile-cache");
 }
 
 function positiveBytes(value, label) {

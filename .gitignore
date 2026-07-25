@@ -4,3 +4,6 @@ artifacts/
 
 # The standalone daemon's checkout-relative default is local runtime state.
 .context-window/
+
+# Compiled-module bytecode cache written by the daemon at runtime.
+.compile-cache/

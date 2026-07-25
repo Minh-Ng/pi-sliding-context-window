@@ -41,6 +41,15 @@ import {
 const DEFAULT_SCAN_LIMIT = 1_000;
 const MAX_SCAN_LIMIT = 100_000;
 
+// Bytes of sealed memtable retained for optimistic-transaction conflict
+// checking. The binding otherwise derives this from
+// maxWriteBufferNumber * writeBufferSize, which is 256 MiB of resident memory
+// on the default column family and dominates daemon RSS under sustained
+// indexing (measured: 689 MB peak at the derived default, 435 MB here).
+// Two write buffers of history keep conflict detection working for
+// transactions that span a flush; going below one buffer starts failing them.
+export const DEFAULT_MAX_WRITE_BUFFER_SIZE_TO_MAINTAIN = 32 * 1_024 * 1_024;
+
 // rocksdb-js 2.4.0 encodes binary keys into one fixed 4 KiB shared buffer.
 // Exact operations use the whole buffer; iterators place both range bounds in
 // that same buffer. Keep these checks at our native adapter boundary even
@@ -563,10 +572,15 @@ function assertDerivedViewRecords(admission, preparedRecords) {
   }
 }
 
+// One scratch buffer for every length prefix instead of a fresh four-byte
+// allocation per key and per value. The hashed byte sequence is unchanged --
+// length, key, length, value, in that order -- because the digest is persisted
+// in idempotency markers and compared against replayed requests.
+const FINGERPRINT_LENGTH_SCRATCH = Buffer.allocUnsafe(4);
+
 function hashLength(hash, length) {
-  const bytes = Buffer.allocUnsafe(4);
-  bytes.writeUInt32BE(length);
-  hash.update(bytes);
+  FINGERPRINT_LENGTH_SCRATCH.writeUInt32BE(length);
+  hash.update(FINGERPRINT_LENGTH_SCRATCH);
 }
 
 function requestFingerprint(entries) {
@@ -604,6 +618,8 @@ export class RocksStore {
       dbWriteBufferSize: options.dbWriteBufferSize,
       writeBufferSize: options.writeBufferSize,
       maxWriteBufferNumber: options.maxWriteBufferNumber,
+      maxWriteBufferSizeToMaintain: options.maxWriteBufferSizeToMaintain
+        ?? DEFAULT_MAX_WRITE_BUFFER_SIZE_TO_MAINTAIN,
     });
     const store = new RocksStore(absolutePath, database, options);
     try {
@@ -1002,15 +1018,14 @@ export class RocksStore {
           );
           assignment = createDocumentOrdinal(viewAdmission, documentOrdinal);
           admittedOrdinals = [documentOrdinal];
+          // The identity key is the one just read as existingAssignment, so it
+          // is known absent on this branch; the remaining three are keyed by a
+          // freshly allocated ordinal and keep their immutability check.
+          transaction.dbi.putSync(
+            identityKey,
+            writeBytes(identityKey, assignment, { kind: "document-ordinal" }),
+          );
           for (const [key, kind] of [
-            [
-              derivedViewKeys.document(
-                assignment.project,
-                assignment.documentId,
-                assignment.documentVersion,
-              ),
-              "document-ordinal",
-            ],
             [derivedViewKeys.ordinal(documentOrdinal), "document-ordinal"],
             [
               derivedViewKeys.projectDocument(assignment.project, documentOrdinal),
@@ -1082,7 +1097,10 @@ export class RocksStore {
           ),
         );
       }
-      immutablePutSync(transaction.dbi, encodedMarkerKey, writeBytes(encodedMarkerKey, {
+      // This transaction opened by reading the marker and returning early if
+      // it existed, so its absence is already established. Re-reading it here
+      // through immutablePutSync would buy nothing.
+      transaction.dbi.putSync(encodedMarkerKey, writeBytes(encodedMarkerKey, {
         requestId,
         fingerprint,
         recordKeys,

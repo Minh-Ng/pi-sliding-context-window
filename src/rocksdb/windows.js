@@ -64,6 +64,27 @@ export function normalizeWindowOptions(options = {}) {
 }
 
 /**
+ * UTF-8 byte length of `source` between two code-unit offsets, measured in
+ * place. Every token needs the byte width of both itself and the gap before
+ * it; slicing those out to measure them allocated two throwaway strings per
+ * token on the admission path. Text is validated free of unpaired surrogates
+ * upstream, so a high surrogate is always followed by its pair.
+ */
+function utf8LengthBetween(source, start, end) {
+  let bytes = 0;
+  for (let index = start; index < end; index += 1) {
+    const code = source.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code < 0xdc00) {
+      bytes += 4;
+      index += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/**
  * Deterministically approximate model tokens while preserving exact UTF-8
  * byte coordinates. Word-like runs are one token; visible punctuation is one
  * token. The evaluation harness can inject a different tokenizer when needed.
@@ -72,6 +93,11 @@ export function tokenizeWithByteOffsets(text) {
   const source = requireWellFormedText(text);
   const tokens = [];
   const expression = /[\p{L}\p{M}\p{N}_]+|[^\s]/gu;
+  // One native measurement settles the whole document: when its UTF-8 size
+  // equals its code-unit count every character is one byte, so byte offsets
+  // are the match indices themselves and no per-token width scan is needed.
+  // Tool output and code -- the bulk of what gets archived -- take this path.
+  const singleByteText = Buffer.byteLength(source, "utf8") === source.length;
   let previousCodeUnitEnd = 0;
   let previousByteEnd = 0;
   for (const match of source.matchAll(expression)) {
@@ -82,16 +108,20 @@ export function tokenizeWithByteOffsets(text) {
       error.code = "INVALID_REQUEST";
       throw error;
     }
-    const skipped = source.slice(previousCodeUnitEnd, match.index);
-    const startByte = previousByteEnd + Buffer.byteLength(skipped, "utf8");
-    const tokenBytes = Buffer.byteLength(match[0], "utf8");
-    const endByte = startByte + tokenBytes;
+    const value = match[0];
+    const matchEnd = match.index + value.length;
+    const startByte = singleByteText
+      ? match.index
+      : previousByteEnd + utf8LengthBetween(source, previousCodeUnitEnd, match.index);
+    const endByte = singleByteText
+      ? matchEnd
+      : startByte + utf8LengthBetween(source, match.index, matchEnd);
     tokens.push(Object.freeze({
-      value: match[0],
+      value,
       startByte,
       endByte,
     }));
-    previousCodeUnitEnd = match.index + match[0].length;
+    previousCodeUnitEnd = matchEnd;
     previousByteEnd = endByte;
   }
   return Object.freeze(tokens);

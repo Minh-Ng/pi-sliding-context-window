@@ -1138,6 +1138,73 @@ test("force shortens only unprotected ephemeral tool payloads while processing d
   assert.equal(await store.get([KEYSPACE.SUPERSESSION, sourceTurn.documentId, 1]), undefined);
 });
 
+test("bounded emergency cleanup resumes normally after disk pressure clears and the store reopens", async (t) => {
+  const path = temporaryStorePath(t, "retention-emergency-resume");
+  let store = await RocksStore.open(path);
+  const candidate = document("emergency-resume", {
+    kind: "tool-result",
+    metadata: { toolCallId: "emergency-resume-call" },
+    text: Array.from(
+      { length: 80 },
+      (_, ordinal) => `EMERGENCY_RESUME_${ordinal}`,
+    ).join(" "),
+  });
+  await admit(store, candidate, 10_000, {
+    retentionClass: "ephemeral-payload",
+    windowTokens: 2,
+  });
+  await indexAll(store);
+
+  const partial = await runRetention(
+    store,
+    retentionRequest(100, { force: true, batchSize: 1 }),
+    { allowEmergencyShortening: true, workLimit: 3 },
+  );
+  assert.equal(partial.status, "more-work");
+  assert.equal(partial.tombstoned, 1);
+  assert.equal(
+    (await store.get([KEYSPACE.SUPERSESSION, candidate.documentId, 1])).status,
+    "expired",
+  );
+  const immediate = await store.get(retentionKeys.expiryCurrent(candidate.documentId, 1));
+  assert.equal(immediate.expiresAt, 100);
+  assert.equal(immediate.retentionClass, "ephemeral-payload");
+  assert.notEqual(await store.get(retentionKeys.expiry(
+    100,
+    "ephemeral-payload",
+    candidate.documentId,
+    1,
+    immediate.generation,
+  )), undefined);
+  store.close();
+
+  store = await RocksStore.open(path);
+  t.after(() => store.close());
+  let resumed;
+  for (let wave = 0; wave < 100; wave += 1) {
+    resumed = await runRetention(
+      store,
+      retentionRequest(101, { batchSize: 1 }),
+      { workLimit: 3 },
+    );
+    if (resumed.status === "complete") break;
+  }
+  assert.equal(resumed.status, "complete");
+  assert.equal(
+    (await store.get(retentionKeys.cleanup(candidate.documentId, 1))).status,
+    "complete",
+  );
+  assert.equal(await store.get(manifestKeys.document(candidate.documentId, 1)), undefined);
+  assert.equal(await store.get(retentionKeys.cleanupManifest(candidate.documentId, 1)), undefined);
+  assert.equal(
+    store.scan([KEYSPACE.EXPIRY])
+      .some(({ payload }) =>
+        payload?.documentId === candidate.documentId
+        && payload.expiresAt <= 101),
+    false,
+  );
+});
+
 test("public force runs due cleanup without shortening configured lifetimes", async (t) => {
   const store = await RocksStore.open(temporaryStorePath(t, "retention-public-force"));
   t.after(() => store.close());

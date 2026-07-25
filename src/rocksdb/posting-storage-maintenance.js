@@ -4,6 +4,7 @@ import {
   DERIVED_VIEW_FORMAT_VERSION,
   DERIVED_VIEW_LAYOUT,
   derivedViewKeys,
+  documentOrdinalLiveness,
   verifyDerivedViewPage,
 } from "./derived-view.js";
 import {
@@ -14,6 +15,7 @@ import {
   exactKeys,
   normalizeExactValue,
 } from "./index/exact.js";
+import { manifestKeys, retiredDocumentStatus } from "./manifests.js";
 import {
   encodePostingLocator,
   isPostingLocator,
@@ -106,8 +108,63 @@ function bm25CanonicalKey(record) {
   );
 }
 
+function bm25PostingIdentity(record) {
+  const [
+    ,
+    ,
+    ,
+    ,
+    family,
+    project,
+    ,
+    ,
+    ,
+    ,
+    documentId,
+    version,
+  ] = record.key;
+  if (family !== "session-term") throw new TypeError("Expected a BM25 session posting.");
+  return { project, documentId, version };
+}
+
+async function isDurablyRetiredBm25Posting(view, record) {
+  const identity = bm25PostingIdentity(record);
+  const ordinal = await documentOrdinalLiveness(view, identity);
+  if (ordinal?.live === false) return true;
+  const marker = await view.get([
+    KEYSPACE.SUPERSESSION,
+    identity.documentId,
+    identity.version,
+  ]);
+  if (marker?.documentId === identity.documentId
+    && marker.documentVersion === identity.version
+    && (marker.status === "expired" || marker.status === "superseded")) {
+    return true;
+  }
+  const history = await view.get(manifestKeys.documentHistory(identity.documentId));
+  return history?.project === identity.project
+    && retiredDocumentStatus(history, identity.version) !== undefined;
+}
+
 function encodedValueBytes(kind, payload) {
   return encodeRecord({ kind, payload }).length;
+}
+
+function measureRewrites(rewrites) {
+  return rewrites.reduce((summary, { record, kind, payload }) => {
+    const nextBytes = encodedValueBytes(kind, payload);
+    return {
+      rewrittenKeys: summary.rewrittenKeys + 1,
+      previousValueBytes: summary.previousValueBytes + record.storedValueBytes,
+      nextValueBytes: summary.nextValueBytes + nextBytes,
+      valueBytesSaved: summary.valueBytesSaved + Math.max(0, record.storedValueBytes - nextBytes),
+    };
+  }, {
+    rewrittenKeys: 0,
+    previousValueBytes: 0,
+    nextValueBytes: 0,
+    valueBytesSaved: 0,
+  });
 }
 
 async function rewriteRecords(
@@ -128,36 +185,33 @@ async function rewriteRecords(
     }
     rewrites.push({ record, ...rewrite });
   }
-  const measured = rewrites.reduce((summary, { record, kind, payload }) => {
-    const nextBytes = encodedValueBytes(kind, payload);
-    return {
-      rewrittenKeys: summary.rewrittenKeys + 1,
-      previousValueBytes: summary.previousValueBytes + record.storedValueBytes,
-      nextValueBytes: summary.nextValueBytes + nextBytes,
-      valueBytesSaved: summary.valueBytesSaved + Math.max(0, record.storedValueBytes - nextBytes),
-    };
-  }, {
-    rewrittenKeys: 0,
-    previousValueBytes: 0,
-    nextValueBytes: 0,
-    valueBytesSaved: 0,
-  });
-  if (!reportOnly) {
-    for (let offset = 0; offset < rewrites.length; offset += 128) {
-      const batch = rewrites.slice(offset, offset + 128);
-      await store.transaction(async (transaction) => {
-        for (const { record, kind, payload } of batch) {
-          const current = await transaction.getRecord(record.keyBytes);
-          if (current === undefined || alreadyRewritten(current.payload)) continue;
-          if (stableJson(current.payload) !== stableJson(record.payload)) {
-            throw new Error("Posting changed during storage migration.");
-          }
-          await transaction.put(record.keyBytes, payload, { kind });
+  if (reportOnly) return { ...measureRewrites(rewrites), unresolvedKeys };
+  const applied = [];
+  for (let offset = 0; offset < rewrites.length; offset += 128) {
+    const batch = rewrites.slice(offset, offset + 128);
+    const committed = await store.transaction(async (transaction) => {
+      const written = [];
+      let unresolved = 0;
+      for (const rewrite of batch) {
+        const { record, kind, payload, validate } = rewrite;
+        const current = await transaction.getRecord(record.keyBytes);
+        if (current === undefined || alreadyRewritten(current.payload)) continue;
+        if (stableJson(current.payload) !== stableJson(record.payload)) {
+          throw new Error("Posting changed during storage migration.");
         }
-      });
-    }
+        if (validate !== undefined && !await validate(transaction)) {
+          unresolved += 1;
+          continue;
+        }
+        await transaction.put(record.keyBytes, payload, { kind });
+        written.push(rewrite);
+      }
+      return { written, unresolved };
+    });
+    applied.push(...committed.written);
+    unresolvedKeys += committed.unresolved;
   }
-  return { ...measured, unresolvedKeys };
+  return { ...measureRewrites(applied), unresolvedKeys };
 }
 
 /**
@@ -179,6 +233,7 @@ export async function rewriteBm25SessionPostingLocators(store, {
     const canonicalKey = bm25CanonicalKey(record);
     const canonical = await store.get(canonicalKey);
     if (canonical === undefined) {
+      if (await isDurablyRetiredBm25Posting(store, record)) return undefined;
       throw new Error("A BM25 session posting has no canonical project posting.");
     }
     if (stableJson(canonical) !== stableJson(record.payload)) {
@@ -190,6 +245,17 @@ export async function rewriteBm25SessionPostingLocators(store, {
         POSTING_LOCATOR_KIND.BM25_SESSION,
         [encodeKey(canonicalKey)],
       ),
+      validate: async (transaction) => {
+        const currentCanonical = await transaction.get(canonicalKey);
+        if (currentCanonical === undefined) {
+          if (await isDurablyRetiredBm25Posting(transaction, record)) return false;
+          throw new Error("A BM25 session posting has no canonical project posting.");
+        }
+        if (stableJson(currentCanonical) !== stableJson(record.payload)) {
+          throw new Error("A BM25 session posting differs from its canonical project posting.");
+        }
+        return true;
+      },
     };
   }, reportOnly, isPostingLocator);
   return Object.freeze({

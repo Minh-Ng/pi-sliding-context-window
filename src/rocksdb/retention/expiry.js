@@ -154,6 +154,37 @@ async function enqueueDeleteOutbox(transaction, candidate, now) {
   return sequence;
 }
 
+async function ensureImmediateCleanupExpiry(transaction, candidate, now) {
+  if (candidate.expiresAt <= now) return;
+  const currentKey = retentionKeys.expiryCurrent(candidate.documentId, candidate.version);
+  const current = await transaction.get(currentKey);
+  if (current?.expiresAt <= now) return;
+  const generation = Math.max(current?.generation ?? 0, candidate.generation ?? 0) + 1;
+  const immediate = Object.freeze({
+    retentionFormatVersion: RETENTION_FORMAT_VERSION,
+    documentId: candidate.documentId,
+    documentVersion: candidate.version,
+    retentionClass: candidate.retentionClass,
+    expiresAt: now,
+    generation,
+    renewedAt: now,
+  });
+  await transaction.put(currentKey, immediate, { kind: "retention-expiry-current" });
+  // The generation is allocated under the document guard in this transaction,
+  // so a regular put preserves uniqueness without a cold transactional read.
+  await transaction.put(
+    retentionKeys.expiry(
+      now,
+      candidate.retentionClass,
+      candidate.documentId,
+      candidate.version,
+      generation,
+    ),
+    immediate,
+    { kind: "expiry" },
+  );
+}
+
 export async function beginExpiry(store, candidate, now, options = {}) {
   // The native optimistic transaction cannot perform a blocking first read
   // immediately after reopen. Warm every point-read key while range scans
@@ -201,6 +232,9 @@ export async function beginExpiry(store, candidate, now, options = {}) {
       await recordDerivedViewTombstone(transaction, ordinalAssignment, existing);
       const cleanup = await transaction.get(retentionKeys.cleanup(candidate.documentId, candidate.version));
       if (cleanup?.deleteOutboxSequence !== undefined) {
+        if (options.forced === true) {
+          await ensureImmediateCleanupExpiry(transaction, candidate, now);
+        }
         return Object.freeze({
           status: "already-tombstoned",
           tombstone: existing,
@@ -233,6 +267,9 @@ export async function beginExpiry(store, candidate, now, options = {}) {
           manifest,
           { kind: "retention-cleanup-manifest" },
         );
+      }
+      if (options.forced === true) {
+        await ensureImmediateCleanupExpiry(transaction, candidate, now);
       }
       return Object.freeze({
         status: "already-tombstoned",
@@ -294,6 +331,9 @@ export async function beginExpiry(store, candidate, now, options = {}) {
       manifest,
       { kind: "retention-cleanup-manifest" },
     );
+    if (options.forced === true) {
+      await ensureImmediateCleanupExpiry(transaction, candidate, now);
+    }
     return Object.freeze({
       status: "tombstoned",
       manifest,

@@ -268,7 +268,11 @@ test("comparison benchmark exercises both stores without overstating unmeasured 
   assert.equal(Object.keys(artifact.scenarios).length, 12);
   assert.equal(artifact.scenarios["sqlite.canonical.clients-1"].operationCount, 8);
   assert.equal(artifact.scenarios["rocksdb.canonical.clients-8"].operationCount, 8);
-  assert.notEqual(artifact.gates.canonicalAppendP95.status, "not-measured");
+  // Eight operations cannot support a p95: the estimate would rest on a single
+  // tail observation. Declining to judge is the point of this test's name, so
+  // the gate must say so rather than emit a verdict this corpus cannot carry.
+  assert.equal(artifact.gates.canonicalAppendP95.status, "not-measured");
+  assert.match(artifact.gates.canonicalAppendP95.reason, /operations per arm/);
   assert.notEqual(artifact.gates.largeToolIngestThroughput.status, "not-measured");
   assert.equal(artifact.gates.warmPreflightP95.status, "not-measured");
   assert.notEqual(artifact.outcome, "passed");

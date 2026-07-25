@@ -125,6 +125,16 @@ function notMeasured(reason) {
   return { status: "not-measured", reason };
 }
 
+// Samples each arm needs before a p95 comparison means anything. A p95 is
+// estimated from the slowest 5 percent, so a 200-operation development run
+// decides this gate on ten observations and a single GC pause or compaction
+// stall moves it. Measured at that size, the ratio swung between 0.85 and 3.70
+// across repeated runs of identical code -- passing and failing the same
+// commit. This floor keeps 50 tail observations per arm, and sits far below
+// the smallest official corpus (10,000 windows), so a real evaluation still
+// gates while a quick run reports honestly that it cannot judge.
+const MIN_CANONICAL_P95_SAMPLES = 1_000;
+
 function canonicalAppendGate(mode, scenarios) {
   if (mode !== "comparison") {
     return notMeasured("A RocksDB-to-SQLite comparison is not present in this mode.");
@@ -134,10 +144,21 @@ function canonicalAppendGate(mode, scenarios) {
     const sqlite = scenarios[scenarioName("sqlite", "canonical", clients)];
     const rocksdb = scenarios[scenarioName("rocksdb", "canonical", clients)];
     if (!sqlite || !rocksdb) return notMeasured(`Canonical append scenarios are missing for ${clients} client(s).`);
+    const samples = Math.min(
+      sqlite.latencyMilliseconds.summary.sampleCount,
+      rocksdb.latencyMilliseconds.summary.sampleCount,
+    );
+    if (samples < MIN_CANONICAL_P95_SAMPLES) {
+      return notMeasured(
+        `Canonical append p95 needs at least ${MIN_CANONICAL_P95_SAMPLES} operations per arm to be `
+          + `stable; this run measured ${samples} at ${clients} client(s).`,
+      );
+    }
     const sqliteP95 = sqlite.latencyMilliseconds.summary.p95;
     const rocksdbP95 = rocksdb.latencyMilliseconds.summary.p95;
     comparisons.push({
       clients,
+      sampleCount: samples,
       sqliteP95Milliseconds: sqliteP95,
       rocksdbP95Milliseconds: rocksdbP95,
       ratio: sqliteP95 === 0 ? null : rocksdbP95 / sqliteP95,
@@ -146,7 +167,8 @@ function canonicalAppendGate(mode, scenarios) {
   }
   return {
     status: comparisons.every(({ passed }) => passed) ? "passed" : "failed",
-    requirement: "RocksDB canonical append p95 is no slower than SQLite at one and eight clients.",
+    requirement: "RocksDB canonical append p95 is no slower than SQLite at one and eight clients, "
+      + `measured over at least ${MIN_CANONICAL_P95_SAMPLES} operations per arm.`,
     comparisons,
   };
 }

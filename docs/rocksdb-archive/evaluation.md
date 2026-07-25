@@ -57,7 +57,11 @@ Generate deterministic stores at 10 thousand, 100 thousand, and 1 million logica
 
 **Performance gates**
 
-- Canonical append p95 is no slower than SQLite at one client and eight concurrent clients.
+- Canonical append p95 is no slower than SQLite at one client and eight concurrent clients, measured
+  over at least 1,000 operations per arm. Below that the p95 rests on too few tail observations to
+  be stable — a 200-operation run swung between 0.85 and 3.70 on identical code — so smaller runs
+  report the gate as not-measured rather than deciding it on noise. Every official corpus is far
+  above the floor.
 - Large-tool ingest throughput is at least 1.5 times the SQLite baseline for 1 MiB payloads, and no
   worse than 0.8 times for 10 KiB payloads. A 1 MiB admission amortizes the fixed cost of a canonical
   commit over enough bytes for the throughput advantage to show; at 10 KiB that fixed cost is most of

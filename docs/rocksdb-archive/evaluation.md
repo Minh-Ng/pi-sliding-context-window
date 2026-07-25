@@ -58,7 +58,11 @@ Generate deterministic stores at 10 thousand, 100 thousand, and 1 million logica
 **Performance gates**
 
 - Canonical append p95 is no slower than SQLite at one client and eight concurrent clients.
-- Large-tool ingest throughput is at least 1.5 times the SQLite baseline.
+- Large-tool ingest throughput is at least 1.5 times the SQLite baseline for 1 MiB payloads, and no
+  worse than 0.8 times for 10 KiB payloads. A 1 MiB admission amortizes the fixed cost of a canonical
+  commit over enough bytes for the throughput advantage to show; at 10 KiB that fixed cost is most of
+  the work and the two backends land level, so parity there is the expectation rather than a
+  regression, and the floor exists to catch RocksDB becoming materially slower.
 - Warm exact and BM25 preflight p95 is at most 50 ms at one million windows with vectors disabled.
 - Three-window recall p95 is at most 25 ms on the benchmark host.
 - Daemon steady-state RSS is at most 256 MiB with vector models disabled.

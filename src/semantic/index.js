@@ -175,7 +175,13 @@ export class LocalSemanticIndex {
     return this.embedder;
   }
 
-  #projectDirectory(project) {
+  /**
+   * Where this project's vectors live on disk. Public because purging a
+   * project is now a cross-layer concern: the caller that retires a project's
+   * documents has to be able to find and remove the index that no keyspace
+   * sweep reaches.
+   */
+  projectDirectory(project) {
     return join(this.indexPath, this.fingerprint, digest(project, 32));
   }
 
@@ -183,7 +189,7 @@ export class LocalSemanticIndex {
     let statePromise = this.states.get(project);
     if (statePromise) return statePromise;
     statePromise = (async () => {
-      const directory = this.#projectDirectory(project);
+      const directory = this.projectDirectory(project);
       const state = {
         project,
         directory,
@@ -550,6 +556,33 @@ export class LocalSemanticIndex {
 
   async flush() {
     await this.queue;
+  }
+
+  /**
+   * Drop one project's vectors from memory and disk.
+   *
+   * Retiring a project's documents only reaches the canonical keyspaces; the
+   * embeddings live in their own on-disk index that no keyspace sweep touches,
+   * so a project purged everywhere else keeps its vectors indefinitely.
+   * Tolerates a project that was never indexed, so a caller can invoke it for
+   * every purge without first asking whether one exists.
+   */
+  async removeProject(project) {
+    if (typeof project !== "string" || project.length === 0) {
+      throw new TypeError("removeProject requires a non-empty project.");
+    }
+    // Settle queued indexing first: an in-flight persist for this project
+    // would otherwise recreate the directory right after it is removed.
+    await this.queue?.catch(() => {});
+    const pending = this.states.get(project);
+    this.states.delete(project);
+    if (pending !== undefined) {
+      const state = await pending.catch(() => undefined);
+      if (state !== undefined) {
+        this.documentCount = Math.max(0, this.documentCount - state.documents.size);
+      }
+    }
+    await rm(this.projectDirectory(project), { recursive: true, force: true });
   }
 
   async close() {

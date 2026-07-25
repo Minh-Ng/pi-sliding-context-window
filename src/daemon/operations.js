@@ -19,6 +19,7 @@ import { createImportanceIndexHandler } from "../rocksdb/index/importance.js";
 import { createNearDuplicateIndexHandler } from "../rocksdb/index/simhash.js";
 import { IndexWorker } from "../rocksdb/indexer.js";
 import { outboxKeys, outboxMetrics } from "../rocksdb/outbox.js";
+import { purgeProjectRecordsUntilComplete } from "../rocksdb/project-purge.js";
 import { scanStatusPrefix } from "../rocksdb/status-scan.js";
 import { derivedViewStatus } from "../rocksdb/derived-view.js";
 import {
@@ -762,6 +763,7 @@ export class DaemonOperations {
     const modes = new Set();
     let indexGeneration = 0;
     let expiredCount = 0;
+    let truncated = false;
     const expiredRetentionClasses = new Set();
     for (const project of readProjects) {
       // Same query-time recency decay as the single-project path, so an
@@ -781,6 +783,9 @@ export class DaemonOperations {
       });
       modes.add(result.mode);
       indexGeneration = Math.max(indexGeneration, result.indexGeneration);
+      // One capped leg caps the union: the merged ranking is drawn from that
+      // leg's partial pool too.
+      if (result.truncated === true) truncated = true;
       // Aggregate expired-but-matching evidence across the alias union so a
       // symlink-widened search still surfaces the aged-out counts a
       // single-project search would have reported.
@@ -831,6 +836,7 @@ export class DaemonOperations {
       ...(expiredCount > 0
         ? { expiredMatches: { count: expiredCount, retentionClasses: [...expiredRetentionClasses] } }
         : {}),
+      ...(truncated ? { truncated: true } : {}),
     });
     // Record implicit feedback on the final merged ranking, keyed by the
     // authenticated project. Locator fingerprints are content-only, so a later
@@ -1327,7 +1333,7 @@ export class DaemonOperations {
 
   async redact(payload, context) {
     this.assertRedactConfirm(payload, context);
-    return this.store.withSharedWrite(async () => {
+    const result = await this.store.withSharedWrite(async () => {
       const gate = await migrationRetentionGate(this.store);
       if (!gate.allowed) {
         throw codedError("STORE_BUSY", "Archive redaction is blocked during migration.");
@@ -1420,6 +1426,32 @@ export class DaemonOperations {
         ...(nextCursor === undefined ? {} : { nextCursor }),
       };
     });
+    // Retirement is per document, so records keyed by project rather than by
+    // document -- BM25 corpus and per-term statistics, derived-view scope
+    // membership, relation heads -- outlive it. Purge them once the last page
+    // has retired and its index deletes have drained; purging earlier lets
+    // pending outbox work rewrite the namespaces just reclaimed. The sweep
+    // refuses to run while the project still has a live document.
+    if (result.status === "complete" && payload.scope === "project") {
+      await this.drainIndexUntilIdle();
+      await purgeProjectRecordsUntilComplete(this.store, {
+        project: context.project,
+        now: Number.isSafeInteger(payload.now) ? payload.now : Date.now(),
+      });
+      // Vectors live outside the keyspaces the purge sweeps, so the sweep
+      // alone leaves a redacted project's embeddings on disk. Optional by
+      // construction: with no semantic index configured this is a no-op and
+      // redaction behaves exactly as it did before.
+      try {
+        await this.semantic?.removeProject?.(context.project);
+      } catch (error) {
+        // The canonical purge has already committed. A stranded vector index
+        // is a storage leak, not a correctness failure, so report it rather
+        // than failing a redaction that already succeeded.
+        this.recordBackgroundError(error);
+      }
+    }
+    return result;
   }
 
   handlers() {

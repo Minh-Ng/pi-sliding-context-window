@@ -544,6 +544,14 @@ const searchResponse = object({
   // expired content itself. Optional (not in the required list below) so
   // older daemons/clients that predate this field do not fail validation.
   expiredMatches: expiredMatchesSummary,
+  // Whether candidate collection hit a work bound and stopped before the
+  // matching set was exhausted, so `results` was ranked from a partial pool.
+  // Without this a capped search is indistinguishable from an exhaustive one,
+  // and an agent reads a truncated ranking as the whole story -- the same
+  // failure `expiredMatches` exists to prevent. Traversal already reports
+  // this; search is the outlier. Optional so daemons and clients predating
+  // the field still validate.
+  truncated: boolean(),
 }, ["mode", "status", "indexGeneration", "results"]);
 
 const traversalResponse = object({

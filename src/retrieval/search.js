@@ -675,6 +675,7 @@ async function collectCandidates(view, request, options) {
   let lexicalAttempted = false;
   let structuralAttempted = false;
   let structuralStatus;
+  let truncated = false;
   // Shared by the exact and lexical passes below so a document tombstoned
   // without a live replacement is counted once even when both indexes
   // independently retain a stale posting for it; bounded by what those
@@ -713,6 +714,10 @@ async function collectCandidates(view, request, options) {
       ...(generation > 0 ? { generation } : {}),
     }, { ...widenedSnippetOptions("bm25", options.bm25 ?? {}, request, options), expiredRetentionClasses });
     candidates.push(...lexicalCandidates(lexical));
+    // BM25 stops once it hits its posting or candidate budget, which caps the
+    // pool the ranking is drawn from. Carry that upward instead of discarding
+    // it, so a capped search is not reported as an exhaustive one.
+    if (lexical.work?.truncated === true) truncated = true;
   }
   const expiredMatches = Object.freeze({
     count: expiredRetentionClasses.size,
@@ -753,6 +758,7 @@ async function collectCandidates(view, request, options) {
     structuralAttempted,
     structuralStatus,
     expiredMatches,
+    truncated,
   });
 }
 
@@ -1454,6 +1460,7 @@ export async function searchArchive(store, request, options = {}) {
     indexGeneration: collected.generation,
     results,
     expiredMatches: collected.expiredMatches,
+    ...(collected.truncated === true ? { truncated: true } : {}),
   });
   // Implicit relevance feedback: hand the presented results (query, ranks,
   // modes, scores, locators) to an optional local recorder. The daemon supplies

@@ -252,7 +252,7 @@ Use the `context-window` namespace in Pi's shared settings files:
     "semanticCandidates": 40,
     "semanticModelDimensions": null,
     "semanticModelPooling": null,
-    "rerankerEnabled": true,
+    "rerankerEnabled": false,
     "rerankerModel": "Xenova/ms-marco-MiniLM-L-6-v2",
     "rerankerModelRevision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
     "rerankerModelCachePath": "~/.pi/context-window/reranker-models",
@@ -362,6 +362,12 @@ CONTEXT_WINDOW_SOCKET=/optional/custom/context-windowd.sock
 ```
 
 Point any MCP-capable client at that command. This provides shared archival and retrieval, not transparent transcript rotation on hosts without a pre-request message-transform API.
+
+## Applying local source changes
+
+After editing this local package, exit Pi and resume the session from the same directory with `pi -c`. Do not rely on `/reload` to deploy context-window source changes: Pi's package loader can retain the already-loaded extension generation and its native ESM dependencies. `/reload` remains suitable for ordinary configuration/resource refreshes, but a fresh Pi process is the verification boundary for code changes.
+
+Client-side changes under `extensions/`, `src/session/`, or `src/archive/` do not require restarting the shared daemon. Restart the daemon with `/window daemon restart --force` only when daemon runtime behavior under `bin/context-windowd.js` or `src/daemon/` must change. Do not kill daemon PIDs manually.
 
 ## Daemon and migration operations
 

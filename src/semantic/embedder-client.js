@@ -33,9 +33,12 @@ export class LocalEmbedder {
     this.pending.clear();
   }
 
-  embed(texts) {
+  embed(texts, { priority = "foreground" } = {}) {
     if (!Array.isArray(texts) || texts.length === 0 || texts.some((text) => typeof text !== "string")) {
       throw new TypeError("embed requires a non-empty string array.");
+    }
+    if (priority !== "foreground" && priority !== "background") {
+      throw new TypeError("embed priority must be foreground or background.");
     }
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
@@ -45,7 +48,7 @@ export class LocalEmbedder {
       }, this.timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
-      this.worker.postMessage({ id, texts });
+      this.worker.postMessage({ id, texts, priority });
     });
   }
 

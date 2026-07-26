@@ -240,6 +240,26 @@ export async function recordRecalledLocator(store, {
  * Returns 0 when no recall has ever been recorded. This is the only feedback
  * signal retrieval-adjacent code reads; the raw event ring stays write-only.
  */
+export function relevanceFeedbackEvents(store, {
+  project,
+  limit = MAX_FEEDBACK_EVENTS_PER_PROJECT,
+} = {}) {
+  requireStore(store);
+  requireProject(project);
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_FEEDBACK_EVENTS_PER_PROJECT) {
+    throw new TypeError(`limit must be between 1 and ${MAX_FEEDBACK_EVENTS_PER_PROJECT}.`);
+  }
+  const events = Array.from(store.iterate(feedbackKeys.eventPrefix(project), {
+    limit,
+    fillCache: false,
+    reverse: true,
+  }), ({ payload }) => payload).reverse();
+  return assertStoreResult("feedback.events", {
+    events,
+    truncated: events.length === limit,
+  });
+}
+
 export async function documentRecallCount(view, { project, documentId, version } = {}) {
   if (!view || typeof view.get !== "function") {
     throw new TypeError("documentRecallCount requires a store or snapshot view.");

@@ -154,6 +154,12 @@ test("facade shards protection deterministically without exceeding the wire cap"
   });
   assert.equal(result, undefined, "setProtectedContext preserves its synchronous facade result");
   const initial = calls.filter(({ operation }) => operation === "store.protect");
+  archive.setProtectedContext({ sessionIds: ["session-main"], documentIds });
+  assert.equal(
+    calls.filter(({ operation }) => operation === "store.protect").length,
+    initial.length,
+    "an unchanged context does not renew protection before the lease timer",
+  );
   assert.deepEqual(initial.map(({ payload }) => payload.documentVersions.length), [1_000, 1]);
   assert.ok(initial.every(({ payload }) => (
     payload.documentVersions.length <= MAX_PROTECTED_DOCUMENT_VERSIONS
@@ -183,6 +189,25 @@ test("facade shards protection deterministically without exceeding the wire cap"
   assert.equal(protectedByOwner.size, 1, "the empty set retains the current owner heartbeat");
   assert.deepEqual([...protectedByOwner.values()], [[]]);
   assert.deepEqual(calls.at(-1).payload.documentVersions, []);
+});
+
+test("facade caches protected document versions until the lease refresh", () => {
+  const archive = Object.create(DaemonArchive.prototype);
+  archive.documentVersionById = new Map();
+  let headReads = 0;
+  archive.canonicalHead = (documentId) => {
+    headReads += 1;
+    return { documentId, version: 1 };
+  };
+  archive.syncProtection = () => {};
+
+  const documentIds = ["one", "two", "three"];
+  assert.equal(archive.documentVersions(documentIds).length, 3);
+  assert.equal(archive.documentVersions(documentIds).length, 3);
+  assert.equal(headReads, 3);
+  archive.refreshPolicyLease();
+  assert.equal(archive.documentVersions(documentIds).length, 3);
+  assert.equal(headReads, 6);
 });
 
 test("facade propagates a protection shard failure", () => {

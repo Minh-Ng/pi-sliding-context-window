@@ -1003,21 +1003,26 @@ function compactionConfig(overrides = {}) {
 function memoryCheckpointArchive() {
   const documents = new Map();
   const puts = [];
+  const protectionRequests = [];
   return {
     documents,
     puts,
-    put(document) {
+    protectionRequests,
+    put(document, options = {}) {
       const stored = document.id
         ? document
         : { ...document, id: `memory-document-${puts.length + 1}` };
       puts.push(stored);
       documents.set(stored.id, stored);
+      if (options.protect) {
+        protectionRequests.push({ sessionIds: [], documentIds: [stored.id] });
+      }
       return stored.id;
     },
     search() { return []; },
     get(id) { return documents.get(id); },
     count() { return documents.size; },
-    setProtectedContext() {},
+    setProtectedContext(request) { protectionRequests.push(structuredClone(request)); },
     prune() {},
     close() {},
   };
@@ -1107,16 +1112,63 @@ test("agent settlement checkpoints a short Pi session and shutdown does not dupl
     message,
   }));
 
+  const protectionCallsBeforeSettlement = archive.protectionRequests.length;
   handlers.get("agent_settled")({}, ctx);
   assert.equal(archive.puts.filter(({ kind }) => kind === "turn").length, 1);
+  assert.equal(archive.protectionRequests.length - protectionCallsBeforeSettlement, 1);
   assert.match(
     archive.puts.find(({ kind }) => kind === "turn").text,
     /cobalt deployment procedure[\s\S]*glacier queue/u,
   );
 
+  const protectionCallsAfterSettlement = archive.protectionRequests.length;
   handlers.get("agent_settled")({}, ctx);
+  assert.equal(archive.protectionRequests.length, protectionCallsAfterSettlement);
   handlers.get("session_shutdown")({ reason: "quit" }, ctx);
   assert.equal(archive.puts.filter(({ kind }) => kind === "turn").length, 1);
+});
+
+test("agent settlement defers disk status work until after the handler returns", async () => {
+  const handlers = new Map();
+  const archive = memoryCheckpointArchive();
+  let statsCalls = 0;
+  archive.stats = () => {
+    statsCalls += 1;
+    return { filesystem: { freeBytes: 500 * 1024 * 1024 * 1024 } };
+  };
+  await createContextEpochWindow({
+    configLoader: () => compactionConfig({ rotationTurns: 20 }),
+    archiveFactory: () => archive,
+  })({
+    on(name, handler) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+  });
+  const ctx = {
+    cwd: "/project",
+    hasUI: true,
+    model: { contextWindow: 200_000 },
+    isProjectTrusted: () => false,
+    sessionManager: {
+      getSessionId: () => "deferred-disk-status-session",
+      getBranch: () => [],
+      buildContextEntries: () => [],
+    },
+    ui: {
+      theme: { fg: (_color, text) => text },
+      setStatus() {},
+      notify() {},
+      confirm: async () => false,
+    },
+  };
+
+  handlers.get("session_start")({ reason: "new" }, ctx);
+  handlers.get("agent_settled")({}, ctx);
+  assert.equal(statsCalls, 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(statsCalls, 1);
+  handlers.get("session_shutdown")({ reason: "quit" }, ctx);
 });
 
 test("session startup warms tool artifacts without running the mutating epoch state machine", async () => {
@@ -1222,7 +1274,7 @@ test("session startup warms tool artifacts without running the mutating epoch st
   handlers.get("session_shutdown")({}, ctx);
 });
 
-test("hot reload tolerates a stale epoch generation without the optional warmup method", async () => {
+test("host reload tolerates a stale epoch generation without the optional warmup method", async () => {
   class LegacyEpochWindowSession extends EpochWindowSession {}
   Object.defineProperty(LegacyEpochWindowSession.prototype, "warmToolArtifacts", {
     configurable: true,

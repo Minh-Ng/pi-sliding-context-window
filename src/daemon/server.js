@@ -1196,6 +1196,7 @@ export class StoreDaemon {
       "derivedView",
       "memory",
       "semantic",
+      "reranker",
       "retention",
       "rocksdb",
       "filesystem",

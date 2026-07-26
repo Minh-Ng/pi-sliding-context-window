@@ -375,9 +375,10 @@ export function createContextEpochWindow({
 } = {}) {
   const persistConfig = typeof configSaver === "function" ? configSaver : saveGlobalConfig;
   return async function contextEpochWindow(pi: ExtensionAPI) {
-    // The packaged default supplies a cache-busted epoch loader because Jiti
-    // can retain native ESM dependencies across `/reload`. Injected/test
-    // adapters use the stable constructor unless they request another loader.
+    // The cache-busted loader reduces stale native ESM dependencies during a
+    // host reload, but it is not a deployment boundary: local package source
+    // changes require a full Pi process restart. Injected/test adapters use the
+    // stable constructor unless they request another loader.
     const epochWindowModule: typeof import("../src/session/epoch-window.js") = epochWindowLoader
       ? await epochWindowLoader()
       : {
@@ -440,7 +441,7 @@ export function createContextEpochWindow({
     function restartProtectionRefresh() {
       stopProtectionRefresh();
       protectionRefreshTimer = setInterval(() => {
-        try { session?.refreshArchiveProtection(); } catch { /* the next lifecycle event retries */ }
+        try { session?.refreshArchiveProtection({ force: true }); } catch { /* the next lifecycle event retries */ }
       }, 60 * 60 * 1_000);
       protectionRefreshTimer.unref?.();
     }
@@ -473,12 +474,15 @@ export function createContextEpochWindow({
 
     function maybeWarnDiskPressure(ctx: ExtensionContext) {
       if (!ctx?.hasUI || !session || startupState !== "ready") return;
-      void diskPressureMonitor.check({
-        notify: (message, level) => {
-          try { ctx.ui.notify(message, level); } catch { /* presentation-only */ }
-        },
-        confirm: (title, message) => ctx.ui.confirm(title, message),
+      const immediate = setImmediate(() => {
+        void diskPressureMonitor.check({
+          notify: (message, level) => {
+            try { ctx.ui.notify(message, level); } catch { /* presentation-only */ }
+          },
+          confirm: (title, message) => ctx.ui.confirm(title, message),
+        });
       });
+      immediate.unref?.();
     }
 
     function exposeRecallHandles(results: any[]) {
@@ -848,14 +852,18 @@ export function createContextEpochWindow({
         warmupMessageCount = warmupMessages.length;
         const warmupStartedAt = performance.now();
         if (warmupMessages.length > 0) {
+          const seedCompletedArchiveCheckpoint = (createdSession as any).seedCompletedArchiveCheckpoint;
+          if (typeof seedCompletedArchiveCheckpoint === "function") {
+            seedCompletedArchiveCheckpoint.call(createdSession, warmupMessages);
+          }
           const warmToolArtifacts = (createdSession as any).warmToolArtifacts;
           if (typeof warmToolArtifacts === "function") {
             const warmup = warmToolArtifacts.call(createdSession, warmupMessages);
             warmupArtifactCount = warmup.artifactCount;
           } else {
-            // A stale dependency generation must not make `/reload` fail. The
-            // cache-busted import above should prevent this, but skipping the
-            // optional warmup remains safe if a host loader violates URL identity.
+            // A stale dependency generation must not make a host reload fail.
+            // Skipping the optional warmup remains safe if a loader violates URL
+            // identity; operators still restart Pi to deploy local source changes.
             warmupAvailable = false;
           }
         }
@@ -938,7 +946,6 @@ export function createContextEpochWindow({
     // after each complete run so the footer reflects the latest measurement.
     pi.on("agent_settled", (_event, ctx) => {
       archiveCompletedSession(session, ctx.sessionManager);
-      session?.refreshArchiveProtection();
       updateStatus(ctx);
       maybeWarnDiskPressure(ctx);
     });

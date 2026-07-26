@@ -53,6 +53,7 @@ import { LocalReranker } from "../semantic/reranker.js";
 import {
   recordRecalledLocator,
   recordShownResults,
+  relevanceFeedbackEvents,
   relevanceFeedbackStats,
 } from "../retrieval/relevance-feedback.js";
 import {
@@ -736,13 +737,15 @@ export class DaemonOperations {
         // only (see src/retrieval/search.js rerankTierOne). preflightArchive's
         // internal searchArchive call never sets this, so frozen hints stay
         // byte-identical.
-        reranker: this.reranker,
+        ...(payload.rerank === false ? {} : { reranker: this.reranker }),
         // RM3/Bo1 query expansion is only ever available on this explicit
         // store.search path, never from preflightArchive's internal call to
         // searchArchive (it does not set this option).
         allowExpansion: true,
         dedupe: payload.dedupe === true,
-        recordShownResults: (event) => this.recordRelevanceFeedback(event),
+        ...(payload.recordFeedback === false
+          ? {}
+          : { recordShownResults: (event) => this.recordRelevanceFeedback(event) }),
         applyImportancePrior: true,
         now,
         recencyDecay: true,
@@ -773,7 +776,7 @@ export class DaemonOperations {
       // not depend on which alias happened to answer.
       const result = await searchArchive(this.store, { ...payload, project }, {
         semantic: this.semantic,
-        reranker: this.reranker,
+        ...(payload.rerank === false ? {} : { reranker: this.reranker }),
         allowExpansion: true,
         applyImportancePrior: true,
         now,
@@ -842,18 +845,20 @@ export class DaemonOperations {
     // authenticated project. Locator fingerprints are content-only, so a later
     // recall (widened over the same aliases) joins back regardless of which
     // alias authorized it.
-    await this.recordRelevanceFeedback({
-      project: context.project,
-      query: payload.query,
-      mode: merged.mode,
-      status: merged.status,
-      results: merged.results,
-      // Mirror search.js's own sessionIds derivation: the alias-merged path
-      // builds its own feedback event rather than going through searchArchive's
-      // recordShownResults hook, so it must compute this itself.
-      sessionIds: payload.sessionIds ?? (payload.sessionId === undefined ? [] : [payload.sessionId]),
-      now: Date.now(),
-    });
+    if (payload.recordFeedback !== false) {
+      await this.recordRelevanceFeedback({
+        project: context.project,
+        query: payload.query,
+        mode: merged.mode,
+        status: merged.status,
+        results: merged.results,
+        // Mirror search.js's own sessionIds derivation: the alias-merged path
+        // builds its own feedback event rather than going through searchArchive's
+        // recordShownResults hook, so it must compute this itself.
+        sessionIds: payload.sessionIds ?? (payload.sessionId === undefined ? [] : [payload.sessionId]),
+        now: Date.now(),
+      });
+    }
     return merged;
   }
 
@@ -1106,6 +1111,13 @@ export class DaemonOperations {
     return relevanceFeedbackStats(this.store, {
       project: context.project,
       queryLimit: payload.queryLimit,
+    });
+  }
+
+  feedbackEvents(payload, context) {
+    return relevanceFeedbackEvents(this.store, {
+      project: context.project,
+      limit: payload.limit,
     });
   }
 
@@ -1474,6 +1486,7 @@ export class DaemonOperations {
       "retention.run": (payload, context) => this.retention(payload, context),
       "retention.status": (_payload, context) => retentionStatus(this.store, { project: context.project }),
       "feedback.stats": (payload, context) => this.feedbackStats(payload, context),
+      "feedback.events": (payload, context) => this.feedbackEvents(payload, context),
       "store.compact": (payload) => this.compact(payload),
     };
   }

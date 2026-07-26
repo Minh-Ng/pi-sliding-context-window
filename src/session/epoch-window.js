@@ -70,6 +70,7 @@ export { CONTEXT_WINDOW_ARCHIVE_DETAILS_VERSION, OversizedInputArchiveError };
 export const TOC_MAX_ENTRIES = 64;
 
 const HINT_STATE_VERSION = 1;
+const COMPLETED_ARCHIVE_STATE_VERSION = 1;
 const MAX_RECONSTRUCT_ONLY_HINT_KEYS = 1_000;
 
 export const ROTATION_STATE_ENTRY = "context-epoch-window:rotation";
@@ -78,12 +79,26 @@ function archivedTurnKey(messages) {
   return messages.map((message) => messageKey(message)).join("\u0000");
 }
 
+function terminalTurnMessage(turn) {
+  return turn.messages.findLast((message) =>
+    ["user", "assistant", "tool", "toolResult"].includes(String(message?.role)));
+}
+
 function isCompletedUserTurn(turn) {
   if (!turn.hasUser) return false;
-  const terminal = turn.messages.findLast((message) =>
-    ["user", "assistant", "tool", "toolResult"].includes(String(message?.role)));
+  const terminal = terminalTurnMessage(turn);
   return terminal?.role === "assistant"
     && !["error", "aborted", "toolUse"].includes(String(terminal.stopReason));
+}
+
+function completedArchiveCheckpoint(turn) {
+  const terminal = terminalTurnMessage(turn);
+  if (!terminal) return undefined;
+  const timestamp = Number(terminal.timestamp);
+  return Object.freeze({
+    messageKey: messageKey(terminal),
+    ...(Number.isFinite(timestamp) && timestamp >= 0 ? { timestamp } : {}),
+  });
 }
 
 /**
@@ -136,6 +151,7 @@ export class EpochWindowSession {
     // Source-derived keys keep those writes idempotent within this process;
     // archive document identities provide the durable retry boundary.
     this.archivedTurnEntries = new Map();
+    this.completedArchiveCheckpoint = undefined;
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -144,6 +160,7 @@ export class EpochWindowSession {
     this.observedActiveUserKeys = new Set();
     this.pendingHintRemovalKeys = new Set();
     this.hintReconciledBoundaryKey = undefined;
+    this.archiveProtectionSignature = undefined;
     this.contextLimits = resolveContextLimits(config, model);
     this.refreshArchiveProtection();
   }
@@ -164,6 +181,7 @@ export class EpochWindowSession {
     this.activeArchiveIds = new Set();
     this.storedArtifactIds = new Set();
     this.archivedTurnEntries = new Map();
+    this.completedArchiveCheckpoint = undefined;
     this.compactionArchiveEntries = Object.freeze([]);
     this.compactionArchiveIds = new Set();
     this.activeHintMessageKeys = new Set();
@@ -206,6 +224,19 @@ export class EpochWindowSession {
           .map((value) => restoredTocEntry(value, this.archive))
           .filter((entry) => entry !== undefined)
           .slice(-TOC_MAX_ENTRIES);
+      }
+      const completedArchiveState = data.completedArchiveState;
+      if (completedArchiveState && typeof completedArchiveState === "object"
+        && !Array.isArray(completedArchiveState)
+        && completedArchiveState.version === COMPLETED_ARCHIVE_STATE_VERSION
+        && typeof completedArchiveState.messageKey === "string"
+        && completedArchiveState.messageKey.length > 0
+        && completedArchiveState.messageKey.length <= 2_048) {
+        const timestamp = Number(completedArchiveState.timestamp);
+        this.completedArchiveCheckpoint = Object.freeze({
+          messageKey: completedArchiveState.messageKey,
+          ...(Number.isFinite(timestamp) && timestamp >= 0 ? { timestamp } : {}),
+        });
       }
       const hintState = data.hintState;
       this.reconstructOnlyHintMessageKeys = new Set(
@@ -315,7 +346,6 @@ export class EpochWindowSession {
       this.activeArchiveIds = new Set();
       this.reconcileStoredArtifactIds([]);
       this.refreshArchiveProtection();
-      this.archive.prune?.();
       this.clearMeasurement();
       return active;
     }
@@ -362,8 +392,8 @@ export class EpochWindowSession {
     active = externalizedArguments.messages;
     for (const id of externalizedArguments.archiveIds) this.activeArchiveIds.add(id);
     this.refreshArchiveProtection();
-    this.archive.prune?.();
 
+    // Routine retention is daemon-owned and must not block provider dispatch.
     // The marker occupies real window space, so it counts toward rotation
     // pressure; it is synthetic, so it never counts as a user turn.
     let marker = this.tocMarkerMessage();
@@ -502,7 +532,7 @@ export class EpochWindowSession {
     this.updateModel(model);
   }
 
-  refreshArchiveProtection() {
+  refreshArchiveProtection({ force = false } = {}) {
     const documentIds = new Set([
       ...this.activeArchiveIds,
       ...this.compactionArchiveIds,
@@ -511,10 +541,23 @@ export class EpochWindowSession {
       documentIds.add(entry.id);
       for (const id of entry.archiveIds ?? []) documentIds.add(id);
     }
-    this.archive.setProtectedContext?.({
-      sessionIds: [...this.sessionIds],
-      documentIds: [...documentIds],
-    });
+    const request = {
+      sessionIds: [...this.sessionIds].sort(),
+      documentIds: [...documentIds].sort(),
+    };
+    const signature = JSON.stringify(request);
+    if (signature === this.archiveProtectionSignature) {
+      if (!force) return false;
+      if (typeof this.archive.refreshPolicyLease === "function") {
+        this.archive.refreshPolicyLease();
+      } else {
+        this.archive.setProtectedContext?.(request);
+      }
+      return true;
+    }
+    this.archive.setProtectedContext?.(request);
+    this.archiveProtectionSignature = signature;
+    return true;
   }
 
   archiveStats() {
@@ -701,7 +744,6 @@ export class EpochWindowSession {
       this.compactionArchiveIds = checkpointIds(combined);
       try {
         this.refreshArchiveProtection();
-        this.archive.prune?.();
       } catch {
         this.compactionArchiveEntries = previousArchiveEntries;
         this.compactionArchiveIds = previousArchiveIds;
@@ -1230,6 +1272,12 @@ export class EpochWindowSession {
         terms: [...entry.terms],
         ...(entry.archiveIds ? { archiveIds: [...entry.archiveIds] } : {}),
       })),
+      ...(this.completedArchiveCheckpoint === undefined ? {} : {
+        completedArchiveState: {
+          version: COMPLETED_ARCHIVE_STATE_VERSION,
+          ...this.completedArchiveCheckpoint,
+        },
+      }),
       hintState: {
         version: HINT_STATE_VERSION,
         reconstructOnlyMessageKeys: [...this.reconstructOnlyHintMessageKeys]
@@ -1562,7 +1610,6 @@ export class EpochWindowSession {
       this.activeArchiveIds = previousActiveArchiveIds;
       this.archivedTurnEntries = previousArchivedTurnEntries;
       this.refreshArchiveProtection();
-      this.archive.prune?.();
       throw error;
     }
 
@@ -1570,7 +1617,6 @@ export class EpochWindowSession {
     this.toc = [...this.toc, ...stagedToc].slice(-TOC_MAX_ENTRIES);
     try {
       this.refreshArchiveProtection();
-      this.archive.prune?.();
       for (const [turnKey, entries] of stagedTurnEntries) {
         this.archivedTurnEntries.set(turnKey, entries);
       }
@@ -1583,20 +1629,63 @@ export class EpochWindowSession {
     }
   }
 
+  persistCompletedArchiveCheckpoint(turn) {
+    const checkpoint = completedArchiveCheckpoint(turn);
+    if (!checkpoint || checkpoint.messageKey === this.completedArchiveCheckpoint?.messageKey) {
+      return false;
+    }
+    const previous = this.completedArchiveCheckpoint;
+    this.completedArchiveCheckpoint = checkpoint;
+    try {
+      this.onRotation(this.rotationState());
+    } catch (error) {
+      this.completedArchiveCheckpoint = previous;
+      throw error;
+    }
+    return true;
+  }
+
+  seedCompletedArchiveCheckpoint(messages) {
+    if (this.completedArchiveCheckpoint !== undefined) return false;
+    const complete = groupCompleteTurns(removeEmptyAssistantErrors(
+      Array.isArray(messages) ? messages : [],
+    )).filter(isCompletedUserTurn);
+    const last = complete.at(-1);
+    if (!last) return false;
+    // Rotation state predating this checkpoint was produced by versions that
+    // archived every settled turn. Seed once rather than replaying the whole
+    // transcript through synchronous idempotent admissions after an upgrade.
+    return this.persistCompletedArchiveCheckpoint(last);
+  }
+
   archiveCompletedTurns(messages) {
     const complete = groupCompleteTurns(removeEmptyAssistantErrors(
       Array.isArray(messages) ? messages : [],
     )).filter(isCompletedUserTurn);
-    const pending = complete.filter((turn) =>
-      !this.archivedTurnEntries.has(archivedTurnKey(turn.messages)));
-    if (pending.length === 0) {
-      return Object.freeze({ turnCount: 0, messageCount: 0 });
+    let candidates = complete;
+    const checkpoint = this.completedArchiveCheckpoint;
+    if (checkpoint !== undefined) {
+      const checkpointIndex = complete.findIndex((turn) =>
+        completedArchiveCheckpoint(turn)?.messageKey === checkpoint.messageKey);
+      if (checkpointIndex >= 0) {
+        candidates = complete.slice(checkpointIndex + 1);
+      } else if (checkpoint.timestamp !== undefined) {
+        candidates = complete.filter((turn) => {
+          const timestamp = completedArchiveCheckpoint(turn)?.timestamp;
+          return timestamp === undefined || timestamp > checkpoint.timestamp;
+        });
+      }
     }
-    const pendingMessages = pending.flatMap((turn) => turn.messages);
-    this.archiveTurns(pendingMessages, { recordToc: false });
+    const pending = candidates.filter((turn) =>
+      !this.archivedTurnEntries.has(archivedTurnKey(turn.messages)));
+    if (pending.length > 0) {
+      this.archiveTurns(pending.flatMap((turn) => turn.messages), { recordToc: false });
+    }
+    const last = complete.at(-1);
+    if (last) this.persistCompletedArchiveCheckpoint(last);
     return Object.freeze({
       turnCount: pending.length,
-      messageCount: pendingMessages.length,
+      messageCount: pending.reduce((count, turn) => count + turn.messages.length, 0),
     });
   }
 

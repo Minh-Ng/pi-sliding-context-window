@@ -166,6 +166,7 @@ const requests = Object.freeze({
   "retention.run": { now: 2_000, force: false, batchSize: 100 },
   "retention.status": {},
   "feedback.stats": { queryLimit: 25 },
+  "feedback.events": { limit: 100 },
   "store.compact": { reason: "deletion-wave", startKey: "a", endKey: "z" },
   "daemon.status": {},
   "daemon.ping": { nonce: "ping-1" },
@@ -384,6 +385,10 @@ const results = Object.freeze({
       { sessionId: "session-1", missQueryKey: "shutdown", missSeq: 1, hitQueryKey: "reap drain", hitSeq: 2 },
     ],
     chainQueryKeys: ["shutdown", "reap drain"],
+  },
+  "feedback.events": {
+    events: [{ seq: 1, query: "reap drain", shown: [], recalls: [] }],
+    truncated: false,
   },
   "store.compact": { status: "complete", bytesBefore: 2_048, bytesAfter: 1_024 },
   "daemon.status": {

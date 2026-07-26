@@ -411,6 +411,12 @@ const searchRequest = object({
   // SEARCH_EFFORT_POLICY. It moves existing thresholds; it adds no new
   // retrieval machinery. Absent entirely on the automatic preflight path.
   searchEffort: enumeration(["normal", "wide"]),
+  // Local evaluation controls. Ordinary clients omit both. They let the
+  // offline real-feedback replay compare the exact production pipeline with
+  // and without cross-encoder scoring without writing probe searches back
+  // into the implicit-feedback ring it is evaluating.
+  rerank: boolean(),
+  recordFeedback: boolean(),
   // Optional (not in the required list): a deterministic digest of session
   // context terms (ultracode task #32) -- the Pi adapter's own top-K
   // high-IDF terms extracted from the recent conversation prefix
@@ -1132,6 +1138,18 @@ export const STORE_OPERATION_CONTRACTS = deepFreeze({
       queryLimit: integer({ minimum: 1, maximum: 1_000 }),
     }, []),
     result: feedbackStatsResponse,
+  },
+  "feedback.events": {
+    request: object({
+      limit: integer({ minimum: 1, maximum: 2_000 }),
+    }, []),
+    // Local evaluation/export surface. Event payloads are already bounded and
+    // content-free (queries, ids, ranks/scores, locator hashes; never archive
+    // text or locator secrets) by relevance-feedback.js.
+    result: object({
+      events: array(jsonValue, { maxItems: 2_000 }),
+      truncated: boolean(),
+    }, ["events", "truncated"]),
   },
   "store.compact": {
     request: object({

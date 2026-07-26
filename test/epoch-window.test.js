@@ -13,6 +13,7 @@ import {
   assistant,
   persistedLegacyBoundaryKey,
   memoryArchive,
+  trackingMemoryArchive,
   pressureArchive,
 } from "./epoch-window-helpers.js";
 
@@ -82,6 +83,28 @@ test("session controller rotates, archives source turns, and emits durable state
   });
 });
 
+test("unchanged provider context coalesces protection and never prunes", () => {
+  const archive = trackingMemoryArchive();
+  const session = new EpochWindowSession({
+    archive,
+    config: { ...config, rotationTurns: 100 },
+    sessionId: "coalesced-protection-session",
+    project: "/project",
+  });
+  const messages = [
+    user("one", 1),
+    { ...assistant("ok", 2), stopReason: "stop" },
+  ];
+
+  assert.equal(archive.protectionRequests.length, 1);
+  session.process(messages, { contextWindow: 200_000 });
+  session.process(messages, { contextWindow: 200_000 });
+  assert.equal(archive.protectionRequests.length, 1);
+  assert.equal(session.refreshArchiveProtection({ force: true }), true);
+  assert.equal(archive.protectionRequests.length, 2);
+  assert.equal(archive.pruneCalls, 0);
+});
+
 test("completed-turn checkpoints persist short sessions once and skip unfinished tails", () => {
   const archive = memoryArchive();
   const session = new EpochWindowSession({
@@ -141,6 +164,55 @@ test("completed-turn checkpoints persist short sessions once and skip unfinished
     messageCount: 0,
   });
   assert.equal(archive.documents.size, 1);
+});
+
+test("completed-turn checkpoint bounds archival after restart and seeds legacy sessions", () => {
+  const archive = trackingMemoryArchive();
+  const states = [];
+  const createSession = () => new EpochWindowSession({
+    archive,
+    config: { ...config, rotationTurns: 100 },
+    sessionId: "restart-session",
+    project: "/project",
+    onRotation: (state) => states.push(structuredClone(state)),
+  });
+  const historical = Array.from({ length: 20 }, (_, index) => [
+    user(`historical ${index}`, index * 2 + 1),
+    { ...assistant("ok", index * 2 + 2), stopReason: "stop" },
+  ]).flat();
+
+  const original = createSession();
+  assert.equal(original.archiveCompletedTurns(historical).turnCount, 20);
+  const persisted = states.at(-1);
+  assert.equal(persisted.completedArchiveState.version, 1);
+  const putsAfterHistoricalArchive = archive.putCalls;
+
+  const reopened = createSession();
+  reopened.restore([{ type: "custom", customType: ROTATION_STATE_ENTRY, data: persisted }]);
+  const next = [
+    user("new turn", 100),
+    { ...assistant("ok", 101), stopReason: "stop" },
+  ];
+  assert.deepEqual(reopened.archiveCompletedTurns([...historical, ...next]), {
+    turnCount: 1,
+    messageCount: 2,
+  });
+  assert.equal(archive.putCalls - putsAfterHistoricalArchive, 1);
+
+  const legacyArchive = trackingMemoryArchive();
+  const legacyStates = [];
+  const legacy = new EpochWindowSession({
+    archive: legacyArchive,
+    config: { ...config, rotationTurns: 100 },
+    sessionId: "legacy-restart-session",
+    project: "/project",
+    onRotation: (state) => legacyStates.push(structuredClone(state)),
+  });
+  assert.equal(legacy.seedCompletedArchiveCheckpoint(historical), true);
+  assert.equal(legacyArchive.putCalls, 0);
+  assert.equal(legacyStates.at(-1).completedArchiveState.version, 1);
+  assert.equal(legacy.archiveCompletedTurns([...historical, ...next]).turnCount, 1);
+  assert.equal(legacyArchive.putCalls, 1);
 });
 
 test("rotation segments a message-heavy turn within archive provenance bounds", () => {
@@ -240,12 +312,14 @@ test("partial multi-turn admission failure does not mutate or duplicate TOC stat
   for (const { id } of toc) assert.match(result[0].content[0].text, new RegExp(id));
 });
 
-test("post-admission cleanup failure rolls back staged TOC state", () => {
-  const archive = memoryArchive();
-  let pruneCalls = 0;
-  archive.prune = () => {
-    pruneCalls += 1;
-    if (pruneCalls === 2) throw new Error("cleanup failed");
+test("post-admission protection failure rolls back staged TOC state without pruning", () => {
+  const archive = trackingMemoryArchive();
+  const protect = archive.setProtectedContext;
+  let protectionCalls = 0;
+  archive.setProtectedContext = (request) => {
+    protectionCalls += 1;
+    if (protectionCalls === 2) throw new Error("protection failed");
+    protect(request);
   };
   const session = new EpochWindowSession({
     archive,
@@ -261,16 +335,16 @@ test("post-admission cleanup failure rolls back staged TOC state", () => {
 
   assert.throws(
     () => session.process(messages, { contextWindow: 200_000 }),
-    /cleanup failed/,
+    /protection failed/,
   );
   assert.deepEqual(session.rotationState().toc, []);
   assert.equal(session.rotationState().boundaryKey, undefined);
 
-  archive.prune = () => {};
   session.process(messages, { contextWindow: 200_000 });
   const toc = session.rotationState().toc;
   assert.equal(toc.length, 2);
   assert.equal(new Set(toc.map(({ id }) => id)).size, 2);
+  assert.equal(archive.pruneCalls, 0);
 });
 
 test("token pressure rotates below the configured retention floor and restores deterministically", () => {

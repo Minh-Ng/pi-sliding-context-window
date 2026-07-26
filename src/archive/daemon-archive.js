@@ -153,6 +153,12 @@ function timestamp(value, fallback = Date.now()) {
   return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
 }
 
+function sameStringSet(left, right) {
+  if (left.size !== right.size) return false;
+  for (const value of left) if (!right.has(value)) return false;
+  return true;
+}
+
 function positiveInteger(value, fallback, maximum = Number.MAX_SAFE_INTEGER) {
   const number = Number(value ?? fallback);
   return Number.isSafeInteger(number) && number > 0 && number <= maximum ? number : fallback;
@@ -522,6 +528,7 @@ export class DaemonArchive {
     this.retentionPolicy = normalizeArchiveRetentionPolicy(retentionPolicy);
     this.protectedSessionIds = new Set();
     this.protectedDocumentIds = new Set();
+    this.documentVersionById = new Map();
     this.protectionShardOwners = new Map();
     this.protectionHandoffId = undefined;
     this.locatorSessionIds = new Map();
@@ -681,14 +688,18 @@ export class DaemonArchive {
   }
 
   canonicalHeadState(id, version) {
+    const documentId = requiredString(id, "id");
     const response = this.request("store.get", {
-      documentId: requiredString(id, "id"),
+      documentId,
       ...(version === undefined ? {} : { version }),
       view: "identity",
     });
     const document = response.status === "resolved" ? response.document : undefined;
     const latestVersion = document?.version
       ?? (Number.isSafeInteger(response.version) ? response.version : 0);
+    this.documentVersionById ??= new Map();
+    if (document && version === undefined) this.documentVersionById.set(documentId, document.version);
+    else if (version === undefined) this.documentVersionById.delete(documentId);
     return { document, latestVersion };
   }
 
@@ -810,9 +821,16 @@ export class DaemonArchive {
           structuralMessages: normalizedStructural,
           ...admissionRetention,
         }, { requestId: `rpc:${idempotencyKey}` });
-        if (protect) {
+        this.documentVersionById ??= new Map();
+        this.documentVersionById.set(documentId, document.version);
+        if (protect && !this.protectedDocumentIds.has(documentId)) {
           this.protectedDocumentIds.add(documentId);
-          this.syncProtection();
+          try {
+            this.syncProtection();
+          } catch (error) {
+            this.protectedDocumentIds.delete(documentId);
+            throw error;
+          }
         }
         return {
           documentId: result.documentId,
@@ -1251,10 +1269,19 @@ export class DaemonArchive {
   }
 
   documentVersions(documentIds) {
+    this.documentVersionById ??= new Map();
     const versions = [];
     for (const documentId of documentIds) {
+      const cachedVersion = this.documentVersionById.get(documentId);
+      if (cachedVersion !== undefined) {
+        versions.push({ documentId, version: cachedVersion });
+        continue;
+      }
       const document = this.canonicalHead(documentId);
-      if (document) versions.push({ documentId, version: document.version });
+      if (document) {
+        this.documentVersionById.set(documentId, document.version);
+        versions.push({ documentId, version: document.version });
+      }
     }
     return versions;
   }
@@ -1329,12 +1356,26 @@ export class DaemonArchive {
   }
 
   setProtectedContext({ sessionIds = [], documentIds = [] } = {}) {
-    this.protectedSessionIds = new Set(sessionIds.filter(Boolean).map(String));
-    this.protectedDocumentIds = new Set(documentIds.filter(Boolean).map(String));
-    this.syncProtection();
+    const nextSessionIds = new Set(sessionIds.filter(Boolean).map(String));
+    const nextDocumentIds = new Set(documentIds.filter(Boolean).map(String));
+    if (sameStringSet(nextSessionIds, this.protectedSessionIds)
+      && sameStringSet(nextDocumentIds, this.protectedDocumentIds)) return;
+    const previousSessionIds = this.protectedSessionIds;
+    const previousDocumentIds = this.protectedDocumentIds;
+    this.protectedSessionIds = nextSessionIds;
+    this.protectedDocumentIds = nextDocumentIds;
+    try {
+      this.syncProtection();
+    } catch (error) {
+      this.protectedSessionIds = previousSessionIds;
+      this.protectedDocumentIds = previousDocumentIds;
+      throw error;
+    }
   }
 
   refreshPolicyLease() {
+    this.documentVersionById ??= new Map();
+    this.documentVersionById.clear();
     this.syncProtection();
   }
 
@@ -1512,6 +1553,7 @@ export class DaemonArchive {
     this.closed = true;
     this.locatorSessionIds.clear();
     this.locatorSessionIdBytes = 0;
+    this.documentVersionById?.clear();
     try { this.bridge.close(); } catch (error) { releaseError ??= error; }
     if (releaseError) throw releaseError;
     return releaseProtection ? undefined : this.protectionHandoffId;

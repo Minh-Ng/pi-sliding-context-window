@@ -4,6 +4,8 @@ import { estimateModelVisibleTokens } from "../session/model-token-budget.js";
 import { RerankerWorkerClient, RerankerTimeoutError } from "./reranker-client.js";
 import {
   DEFAULT_RERANKER_CANDIDATE_WINDOW,
+  DEFAULT_RERANKER_MODEL,
+  DEFAULT_RERANKER_MODEL_REVISION,
   DEFAULT_RERANKER_TEXT_TOKEN_BUDGET,
 } from "./reranker-model.js";
 
@@ -14,6 +16,7 @@ import {
 // is unusably slow or stuck, at which point the reranker degrades exactly
 // like a genuine load failure (latch + terminate the now-useless worker).
 const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS = 3;
+const DEFAULT_IDLE_TIMEOUT_MS = 15_000;
 
 // The cross-encoder reorders only the shared lexical/semantic tier (RRF fusion
 // tier one in src/retrieval/search.js); exact and structural candidates keep
@@ -66,8 +69,8 @@ export function truncateCenteredTokens(text, maxTokens) {
 export class LocalReranker {
   constructor({
     enabled = false,
-    model,
-    revision,
+    model = DEFAULT_RERANKER_MODEL,
+    revision = DEFAULT_RERANKER_MODEL_REVISION,
     cachePath,
     candidateWindow = DEFAULT_RERANKER_CANDIDATE_WINDOW,
     textTokenBudget = DEFAULT_RERANKER_TEXT_TOKEN_BUDGET,
@@ -79,6 +82,7 @@ export class LocalReranker {
     workerUrl,
     recordError = () => {},
     maxConsecutiveTimeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
+    idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
   } = {}) {
     this.enabled = enabled === true;
     this.model = model;
@@ -97,6 +101,10 @@ export class LocalReranker {
     this.maxConsecutiveTimeouts = Number.isSafeInteger(maxConsecutiveTimeouts) && maxConsecutiveTimeouts > 0
       ? maxConsecutiveTimeouts
       : DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
+    this.idleTimeoutMs = Number.isSafeInteger(idleTimeoutMs) && idleTimeoutMs > 0
+      ? idleTimeoutMs
+      : DEFAULT_IDLE_TIMEOUT_MS;
+    this.idleTimer = undefined;
     this.unavailable = false;
     this.closed = false;
     this.consecutiveTimeouts = 0;
@@ -115,7 +123,11 @@ export class LocalReranker {
   status() {
     return {
       enabled: this.enabled,
-      available: this.enabled && !this.unavailable,
+      // Enabled is configuration intent; available means a request would
+      // actually rerank now. In particular, do not report available:true for
+      // the documented silent-fallback state where the separately installed
+      // local model cache is absent.
+      available: this.isOperational(),
       model: this.model,
       revision: this.revision,
       candidateWindow: this.candidateWindow,
@@ -210,6 +222,7 @@ export class LocalReranker {
       await this.#terminateClient();
       return candidates;
     }
+    this.#scheduleIdleClientClose();
     const scoreByIndex = new Map(windowIndexes.map((index, position) => [index, scores[position]]));
     // Array.prototype.sort is stable, so returning 0 on a tie (including when
     // either score is non-finite, e.g. NaN) preserves the candidates' input
@@ -234,18 +247,36 @@ export class LocalReranker {
     return next;
   }
 
-  // Shuts down the worker thread once the reranker has latched unavailable,
-  // so a load failure doesn't leave a model-loading (or already-loaded but
-  // now-known-broken) worker thread alive and consuming memory/CPU for the
-  // rest of the daemon's life with nothing left to use it. Only closes a
+  #scheduleIdleClientClose() {
+    if (!this.ownsClient) return;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      const client = this.client;
+      if (!client || this.closed || this.unavailable) return;
+      // Clear first so a new request can create a fresh process without
+      // racing against the old process's asynchronous shutdown.
+      this.client = undefined;
+      void client.close().catch((error) => this.recordError(error));
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref?.();
+  }
+
+  // Shuts down the isolated process once the reranker has latched unavailable,
+  // so a load failure doesn't leave a model-loading process alive and
+  // consuming memory/CPU for the rest of the daemon's life. Only closes a
   // client this instance created itself: a caller-injected client (the test
   // seam) is not ours to terminate.
   async #terminateClient() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
     if (this.ownsClient) await this.client?.close();
   }
 
   async close() {
     this.closed = true;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
     if (this.ownsClient) await this.client?.close();
   }
 }

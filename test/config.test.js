@@ -144,7 +144,7 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     // Unset by default: LocalSemanticIndex derives both from semanticModel.
     assert.equal(defaults.semanticModelDimensions, undefined);
     assert.equal(defaults.semanticModelPooling, undefined);
-    assert.equal(defaults.rerankerEnabled, true);
+    assert.equal(defaults.rerankerEnabled, false);
     assert.equal(defaults.rerankerModel, "Xenova/ms-marco-MiniLM-L-6-v2");
     assert.equal(defaults.rerankerModelRevision, "a09144355adeed5f58c8ed011d209bf8ee5a1fec");
     assert.equal(defaults.rerankerModelCachePath, join(directory, ".pi", "context-window", "reranker-models"));
@@ -229,6 +229,14 @@ test("fresh installs use RocksDB while existing SQLite archives require an expli
     assert.equal(overridden.derivedAutoRetrievalDays, 0);
     assert.equal(overridden.ephemeralRetentionDays, 2);
     assert.equal(overridden.conversationRetentionDays, 30);
+
+    const rerankerOptIn = loadConfig({
+      cwd: directory,
+      projectTrusted: false,
+      home: directory,
+      env: { CONTEXT_WINDOW_RERANKER_ENABLED: "true" },
+    });
+    assert.equal(rerankerOptIn.rerankerEnabled, true);
     assert.equal(overridden.derivedRetentionDays, 0);
   } finally {
     rmSync(directory, { recursive: true, force: true });

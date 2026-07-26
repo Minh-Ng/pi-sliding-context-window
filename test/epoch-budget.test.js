@@ -89,7 +89,11 @@ test("repeated large context passes reuse successfully stored tool artifacts", (
 
   assert.deepEqual(second, first);
   assert.equal(archive.putCalls, writesAfterFirstPass);
-  assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 1);
+  assert.equal(
+    archive.protectionRequests.length,
+    protectionsAfterFirstPass,
+    "an unchanged artifact set does not renew protection",
+  );
 
   const appended = [
     ...messages,
@@ -97,7 +101,7 @@ test("repeated large context passes reuse successfully stored tool artifacts", (
   ];
   session.process(appended, { contextWindow: 200_000 });
   assert.equal(archive.putCalls, writesAfterFirstPass + 1, "only the appended artifact is stored");
-  assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 2);
+  assert.equal(archive.protectionRequests.length, protectionsAfterFirstPass + 1);
 });
 
 test("failed tool-artifact writes retry and cache only after success", () => {

@@ -35,6 +35,10 @@ const usearch = require("usearch");
 const DEFAULT_BATCH_SIZE = 16;
 const DEFAULT_CANDIDATES = 40;
 const DEFAULT_MINIMUM_SCORE = 0.35;
+const DEFAULT_COMPACTION_INTERVAL_MS = 60_000;
+const DEFAULT_COMPACTION_IDLE_MS = 5_000;
+const DEFAULT_COMPACTION_MINIMUM_ENTRIES = 1_000;
+const DEFAULT_COMPACTION_DEAD_RATIO = 0.25;
 export const DEFAULT_SEMANTIC_MODEL = "Xenova/all-MiniLM-L6-v2";
 export const DEFAULT_SEMANTIC_MODEL_REVISION = "751bff37182d3f1213fa05d7196b954e230abad9";
 // Mirrors config.js's POOLING_MODES: the pooling strategies the pinned
@@ -48,6 +52,13 @@ async function fileSize(path) {
     // Observability must never make a valid derived index unavailable.
     return 0;
   }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    timer.unref?.();
+  });
 }
 
 function digest(value, length = 24) {
@@ -72,7 +83,13 @@ function newIndex(dimensions) {
   return new usearch.Index({
     dimensions,
     metric: usearch.MetricKind.Cos,
-    quantization: usearch.ScalarKind.F32,
+    // F16 halves vector memory and on-disk snapshot size versus F32 at
+    // no measured retrieval cost (100% top-10 overlap on MiniLM-scale
+    // vectors). Quantization is intentionally NOT part of the index
+    // fingerprint: load()/view() restore the scalar kind serialized in the
+    // snapshot itself, so legacy F32 snapshots keep working unchanged and
+    // only new or rebuilt snapshots pick up F16.
+    quantization: usearch.ScalarKind.F16,
     connectivity: 16,
     expansion_add: 64,
     expansion_search: 48,
@@ -104,6 +121,12 @@ export class LocalSemanticIndex {
     batchSize = DEFAULT_BATCH_SIZE,
     candidates = DEFAULT_CANDIDATES,
     minimumScore = DEFAULT_MINIMUM_SCORE,
+    compactionIntervalMs = DEFAULT_COMPACTION_INTERVAL_MS,
+    compactionIdleMs = DEFAULT_COMPACTION_IDLE_MS,
+    compactionMinimumEntries = DEFAULT_COMPACTION_MINIMUM_ENTRIES,
+    compactionDeadRatio = DEFAULT_COMPACTION_DEAD_RATIO,
+    compactionEnabled = true,
+    backgroundGate,
     embedder,
     recordError = () => {},
   } = {}) {
@@ -135,6 +158,26 @@ export class LocalSemanticIndex {
       && minimumScore <= 1
       ? minimumScore
       : DEFAULT_MINIMUM_SCORE;
+    this.compactionIntervalMs = Number.isSafeInteger(compactionIntervalMs) && compactionIntervalMs > 0
+      ? compactionIntervalMs
+      : DEFAULT_COMPACTION_INTERVAL_MS;
+    this.compactionIdleMs = Number.isSafeInteger(compactionIdleMs) && compactionIdleMs >= 0
+      ? compactionIdleMs
+      : DEFAULT_COMPACTION_IDLE_MS;
+    this.compactionMinimumEntries = Number.isSafeInteger(compactionMinimumEntries)
+      && compactionMinimumEntries > 0
+      ? compactionMinimumEntries
+      : DEFAULT_COMPACTION_MINIMUM_ENTRIES;
+    this.compactionDeadRatio = typeof compactionDeadRatio === "number"
+      && Number.isFinite(compactionDeadRatio)
+      && compactionDeadRatio > 0
+      && compactionDeadRatio < 1
+      ? compactionDeadRatio
+      : DEFAULT_COMPACTION_DEAD_RATIO;
+    this.compactionEnabled = compactionEnabled !== false;
+    this.backgroundGate = typeof backgroundGate === "function"
+      ? backgroundGate
+      : () => this.#waitForForegroundIdle();
     this.embedder = embedder;
     this.ownsEmbedder = embedder === undefined;
     this.recordError = recordError;
@@ -147,6 +190,10 @@ export class LocalSemanticIndex {
     this.indexBytes = 0;
     this.closed = false;
     this.unavailable = false;
+    this.lastForegroundAt = 0;
+    this.compactionTimer = undefined;
+    this.compactionPromise = undefined;
+    this.rebuildingProjects = new Set();
     // Pooling changes the vectors a model produces for the same text, so it
     // versions the derived index exactly like model/revision/dimensions do.
     // "mean" was the implicit, undigested pooling for every index built
@@ -162,6 +209,10 @@ export class LocalSemanticIndex {
   initialize() {
     if (!this.enabled) return this;
     setImmediate(() => this.#warmExisting());
+    if (this.compactionEnabled) {
+      this.compactionTimer = setInterval(() => { void this.maintain(); }, this.compactionIntervalMs);
+      this.compactionTimer.unref?.();
+    }
     return this;
   }
 
@@ -197,9 +248,15 @@ export class LocalSemanticIndex {
         entries: new Map(),
         documents: new Set(),
         entryCountByDocumentIdentity: new Map(),
+        retiredLabels: new Set(),
         metadataBytes: 0,
         indexBytes: 0,
         dirty: false,
+        // True while `index` is an mmap view of the on-disk snapshot: pages
+        // are file-backed and evictable instead of resident anonymous
+        // memory, but the index is immutable until #writableIndex promotes
+        // it to a loaded copy.
+        viewed: false,
       };
       try {
         const metadataPath = join(directory, SEMANTIC_METADATA_FILENAME);
@@ -225,7 +282,13 @@ export class LocalSemanticIndex {
           legacy = true;
         }
         state.index = newIndex(this.dimensions);
-        state.index.load(indexPath);
+        // view() mmaps the snapshot instead of copying it into anonymous
+        // memory. Most projects a daemon touches are read-mostly, so their
+        // vectors stay evictable file-backed pages; the first mutation
+        // promotes to a resident load() via #writableIndex. Renames in
+        // #persist are safe while viewed: the mapping pins the old inode.
+        state.index.view(indexPath);
+        state.viewed = true;
         for (const entry of metadata.entries) {
           state.entries.set(entry.label, Object.freeze(entry));
           const identity = documentIdentity(entry.documentId, entry.version);
@@ -270,14 +333,82 @@ export class LocalSemanticIndex {
         state.entries.clear();
         state.documents.clear();
         state.entryCountByDocumentIdentity.clear();
+        state.retiredLabels.clear();
         state.metadataBytes = 0;
         state.indexBytes = 0;
         state.dirty = false;
+        state.viewed = false;
       }
       return state;
     })();
     this.states.set(project, statePromise);
     return statePromise;
+  }
+
+  async #waitForForegroundIdle() {
+    while (!this.closed) {
+      const remaining = this.compactionIdleMs - (Date.now() - this.lastForegroundAt);
+      if (remaining <= 0) return;
+      // Poll in short slices so close() never waits on a long idle timer.
+      await delay(Math.min(remaining, 250));
+    }
+  }
+
+  async #liveManifest(view, project, documentId, version, derivedViewAuthoritative) {
+    const manifest = await view.get(manifestKeys.document(documentId, version));
+    if (!manifest || manifest.project !== project) return undefined;
+    const ordinal = await documentOrdinalLiveness(view, {
+      project,
+      documentId,
+      version,
+      authoritative: derivedViewAuthoritative,
+    });
+    const retired = ordinal === undefined
+      || (!ordinal.authoritative && ordinal.tombstone === undefined)
+      ? view.scan([KEYSPACE.SUPERSESSION, documentId, version], { limit: 1 }).length > 0
+      : !ordinal.live;
+    return retired ? undefined : manifest;
+  }
+
+  async #deadEntries(state) {
+    // One stable snapshot and one cutover read per project audit. The previous
+    // per-document snapshot setup was observable CPU work at real index size.
+    return this.store.snapshot(async (view) => {
+      const derivedViewAuthoritative = isDerivedViewQueryCutover(
+        await view.get(derivedViewKeys.queryCutover()),
+      );
+      let deadEntries = 0;
+      for (const identity of state.documents) {
+        const separator = identity.lastIndexOf("\0");
+        const documentId = identity.slice(0, separator);
+        const version = Number(identity.slice(separator + 1));
+        const manifest = await this.#liveManifest(
+          view,
+          state.project,
+          documentId,
+          version,
+          derivedViewAuthoritative,
+        );
+        if (manifest) continue;
+        deadEntries += state.entryCountByDocumentIdentity.get(identity) ?? 0;
+      }
+      return deadEntries;
+    });
+  }
+
+  /**
+   * Replace a viewed (immutable, mmap) index with a resident, mutable copy
+   * loaded from the same snapshot. Called immediately before the first
+   * mutation of a project that was opened via view(). Safe because this
+   * daemon is the store's single owner and only replaces snapshots via
+   * rename-over, so the file cannot change between view() and load().
+   */
+  #writableIndex(state) {
+    if (!state.viewed) return;
+    const fresh = newIndex(this.dimensions);
+    fresh.load(join(state.directory, "index.usearch"));
+    state.index = fresh;
+    state.viewed = false;
   }
 
   async #persist(state) {
@@ -314,11 +445,19 @@ export class LocalSemanticIndex {
 
   async #documentSpans(documentId, version) {
     return this.store.snapshot(async (view) => {
-      const manifest = await view.get(manifestKeys.document(documentId, version));
+      const originalManifest = await view.get(manifestKeys.document(documentId, version));
+      if (!originalManifest) return undefined;
+      const manifest = await this.#liveManifest(
+        view,
+        originalManifest.project,
+        documentId,
+        version,
+        isDerivedViewQueryCutover(await view.get(derivedViewKeys.queryCutover())),
+      );
+      // Rebuild and audit must use the same liveness predicate. Otherwise an
+      // ordinal-only tombstone is re-embedded and triggers another rebuild on
+      // the very next audit.
       if (!manifest) return undefined;
-      if (view.scan([KEYSPACE.SUPERSESSION, documentId, version], { limit: 1 }).length > 0) {
-        return undefined;
-      }
       const spans = [];
       const seen = new Set();
       for (const { payload: window } of view.scan([KEYSPACE.WINDOW, documentId, version])) {
@@ -345,9 +484,16 @@ export class LocalSemanticIndex {
     const state = await this.#loadProject(manifest.project);
     const identityForDocument = documentIdentity(documentId, version);
     if (state.documents.has(identityForDocument)) return;
+    // This document will be added below; a viewed index cannot accept adds.
+    this.#writableIndex(state);
     for (let offset = 0; offset < spans.length; offset += this.batchSize) {
       const batch = spans.slice(offset, offset + this.batchSize);
-      const embedded = await this.#embedder().embed(batch.map(({ text }) => text));
+      await this.backgroundGate();
+      if (this.closed) return;
+      const embedded = await this.#embedder().embed(
+        batch.map(({ text }) => text),
+        { priority: "background" },
+      );
       if (embedded.dimensions !== this.dimensions
         || embedded.vectors.length !== batch.length * this.dimensions) {
         throw new Error(`Local embedding model returned incompatible ${embedded.dimensions}-dimensional vectors.`);
@@ -424,8 +570,135 @@ export class LocalSemanticIndex {
     }
   }
 
+  #projectManifests(project) {
+    return this.store.scan([KEYSPACE.DOCUMENT])
+      .map(({ payload }) => payload)
+      .filter((manifest) => manifest.project === project);
+  }
+
+  async #rebuildProject(project) {
+    if (this.closed || this.rebuildingProjects.has(project)) return;
+    this.rebuildingProjects.add(project);
+    const temporaryRoot = join(
+      this.indexPath,
+      `.rebuild-${digest(project, 16)}-${process.pid}-${Date.now()}`,
+    );
+    const rebuilt = new LocalSemanticIndex(this.store, {
+      enabled: true,
+      model: this.model,
+      revision: this.revision,
+      cachePath: this.cachePath,
+      indexPath: temporaryRoot,
+      dimensions: this.dimensions,
+      pooling: this.pooling,
+      batchSize: this.batchSize,
+      candidates: this.candidates,
+      minimumScore: this.minimumScore,
+      compactionEnabled: false,
+      backgroundGate: () => this.#waitForForegroundIdle(),
+      embedder: this.#embedder(),
+      recordError: this.recordError,
+    });
+    const enqueueCurrent = async () => {
+      for (const manifest of this.#projectManifests(project)) {
+        if (this.closed) return;
+        await this.#waitForForegroundIdle();
+        rebuilt.enqueueDocument(manifest.documentId, manifest.version);
+        // Keep only one background document in flight. Interactive embeddings
+        // can jump ahead between every model batch.
+        await rebuilt.flush();
+      }
+      if (!rebuilt.status().available) {
+        throw new Error(`Background semantic rebuild failed for ${project}.`);
+      }
+    };
+    try {
+      // Build a complete replacement beside the live generation. Searches
+      // continue using the old mmap throughout this phase.
+      await enqueueCurrent();
+      if (this.closed) return;
+
+      // Serialize only the short catch-up and generation swap with ordinary
+      // semantic admissions. Canonical admission/search remain independent.
+      const priorQueue = this.queue;
+      const finalize = priorQueue.then(async () => {
+        await enqueueCurrent();
+        if (this.closed) return;
+        const builtDirectory = rebuilt.projectDirectory(project);
+        const targetDirectory = this.projectDirectory(project);
+        const backupDirectory = `${targetDirectory}.replaced-${process.pid}-${Date.now()}`;
+        let movedOld = false;
+        try {
+          await rename(targetDirectory, backupDirectory);
+          movedOld = true;
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        try {
+          if (rebuilt.status().entries === 0) {
+            await rm(targetDirectory, { recursive: true, force: true });
+          } else {
+            await rename(builtDirectory, targetDirectory);
+          }
+        } catch (error) {
+          if (movedOld) await rename(backupDirectory, targetDirectory).catch(() => {});
+          throw error;
+        }
+        const currentPromise = this.states.get(project);
+        const oldState = await currentPromise?.catch(() => undefined);
+        if (this.states.get(project) === currentPromise) this.states.delete(project);
+        if (oldState) {
+          this.entryCount = Math.max(0, this.entryCount - oldState.entries.size);
+          this.documentCount = Math.max(0, this.documentCount - oldState.documents.size);
+          this.metadataBytes = Math.max(0, this.metadataBytes - oldState.metadataBytes);
+          this.indexBytes = Math.max(0, this.indexBytes - oldState.indexBytes);
+        }
+        if (movedOld) await rm(backupDirectory, { recursive: true, force: true });
+      });
+      // A maintenance failure is reported but must not poison the admission
+      // queue or mark semantic retrieval unavailable.
+      this.queue = finalize.catch((error) => { this.recordError(error); });
+      await finalize;
+    } finally {
+      await rebuilt.close().catch(() => {});
+      await rm(temporaryRoot, { recursive: true, force: true });
+      this.rebuildingProjects.delete(project);
+    }
+  }
+
+  /**
+   * Audit at most one loaded project and rebuild it only after its dead-vector
+   * ratio crosses the configured threshold. Timer callers do not await this;
+   * tests and orderly shutdown may.
+   */
+  maintain() {
+    if (!this.enabled || !this.compactionEnabled || this.closed) return Promise.resolve(undefined);
+    if (this.compactionPromise) return this.compactionPromise;
+    let work;
+    work = (async () => {
+      await this.#waitForForegroundIdle();
+      // Never compete with initial warm-up or newly admitted documents.
+      if (this.closed || this.queuedDocuments > 0) return;
+      for (const statePromise of this.states.values()) {
+        const state = await statePromise;
+        if (!state.index || state.entries.size < this.compactionMinimumEntries) continue;
+        const deadEntries = await this.#deadEntries(state);
+        if (deadEntries / state.entries.size < this.compactionDeadRatio) continue;
+        await this.#rebuildProject(state.project);
+        return;
+      }
+    })().catch((error) => {
+      if (!this.closed) this.recordError(error);
+    }).finally(() => {
+      if (this.compactionPromise === work) this.compactionPromise = undefined;
+    });
+    this.compactionPromise = work;
+    return work;
+  }
+
   async search(request) {
     if (!this.enabled || this.closed || this.unavailable || request.query.trim().length === 0) return [];
+    this.lastForegroundAt = Date.now();
     try {
       const state = await this.#loadProject(request.project);
       if (!state.index || state.index.size() === 0) return [];
@@ -436,7 +709,7 @@ export class LocalSemanticIndex {
       for (let attempt = 0; attempt < 3 && results.length < request.limit * 3; attempt += 1) {
         const matches = state.index.search(
           embedded.vectors,
-          Math.min(state.index.size(), this.candidates),
+          Math.min(state.index.size(), this.candidates * (4 ** attempt)),
           1,
         );
         const target = request.limit * 3 - results.length;
@@ -450,21 +723,18 @@ export class LocalSemanticIndex {
             const label = matches.keys[index];
             const entry = state.entries.get(label.toString());
             if (!entry) continue;
-            const manifest = await view.get(manifestKeys.document(entry.documentId, entry.version));
-            const ordinal = await documentOrdinalLiveness(view, {
-              project: request.project,
-              documentId: entry.documentId,
-              version: entry.version,
-              authoritative: derivedViewAuthoritative,
-            });
-            const retired = ordinal === undefined
-              || (!ordinal.authoritative && ordinal.tombstone === undefined)
-              ? view.scan(
-                  [KEYSPACE.SUPERSESSION, entry.documentId, entry.version],
-                  { limit: 1 },
-                ).length > 0
-              : !ordinal.live;
-            if (!manifest || manifest.project !== request.project || retired) {
+            if (state.retiredLabels.has(entry.label)) {
+              resolved.push(Object.freeze({ entry, retired: true }));
+              continue;
+            }
+            const manifest = await this.#liveManifest(
+              view,
+              request.project,
+              entry.documentId,
+              entry.version,
+              derivedViewAuthoritative,
+            );
+            if (!manifest) {
               resolved.push(Object.freeze({ entry, retired: true }));
               continue;
             }
@@ -493,23 +763,16 @@ export class LocalSemanticIndex {
           }
           return resolved;
         });
-        let removed = 0;
+        let retiredFound = 0;
         for (const resolved of resolvedMatches) {
           const { entry } = resolved;
           if (resolved.retired === true) {
-            state.index.remove(BigInt(entry.label));
-            state.entries.delete(entry.label);
-            this.entryCount -= 1;
-            const identityForDocument = documentIdentity(entry.documentId, entry.version);
-            const remainingEntries = (state.entryCountByDocumentIdentity.get(identityForDocument) ?? 1) - 1;
-            if (remainingEntries === 0) {
-              state.entryCountByDocumentIdentity.delete(identityForDocument);
-              if (state.documents.delete(identityForDocument)) this.documentCount -= 1;
-            } else {
-              state.entryCountByDocumentIdentity.set(identityForDocument, remainingEntries);
-            }
-            state.dirty = true;
-            removed += 1;
+            // usearch remove()+save() preserves graph tombstones and the
+            // pinned native build can segfault while loading such a snapshot.
+            // Filter in memory and let the background generation rebuild
+            // reclaim it without ever mutating the live ANN file.
+            state.retiredLabels.add(entry.label);
+            retiredFound += 1;
             continue;
           }
           if (returned.has(entry.label)) continue;
@@ -526,9 +789,8 @@ export class LocalSemanticIndex {
           });
           if (results.length >= request.limit * 3) break;
         }
-        if (removed === 0) break;
+        if (retiredFound === 0) break;
       }
-      await this.#persist(state);
       return results;
     } catch (error) {
       this.unavailable = true;
@@ -587,7 +849,9 @@ export class LocalSemanticIndex {
 
   async close() {
     this.closed = true;
+    if (this.compactionTimer) clearInterval(this.compactionTimer);
     await this.queue.catch(() => {});
+    await this.compactionPromise?.catch(() => {});
     if (this.ownsEmbedder) await this.embedder?.close();
   }
 }

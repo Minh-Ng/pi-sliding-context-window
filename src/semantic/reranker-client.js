@@ -1,6 +1,8 @@
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
-const DEFAULT_WORKER_URL = new URL("./reranker-worker.js", import.meta.url);
+const DEFAULT_PROCESS_URL = new URL("./reranker-process.js", import.meta.url);
 
 /**
  * Thrown by `score()` when a request times out waiting for the worker to
@@ -14,9 +16,11 @@ const DEFAULT_WORKER_URL = new URL("./reranker-worker.js", import.meta.url);
 export class RerankerTimeoutError extends Error {}
 
 /**
- * Worker-thread cross-encoder client. Mirrors LocalEmbedder
- * (embedder-client.js): the model loads lazily inside the worker on its
- * first message, never blocking construction or daemon start, and every
+ * Process-isolated cross-encoder client. onnxruntime-node fatally corrupts
+ * V8/N-API state when the semantic embedder and reranker run in separate
+ * worker threads in one process; production therefore forks the reranker.
+ * An explicit workerUrl retains the lightweight worker-thread test seam.
+ * The model loads lazily on its first message, never blocking daemon start, and every
  * request/response round-trips by sequence id so out-of-order settlement is
  * impossible. `score(query, passages)` matches the interface
  * eval/retrieval/reranker-model.js's createCrossEncoderReranker returns, so
@@ -30,20 +34,30 @@ export class RerankerWorkerClient {
     revision,
     cachePath,
     timeoutMs = 60_000,
-    workerUrl = DEFAULT_WORKER_URL,
+    workerUrl,
   }) {
     this.timeoutMs = timeoutMs;
     this.sequence = 0;
     this.pending = new Map();
     this.metadata = Object.freeze({ id: model, revision });
-    this.worker = new Worker(workerUrl, {
-      workerData: { model, revision, cachePath },
-      execArgv: [],
-    });
+    this.processIsolated = workerUrl === undefined;
+    this.worker = this.processIsolated
+      ? fork(fileURLToPath(DEFAULT_PROCESS_URL), [model, revision ?? "main", cachePath], {
+          execArgv: [],
+          stdio: ["ignore", "ignore", "ignore", "ipc"],
+        })
+      : new Worker(workerUrl, {
+          workerData: { model, revision, cachePath },
+          execArgv: [],
+        });
     this.worker.on("message", (message) => this.#settle(message));
     this.worker.on("error", (error) => this.#fail(error));
-    this.worker.on("exit", (code) => {
-      if (code !== 0) this.#fail(new Error(`Local reranker worker exited with code ${code}.`));
+    this.worker.on("exit", (code, signal) => {
+      if (!this.terminated && (code !== 0 || signal !== null)) {
+        this.#fail(new Error(
+          `Local reranker ${this.processIsolated ? "process" : "worker"} exited with ${signal ?? `code ${code}`}.`,
+        ));
+      }
     });
     // Observable, idempotent close: LocalReranker terminates a load-failed
     // worker as soon as it latches unavailable, and a later daemon shutdown
@@ -81,7 +95,19 @@ export class RerankerWorkerClient {
       }, this.timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
-      this.worker.postMessage({ id, query: String(query), passages });
+      const message = { id, query: String(query), passages };
+      if (this.processIsolated) {
+        this.worker.send(message, (error) => {
+          if (!error) return;
+          const pending = this.pending.get(id);
+          if (!pending) return;
+          this.pending.delete(id);
+          clearTimeout(pending.timer);
+          pending.reject(error);
+        });
+      } else {
+        this.worker.postMessage(message);
+      }
     });
   }
 
@@ -89,6 +115,14 @@ export class RerankerWorkerClient {
     if (this.terminated) return;
     this.terminated = true;
     this.#fail(new Error("Local reranker closed."));
-    await this.worker.terminate();
+    if (!this.processIsolated) {
+      await this.worker.terminate();
+      return;
+    }
+    if (this.worker.exitCode !== null || this.worker.signalCode !== null) return;
+    await new Promise((resolve) => {
+      this.worker.once("exit", resolve);
+      this.worker.kill();
+    });
   }
 }

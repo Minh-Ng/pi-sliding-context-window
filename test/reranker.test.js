@@ -307,6 +307,13 @@ test("LocalReranker.isOperational is false for a self-constructed worker whose p
       cachePath: missingCacheDir,
     });
     assert.equal(reranker.isOperational(), false);
+    assert.deepEqual(reranker.status(), {
+      enabled: true,
+      available: false,
+      model: "some-org/never-installed-model",
+      revision: "v1",
+      candidateWindow: 40,
+    });
     assert.equal(reranker.client, undefined, "probing operational status must never construct (let alone load) a worker client");
   } finally {
     rmSync(missingCacheDir, { recursive: true, force: true });
@@ -348,6 +355,37 @@ test(
     assert.equal(reranker.client, undefined, "the operational probe itself must never construct a worker client");
   },
 );
+
+test("LocalReranker evicts its owned inference client after an idle burst", async () => {
+  const cachePath = mkdtempSync(join(tmpdir(), "context-window-reranker-idle-"));
+  const model = "fake/model";
+  const revision = "v1";
+  mkdirSync(join(cachePath, model, revision), { recursive: true });
+  writeFileSync(join(cachePath, model, revision, "config.json"), "{}");
+  const reranker = new LocalReranker({
+    enabled: true,
+    model,
+    revision,
+    cachePath,
+    workerUrl: FAKE_WORKER_URL,
+    idleTimeoutMs: 10,
+  });
+  try {
+    await reranker.rerank("query", [
+      candidate({ documentId: "a", retrievalMode: "lexical" }),
+      candidate({ documentId: "b", retrievalMode: "semantic" }),
+    ]);
+    const client = reranker.client;
+    assert.ok(client);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(reranker.client, undefined);
+    assert.equal(client.terminated, true);
+    assert.equal(reranker.isOperational(), true, "an evicted client can be recreated on demand");
+  } finally {
+    await reranker.close();
+    rmSync(cachePath, { recursive: true, force: true });
+  }
+});
 
 test("LocalReranker skips rerank for an empty query or fewer than two tier-one candidates", async () => {
   const client = fakeClient(() => {

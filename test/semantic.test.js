@@ -15,6 +15,7 @@ import test from "node:test";
 import { admitDocument } from "../src/rocksdb/manifests.js";
 import { RocksStore } from "../src/rocksdb/store.js";
 import { KEYSPACE } from "../src/rocksdb/keys.js";
+import { derivedViewKeys } from "../src/rocksdb/derived-view.js";
 import { searchArchive } from "../src/retrieval/search.js";
 import { LocalSemanticIndex } from "../src/semantic/index.js";
 import {
@@ -191,7 +192,13 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
   assert.equal(hybrid.results[0].documentId, "semantic-cat");
   await first.close();
 
-  const reloaded = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
+  const reloaded = new LocalSemanticIndex(store, {
+    ...options,
+    compactionIdleMs: 0,
+    compactionMinimumEntries: 1,
+    compactionDeadRatio: 0.5,
+    embedder: fakeEmbedder(),
+  });
   assert.equal((await reloaded.search(request))[0].documentId, "semantic-cat");
   assert.deepEqual(
     reloaded.status(),
@@ -206,6 +213,10 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
     recordedAt: Date.now(),
   });
   assert.deepEqual(await reloaded.search(request), []);
+  // Search only filters the tombstone in memory; background maintenance
+  // replaces the whole generation because usearch remove()+save() is unsafe.
+  assert.equal(reloaded.status().entries, 1);
+  await reloaded.maintain();
   assert.equal(reloaded.status().entries, 0);
   assert.equal(reloaded.status().documents, 0);
   await reloaded.close();
@@ -215,6 +226,75 @@ test("local semantic index searches and reloads a project-scoped ANN snapshot", 
   assert.equal(cleaned.status().entries, 0);
   assert.equal(cleaned.status().documents, 0);
   await cleaned.close();
+});
+
+test("a reloaded (viewed) project index accepts new documents", async (t) => {
+  // Reloading opens the on-disk snapshot as an immutable mmap view;
+  // indexing another document must transparently promote it to a mutable
+  // resident copy rather than fail.
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+  for (const [documentId, text] of [
+    ["semantic-cat", "The feline sleeps beside the radiator."],
+    ["semantic-dog", "A different animal barks at the mail carrier."],
+  ]) {
+    await admitDocument(store, {
+      idempotencyKey: `${documentId}:1`,
+      document: {
+        documentId,
+        version: 1,
+        sourceKey: `user:${documentId}`,
+        sourceMessageKeys: [`user:${documentId}`],
+        sessionId: "session-semantic",
+        project: "/workspace/semantic",
+        kind: "turn",
+        createdAt: 100,
+        text,
+        metadata: {},
+      },
+      retentionClass: "conversation-source",
+    });
+  }
+  const options = {
+    enabled: true,
+    model: "test/model",
+    revision: "test-revision",
+    cachePath: join(directory, "models"),
+    indexPath: join(directory, "index"),
+    dimensions: 3,
+    embedder: fakeEmbedder(),
+  };
+  const request = {
+    query: "house pet",
+    project: "/workspace/semantic",
+    effectiveScope: "session",
+    sessionIds: ["session-semantic"],
+    excludeVisibleSourceKeys: [],
+    limit: 3,
+  };
+  const first = new LocalSemanticIndex(store, options);
+  first.enqueueDocument("semantic-cat", 1);
+  await first.flush();
+  assert.equal((await first.search(request))[0].documentId, "semantic-cat");
+  await first.close();
+
+  // Reload from disk (view), then index a second document (promotion).
+  const reloaded = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
+  assert.equal((await reloaded.search(request))[0].documentId, "semantic-cat");
+  reloaded.enqueueDocument("semantic-dog", 1);
+  await reloaded.flush();
+  assert.equal(reloaded.status().available, true);
+  assert.equal(reloaded.status().documents, 2);
+  assert.equal((await reloaded.search(request))[0].documentId, "semantic-cat");
+  await reloaded.close();
+
+  // The promoted index persisted both documents; a third instance sees them.
+  const third = new LocalSemanticIndex(store, { ...options, embedder: fakeEmbedder() });
+  assert.equal((await third.search(request))[0].documentId, "semantic-cat");
+  assert.equal(third.status().documents, 2);
+  assert.equal(third.status().entries, 2);
+  await third.close();
 });
 
 test("semantic labels remain unique when different documents use identical byte ranges", async (t) => {
@@ -478,6 +558,87 @@ test("semantic search preserves its hydration limit after pruning retired candid
 
   assert.equal(results.length, 3);
   assert.equal(chunkReads, 3);
+  await semantic.close();
+});
+
+test("background semantic maintenance rebuilds a dead-heavy project without touching live search", async (t) => {
+  const directory = temporaryDirectory(t);
+  const store = await RocksStore.open(join(directory, "archive.rocks"));
+  t.after(() => store.close());
+  for (let index = 0; index < 12; index += 1) {
+    const documentId = `semantic-compact-${String(index).padStart(2, "0")}`;
+    await admitDocument(store, {
+      idempotencyKey: `${documentId}:1`,
+      document: {
+        documentId,
+        version: 1,
+        sourceKey: `user:${documentId}`,
+        sourceMessageKeys: [`user:${documentId}`],
+        sessionId: "session-semantic",
+        project: "/workspace/semantic",
+        kind: "turn",
+        createdAt: 100 + index,
+        text: `background compaction evidence ${index}`,
+        metadata: {},
+      },
+      retentionClass: "conversation-source",
+    });
+  }
+  const options = {
+    enabled: true,
+    model: "test/model",
+    revision: "test-revision",
+    cachePath: join(directory, "models"),
+    indexPath: join(directory, "index"),
+    dimensions: 3,
+    compactionIdleMs: 0,
+    compactionMinimumEntries: 1,
+    compactionDeadRatio: 0.5,
+    embedder: fakeEmbedder(),
+  };
+  const semantic = new LocalSemanticIndex(store, options);
+  for (let index = 0; index < 12; index += 1) {
+    semantic.enqueueDocument(`semantic-compact-${String(index).padStart(2, "0")}`, 1);
+  }
+  await semantic.flush();
+  const projectDirectory = semanticProjectDirectory(options.indexPath, semantic.fingerprint);
+  const beforeBytes = readFileSync(join(projectDirectory, "index.usearch")).length;
+  for (let index = 0; index < 8; index += 1) {
+    const documentId = `semantic-compact-${String(index).padStart(2, "0")}`;
+    const assignment = await store.get(derivedViewKeys.document(
+      "/workspace/semantic",
+      documentId,
+      1,
+    ));
+    assert.ok(assignment);
+    // Ordinal-only retirement reproduces the live bug: the old rebuild path
+    // checked SUPERSESSION but re-embedded these tombstoned documents.
+    await store.put(derivedViewKeys.tombstone("/workspace/semantic", assignment.ordinal), {
+      status: "expired",
+      recordedAt: 1_000,
+    }, { kind: "derived-view-tombstone" });
+  }
+
+  await semantic.maintain();
+  const results = await semantic.search({
+    query: "background compaction evidence",
+    project: "/workspace/semantic",
+    effectiveScope: "session",
+    sessionIds: ["session-semantic"],
+    excludeVisibleSourceKeys: [],
+    limit: 4,
+  });
+  assert.equal(results.length, 4);
+  assert.ok(results.every(({ documentId }) => Number(documentId.slice(-2)) >= 8));
+  assert.equal(semantic.status().documents, 4);
+  assert.equal(semantic.status().entries, 4);
+  const compactedSnapshot = readFileSync(join(projectDirectory, "index.usearch"));
+  assert.ok(compactedSnapshot.length < beforeBytes);
+
+  // A clean follow-up audit is read-only: no repeated rebuild or rewrite.
+  await semantic.maintain();
+  assert.deepEqual(readFileSync(join(projectDirectory, "index.usearch")), compactedSnapshot);
+  assert.equal(semantic.status().entries, 4);
   await semantic.close();
 });
 

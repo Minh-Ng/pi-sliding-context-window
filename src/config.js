@@ -84,13 +84,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   // hatch for a custom or self-hosted model the catalog does not recognize.
   semanticModelDimensions: undefined,
   semanticModelPooling: undefined,
-  // Cross-encoder rerank for explicit search/gather (deferred task #2), never
-  // consulted by automatic preflight. Enabled by default like
-  // semanticRetrieval above: the worker degrades silently to the pre-rerank
-  // fused order when the pinned model is not installed (see
-  // `context-window-semantic install-reranker`), so leaving this on does not
-  // require the model to already be present.
-  rerankerEnabled: true,
+  // Cross-encoder rerank for explicit search/gather, never automatic preflight.
+  // Keep it opt-in: the real-session evaluation found no quality improvement
+  // and measured additional latency and memory use.
+  rerankerEnabled: false,
   rerankerModel: "Xenova/ms-marco-MiniLM-L-6-v2",
   rerankerModelRevision: "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
   rerankerModelCachePath: join(homedir(), ".pi", "context-window", "reranker-models"),
@@ -601,9 +598,8 @@ export function loadConfig({ cwd = process.cwd(), projectTrusted = false, env = 
       env.CONTEXT_WINDOW_SEMANTIC_MODEL_POOLING,
       ...values("semanticModelPooling"),
     ),
-    // Cross-encoder rerank for explicit search/gather only (deferred task
-    // #2); see DEFAULT_CONFIG.rerankerEnabled above for why this defaults on
-    // despite the model needing a separate installer step.
+    // Cross-encoder rerank for explicit search/gather only. It remains
+    // disabled unless configuration or the environment opts in explicitly.
     rerankerEnabled: booleanValue(
       env.CONTEXT_WINDOW_RERANKER_ENABLED ?? merged.rerankerEnabled,
       DEFAULT_CONFIG.rerankerEnabled,

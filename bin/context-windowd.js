@@ -247,6 +247,7 @@ const runtimeOperations = [
   "retention.run",
   "retention.status",
   "feedback.stats",
+  "feedback.events",
   "store.compact",
 ];
 const operationHandlers = Object.fromEntries(runtimeOperations.map((operation) => [

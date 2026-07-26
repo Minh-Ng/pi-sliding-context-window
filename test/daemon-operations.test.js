@@ -39,6 +39,7 @@ async function runningRuntime(t, runtimeOptions = {}, daemonOptions = {}) {
     "retention.run",
     "retention.status",
     "feedback.stats",
+    "feedback.events",
     "store.compact",
   ];
   const operationHandlers = Object.fromEntries(names.map((name) => [
@@ -85,17 +86,25 @@ test("daemon admission reports durable, retryable disk-low state", async (t) => 
   assert.equal(status.retention.emergencyMode, true);
 });
 
-test("daemon.status reports catalog-derived semantic dimensions and pooling over the wire", async (t) => {
+test("daemon.status reports semantic and operational reranker state over the wire", async (t) => {
   // Regression coverage: the versioned daemon.status wire contract
   // (src/store/store-contract.js) allowlists the fields inside `semantic`, so
   // adding dimensions/pooling to LocalSemanticIndex.status() without also
   // widening that contract makes every daemon.status response fail client-side
   // validation as an unknown field, not just this one.
+  const missingRerankerCache = mkdtempSync(join(tmpdir(), "context-window-reranker-status-"));
+  t.after(() => rmSync(missingRerankerCache, { recursive: true, force: true }));
   const { socketPath } = await runningRuntime(t, {
     semantic: {
       enabled: true,
       model: "onnx-community/embeddinggemma-300m-ONNX",
       revision: "main",
+    },
+    reranker: {
+      enabled: true,
+      model: "some-org/not-installed",
+      revision: "v1",
+      cachePath: missingRerankerCache,
     },
   });
   const client = new StoreClient({ socketPath, project: "/workspace/semantic-status" });
@@ -114,6 +123,13 @@ test("daemon.status reports catalog-derived semantic dimensions and pooling over
     queuedDocuments: 0,
     metadataBytes: 0,
     indexBytes: 0,
+  });
+  assert.deepEqual(status.reranker, {
+    enabled: true,
+    available: false,
+    model: "some-org/not-installed",
+    revision: "v1",
+    candidateWindow: 40,
   });
   assert.ok(status.memory.rssBytes > 0);
   assert.ok(status.memory.maxRssBytes >= status.memory.rssBytes);
@@ -1098,9 +1114,15 @@ test("feedback.stats reports shown-vs-recalled usage over the daemon wire", asyn
   assert.equal(stats.byRank[0].recalled, 1);
   assert.equal(stats.queries[0].query, "REAP_DRAIN");
   assert.equal(stats.queries[0].recalled, 1);
+  const eventExport = await client.request("feedback.events", {});
+  assert.equal(eventExport.events.length, 1);
+  assert.equal(eventExport.events[0].query, "REAP_DRAIN");
+  assert.equal(eventExport.events[0].shown[0].documentId, "turn-1");
+  assert.equal(eventExport.events[0].recalls.length, 1);
 
   // The click log is project-scoped: a foreign connection never sees it.
   const foreignStats = await foreign.request("feedback.stats", {});
+  assert.deepEqual((await foreign.request("feedback.events", {})).events, []);
   assert.deepEqual(foreignStats, {
     events: 0,
     shownTotal: 0,

@@ -106,6 +106,7 @@ async function collectCandidates(view, anchorClaims, request) {
       manifest,
       0,
       Math.min(manifest.byteLength, MAX_SNIPPET_BYTES),
+      { adjustUtf8: true },
     );
     candidates.push({ manifest, snippet: range.text });
   }

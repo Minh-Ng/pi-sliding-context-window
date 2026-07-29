@@ -172,6 +172,34 @@ test("workflow gather follows bounded successors on the anchor branch", async (t
   assert.doesNotMatch(gather.evidence.map(({ document }) => document.text).join("\n"), /personal account/u);
 });
 
+test("workflow gather keeps traversing when a bounded successor preview ends inside a UTF-8 scalar", async (t) => {
+  const { store, worker, admit } = await fixture(t);
+  await admit("anchor", "Unicode workflow begins with this anchor.", 100);
+  const successorText = `${"a".repeat(511)}🙂 refined workflow detail.`;
+  await admit("unicode-successor", successorText, 110);
+  await worker.drain({ limit: 1_000, maxDurationMs: 30_000, throwOnError: true });
+
+  const gather = await gatherArchive(store, gatherRequest({
+    query: "Unicode workflow begins",
+    intent: "workflow",
+    limit: 1,
+    before: 0,
+    after: 1,
+    neighborhoodAnchors: 1,
+    maxEvidence: 2,
+  }), {
+    project: PROJECT,
+    now: 1_000,
+    semantic: { search: async () => [] },
+  });
+
+  assert.deepEqual(gather.evidence.map(({ document }) => document.documentId), [
+    "anchor",
+    "unicode-successor",
+  ]);
+  assert.match(gather.evidence[1].document.text, /🙂 refined workflow detail/u);
+});
+
 test("gather reports continuation and obeys aggregate evidence bounds", async (t) => {
   const { store, worker, admit } = await fixture(t);
   await admit("anchor", "Reusable migration procedure anchor.", 100);

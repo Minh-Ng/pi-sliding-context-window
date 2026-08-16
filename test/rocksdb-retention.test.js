@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1455,12 +1456,28 @@ test("document expiry removes every coarse access bucket", async (t) => {
   assert.equal(store.scan(retentionKeys.accessPrefix(candidate.documentId, 1)).length, 0);
 });
 
+// Chained SHA-256 blocks produce deterministic high-entropy bytes that the
+// binding's block/blob compression (LZ4 by default since rocksdb-js 2.6.0)
+// cannot shrink, so physical-reclamation assertions measure real bytes freed
+// rather than a codec collapsing a constant fill to nothing.
+function incompressibleBytes(size, seed) {
+  const blocks = [];
+  let filled = 0;
+  let block = Buffer.from(`evacuation-seed:${seed}`, "utf8");
+  while (filled < size) {
+    block = createHash("sha256").update(block).digest();
+    blocks.push(block);
+    filled += block.length;
+  }
+  return Buffer.concat(blocks, size);
+}
+
 test("live-value evacuation makes partial blob deletion physically reclaimable", async (t) => {
   const store = await RocksStore.open(temporaryStorePath(t, "retention-compaction"));
   t.after(() => store.close());
   const prefix = ["chunk", "evacuation-test"];
   for (let index = 0; index < 8; index += 1) {
-    await store.putImmutable([...prefix, index], Buffer.alloc(32 * 1024, index + 1), { kind: "chunk" });
+    await store.putImmutable([...prefix, index], incompressibleBytes(32 * 1024, index + 1), { kind: "chunk" });
   }
   await store.flush();
   await store.compact({ prefix });

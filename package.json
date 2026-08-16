@@ -48,7 +48,7 @@
     "check": "tsc --noEmit && node --check bin/context-window-mcp.js && node --check bin/context-windowd.js && node --check bin/context-window-migrate.js && node --check bin/context-window-index-maintenance.js && node --check bench/archive/posting-storage-cli.js && node --test"
   },
   "dependencies": {
-    "@harperfast/rocksdb-js": "2.4.0",
+    "@harperfast/rocksdb-js": "2.7.1",
     "@huggingface/transformers": "3.8.1",
     "typebox": "1.1.38",
     "usearch": "2.26.0"

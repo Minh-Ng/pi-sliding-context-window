@@ -85,7 +85,7 @@ test("store initialization persists compatible schema metadata", async (t) => {
   let store = await RocksStore.open(path);
   assert.equal(lstatSync(path).mode & 0o777, 0o700);
   assert.equal(store.status().schema.fingerprint, SCHEMA_FINGERPRINT);
-  assert.equal(store.status().bindingVersions["rocksdb-js"], "2.4.0");
+  assert.equal(store.status().bindingVersions["rocksdb-js"], "2.7.1");
   store.close();
 
   store = await RocksStore.open(path, { readOnly: true });

@@ -17,7 +17,7 @@ function temporaryDatabase(t, name) {
 test("the pinned native binding loads on the supported Node runtime", () => {
   const [major, minor] = process.versions.node.split(".").map(Number);
   assert.equal(major >= 24 || (major === 22 && minor >= 19), true);
-  assert.equal(versions["rocksdb-js"], "2.4.0");
+  assert.equal(versions["rocksdb-js"], "2.7.1");
   assert.match(versions.rocksdb, /^\d+\.\d+\.\d+$/u);
 });
 

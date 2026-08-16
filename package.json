@@ -1,10 +1,30 @@
 {
-  "name": "context-epoch-window",
+  "name": "pi-sliding-context-window",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Cache-aware epoch context window with a single-owner RocksDB archive and bounded recall",
-  "license": "MIT",
+  "license": "Apache-2.0",
+  "author": "Minh-Ng (https://github.com/Minh-Ng)",
+  "homepage": "https://github.com/Minh-Ng/pi-sliding-context-window#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Minh-Ng/pi-sliding-context-window.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Minh-Ng/pi-sliding-context-window/issues"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "context-window",
+    "mcp",
+    "rocksdb",
+    "bm25",
+    "retrieval",
+    "semantic-search",
+    "conversation-history",
+    "llm"
+  ],
   "files": [
     "bin",
     "docs/rocksdb-archive",
@@ -56,6 +76,14 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.6",
     "@earendil-works/pi-tui": ">=0.80.6"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.82.0",

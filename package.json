@@ -2,7 +2,7 @@
   "name": "pi-sliding-context-window",
   "version": "0.1.0",
   "type": "module",
-  "description": "Cache-aware epoch context window with a single-owner RocksDB archive and bounded recall",
+  "description": "A sliding context window for Pi and MCP coding agents — archives old turns to a local RocksDB store and recalls them on demand with exact, BM25, and semantic search.",
   "license": "Apache-2.0",
   "author": "Minh-Ng (https://github.com/Minh-Ng)",
   "homepage": "https://github.com/Minh-Ng/pi-sliding-context-window#readme",

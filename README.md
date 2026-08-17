@@ -1,8 +1,30 @@
 # Pi Sliding Context Window
 
-A cache-aware sliding context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, optional local semantic, structural, and bounded recall tools.
+As a coding session goes on, the conversation gets too long to fit in the model's memory. Most tools handle this by trimming or summarizing old messages, which loses detail. This one saves them instead: when messages drop out of the active view, they go into a small database on your machine. Your agent can search that history — by keyword or by meaning — and bring back the exact earlier message whenever it matters. The live conversation stays short and cheap to run, while the older detail stays searchable in the archive.
 
-The Pi adapter provides the complete implementation because Pi exposes a pre-request `context` hook. The included MCP server makes the archive portable to Claude Code, Codex, OpenCode, and other MCP clients, but those clients cannot transparently remove old transcript messages unless their plugin API exposes a message-transform hook.
+Built for [Pi](https://pi.dev). It also ships an MCP server, so the same searchable archive works in Claude Code, Codex, OpenCode, and other MCP clients.
+
+## Install
+
+```
+pi install npm:pi-sliding-context-window
+```
+
+Or add it to `.pi/settings.json`:
+
+```json
+{ "packages": ["npm:pi-sliding-context-window"] }
+```
+
+## Quick start
+
+Once it's installed, a line at the bottom of Pi shows how full the context is:
+
+```
+Epoch · 42/60 turns · ~187k/200k tokens · near limit
+```
+
+When it fills up, the oldest messages move to the archive on their own. Your agent gains tools to search and recall that history (`context_window_search`, `context_recall`, and more), plus a `/window` command to check status or change settings.
 
 ## Architecture
 

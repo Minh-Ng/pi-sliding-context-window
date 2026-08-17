@@ -1,8 +1,8 @@
 {
   "name": "pi-sliding-context-window",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
-  "description": "A sliding context window for Pi and MCP coding agents — archives old turns to a local RocksDB store and recalls them on demand with exact, BM25, and semantic search.",
+  "description": "A sliding context window for Pi coding agents. When a chat gets long, old messages are saved to a small local database instead of being dropped — so your agent can search them and pull the exact one back whenever it needs it.",
   "license": "Apache-2.0",
   "author": "Minh-Ng (https://github.com/Minh-Ng)",
   "homepage": "https://github.com/Minh-Ng/pi-sliding-context-window#readme",
@@ -14,6 +14,7 @@
     "url": "https://github.com/Minh-Ng/pi-sliding-context-window/issues"
   },
   "keywords": [
+    "pi-package",
     "pi",
     "coding-agent",
     "context-window",

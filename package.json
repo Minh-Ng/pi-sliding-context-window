@@ -90,8 +90,5 @@
     "@earendil-works/pi-tui": "0.82.0",
     "@types/node": "24.13.3",
     "typescript": "5.9.3"
-  },
-  "overrides": {
-    "sharp": "0.35.3"
   }
 }

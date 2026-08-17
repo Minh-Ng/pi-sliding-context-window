@@ -1,6 +1,6 @@
-# Context Epoch Window
+# Pi Sliding Context Window
 
-A cache-aware context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, optional local semantic, structural, and bounded recall tools.
+A cache-aware sliding context window for coding agents. It keeps conversation history append-only during a large **epoch**, rotates only at a token threshold, archives removed turns through a single-owner local RocksDB daemon, and exposes exact, BM25, optional local semantic, structural, and bounded recall tools.
 
 The Pi adapter provides the complete implementation because Pi exposes a pre-request `context` hook. The included MCP server makes the archive portable to Claude Code, Codex, OpenCode, and other MCP clients, but those clients cannot transparently remove old transcript messages unless their plugin API exposes a message-transform hook.
 

@@ -1,3 +1,7 @@
+# Installed dependencies. In the former monorepo this was ignored at the
+# repository root; the standalone repo must ignore it here.
+node_modules/
+
 # Local evaluation and benchmark output can contain machine metadata or
 # content-shaped fixture fields. Formal release captures belong outside the repo.
 artifacts/

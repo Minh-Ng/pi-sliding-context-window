@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { Archive } from "../src/archive/archive.js";
 import { claimSqliteBackendAuthority } from "../src/archive/backend-authority.js";
 import { ArchiveRecallError, DaemonArchive } from "../src/archive/daemon-archive.js";
@@ -7,6 +8,7 @@ import { retentionPolicyFromDays } from "../src/daemon/retention-policy.js";
 import { LineFramer } from "../src/daemon/framing.js";
 import { canonicalProjectId, projectIdentityAlias } from "../src/identity/project-identity.js";
 import {
+  assembleAgentInstructions,
   GATHER_TOOL_DESCRIPTION,
   RECALL_TOOL_DESCRIPTION,
   SEARCH_EFFORT_DESCRIPTION,
@@ -85,6 +87,10 @@ if (config.archiveBackend === "sqlite") {
   });
 }
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const PACKAGE_MANIFEST = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+// One canonical body of routing guidance, delivered over MCP's native
+// system-prompt channel so non-Pi clients get the same policy Pi injects.
+const MCP_INSTRUCTIONS = assembleAgentInstructions();
 const POLICY_REFRESH_INTERVAL_MS = 60 * 60 * 1_000;
 // Bound the encoded MCP transport independently from logical field limits.
 // Ordinary maximum archive content fits with envelope headroom; JSON whose
@@ -432,7 +438,8 @@ function respond(message) {
         result = {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "context-epoch-window", version: "0.1.0" },
+          serverInfo: { name: PACKAGE_MANIFEST.name, version: PACKAGE_MANIFEST.version },
+          instructions: MCP_INSTRUCTIONS,
         };
         break;
       case "ping":

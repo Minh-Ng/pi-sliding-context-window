@@ -120,3 +120,31 @@ export const DECISION_ABSENCE_HINT =
 
 export const ARCHIVED_EVIDENCE_LABEL =
   "Archived historical evidence — may be stale about current mutable state; verify live state separately.";
+
+// Assemble the canonical routing guidance into one system-prompt block.
+// Derived from EVIDENCE_ROUTING_GUIDELINES so hosts that expose a static
+// system-prompt slot (the MCP `instructions` field) deliver exactly the
+// policy the Pi extension already attaches to its tools — one source, no
+// second copy to drift.
+export function assembleAgentInstructions() {
+  const tools = [
+    "`context_window_search` — find prior discussion that has rotated out of the active context (BM25, plus optional local semantic).",
+    "`context_window_gather` — one bounded retrieval for a question whose answer spans several archived records.",
+    "`context_recall` — return the exact original wording for an id returned by search or gather.",
+    "`context_window_traverse` — page chronologically around an anchor record.",
+    "`context_window_archive` / `context_window_supersede` — persist a durable fact under a stable subjectKey, or retire an outdated one.",
+  ];
+  return [
+    "# Context window archive",
+    "",
+    "This server archives conversation turns that have rotated out of the model's active context and lets you retrieve them on demand. Tools:",
+    "",
+    ...tools.map((tool) => `- ${tool}`),
+    "",
+    "When to reach for the archive versus live tools:",
+    "",
+    ...EVIDENCE_ROUTING_GUIDELINES.map((guideline) => `- ${guideline}`),
+    "",
+    `Every archived result carries this caveat: ${ARCHIVED_EVIDENCE_LABEL}`,
+  ].join("\n");
+}

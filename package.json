@@ -1,6 +1,6 @@
 {
   "name": "pi-sliding-context-window",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "A sliding context window for Pi and MCP coding agents — archives old turns to a local RocksDB store and recalls them on demand with exact, BM25, and semantic search.",
   "license": "Apache-2.0",

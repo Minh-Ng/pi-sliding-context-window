@@ -790,6 +790,9 @@ test("MCP negotiates its supported version and reports malformed JSON", async ()
 
     const [initialize, parseError] = await responses;
     assert.equal(initialize.result.protocolVersion, "2025-06-18");
+    // The routing policy reaches non-Pi clients through MCP's instructions slot.
+    assert.equal(initialize.result.serverInfo.name, "pi-sliding-context-window");
+    assert.match(initialize.result.instructions, /context_window_search/u);
     assert.equal(parseError.id, null);
     assert.equal(parseError.error.code, -32700);
 

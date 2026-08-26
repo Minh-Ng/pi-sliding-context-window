@@ -16,6 +16,9 @@ Or add it to `.pi/settings.json`:
 { "packages": ["npm:pi-sliding-context-window"] }
 ```
 
+> [!IMPORTANT]
+> Until Hugging Face releases [transformers.js#1731](https://github.com/huggingface/transformers.js/pull/1731), prefer the patched git package with `pi install git:github.com/Minh-Ng/pi-sliding-context-window`. Git and local installs honor this package's patched `sharp@^0.35.0` override for [GHSA-f88m-g3jw-g9cj](https://github.com/lovell/sharp/security/advisories/GHSA-f88m-g3jw-g9cj). npm ignores overrides declared inside an installed dependency, so the currently published npm package can still resolve vulnerable `sharp@0.34.x` until the upstream Transformers release lands.
+
 ## Quick start
 
 Once it's installed, a line at the bottom of Pi shows how full the context is:

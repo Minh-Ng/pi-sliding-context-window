@@ -74,6 +74,11 @@
     "typebox": "1.1.38",
     "usearch": "2.26.0"
   },
+  "overrides": {
+    "@huggingface/transformers": {
+      "sharp": "^0.35.0"
+    }
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.6",
     "@earendil-works/pi-tui": ">=0.80.6"
